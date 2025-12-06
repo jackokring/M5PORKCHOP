@@ -1,4 +1,4 @@
-# 🐷 M5Porkchop - ML-Enhanced Piglet Security Companion
+# M5Porkchop - ML-Enhanced Security Companion
 
 ```
   /   \
@@ -13,26 +13,26 @@ A tamagotchi-like security companion for the M5Cardputer, featuring:
 
 ## Features
 
-### 🐷 Piglet Personality
+### Piglet Personality
 Your digital piglet companion reacts to discoveries:
 - Gets excited when capturing handshakes
 - Becomes sleepy during quiet periods
 - Shows hunting focus when scanning
 
-### 📡 OINK Mode
+### OINK Mode
 - Channel hopping WiFi scanner
 - Promiscuous mode packet capture
 - EAPOL/WPA handshake detection
 - Deauth capability (for authorized testing only)
 - ML-based network classification
 
-### 🗺️ WARHOG Mode
+### WARHOG Mode
 - GPS-enabled wardriving
 - Automatic network logging
 - Export to CSV, Wigle, or Kismet formats
 - Real-time statistics display
 
-### 🧠 Machine Learning
+### Machine Learning
 - 32-feature extraction from WiFi beacon frames
 - Enhanced heuristic classifier detecting:
   - **Rogue APs** - Strong signal, abnormal beacon timing, missing vendor IEs
@@ -173,4 +173,4 @@ MIT License - See LICENSE file for details
 
 ---
 
-*Oink oink! 🐷*
+*Oink oink!*

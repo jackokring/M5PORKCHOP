@@ -8,6 +8,15 @@ M5Porkchop is a WiFi security research tool for the M5Cardputer (ESP32-S3 based)
 - Interactive ASCII piglet avatar with mood-based phrases
 - Settings menu with persistent configuration
 
+## Code Style Guidelines
+
+1. **No emojis** - Do not use emojis in code, comments, documentation, or UI strings
+2. **Static classes** for singletons (OinkMode, WarhogMode, Menu, Display, etc.)
+3. **Include guards** with `#pragma once`
+4. **Relative includes** from src root: `#include "../core/config.h"`
+5. **Debug logging** via `Serial.printf("[MODULE] message\n")`
+6. **Debounce pattern** for keyboard: track `keyWasPressed` bool, only act on edge transitions
+
 ## Architecture
 
 ### Core Components
@@ -102,14 +111,6 @@ pio run -e m5cardputer         # Build release only
 pio run -t upload              # Build and upload
 pio run -t upload -e m5cardputer  # Upload release only
 ```
-
-## Code Style Guidelines
-
-1. **Static classes** for singletons (OinkMode, WarhogMode, Menu, Display, etc.)
-2. **Include guards** with `#pragma once`
-3. **Relative includes** from src root: `#include "../core/config.h"`
-4. **Debug logging** via `Serial.printf("[MODULE] message\n")`
-5. **Debounce pattern** for keyboard: track `keyWasPressed` bool, only act on edge transitions
 
 ## Common Patterns
 
