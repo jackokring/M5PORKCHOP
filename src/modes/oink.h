@@ -27,6 +27,9 @@ struct DetectedNetwork {
     uint16_t beaconCount;
     bool isTarget;
     bool hasPMF;  // Protected Management Frames (immune to deauth)
+    bool hasHandshake;  // Already captured handshake for this network
+    uint8_t attackAttempts;  // Number of attack attempts (for retry logic)
+    bool isHidden;  // Hidden SSID (needs probe response)
     DetectedClient clients[MAX_CLIENTS_PER_NETWORK];
     uint8_t clientCount;
 };
@@ -128,6 +131,7 @@ private:
     static void IRAM_ATTR promiscuousCallback(void* buf, wifi_promiscuous_pkt_type_t type);
     
     static void processBeacon(const uint8_t* payload, uint16_t len, int8_t rssi);
+    static void processProbeResponse(const uint8_t* payload, uint16_t len, int8_t rssi);
     static void processDataFrame(const uint8_t* payload, uint16_t len, int8_t rssi);
     static void processEAPOL(const uint8_t* payload, uint16_t len, const uint8_t* srcMac, const uint8_t* dstMac);
     
@@ -140,6 +144,9 @@ private:
 
     static int findNetwork(const uint8_t* bssid);
     static int findOrCreateHandshake(const uint8_t* bssid, const uint8_t* station);
+    static void sortNetworksByPriority();
+    static bool hasHandshakeFor(const uint8_t* bssid);
+    static int getNextTarget();  // Smart target selection
     static void writePCAPHeader(fs::File& f);
     static void writePCAPPacket(fs::File& f, const uint8_t* data, uint16_t len, uint32_t ts);
 };

