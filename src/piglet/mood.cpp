@@ -224,12 +224,23 @@ void Mood::onMLPrediction(float confidence) {
 }
 
 void Mood::onNoActivity(uint32_t seconds) {
+    // Rate-limit inactivity effects to prevent rapid phrase changes
+    static uint32_t lastInactivityUpdate = 0;
+    uint32_t now = millis();
+    
+    // Only update every 5 seconds to prevent burst phrase changes
+    if (now - lastInactivityUpdate < 5000) {
+        return;
+    }
+    lastInactivityUpdate = now;
+    
     if (seconds > 300) {
         // Very bored after 5 minutes
         happiness = max(happiness - 2, -100);
         if (happiness < -20) {
             int idx = random(0, sizeof(PHRASES_SLEEPY) / sizeof(PHRASES_SLEEPY[0]));
             currentPhrase = PHRASES_SLEEPY[idx];
+            lastPhraseChange = now;  // Prevent immediate re-selection
         }
     } else if (seconds > 120) {
         // Getting bored after 2 minutes
