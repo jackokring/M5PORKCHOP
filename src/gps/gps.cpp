@@ -89,6 +89,7 @@ void GPS::updateData() {
 
 void GPS::sleep() {
     if (!active) return;
+    if (!serial) return;  // Safety check
     
     // Send sleep command to AT6668 (UBX protocol)
     // CFG-RXM - Power Save Mode
@@ -107,6 +108,7 @@ void GPS::sleep() {
 
 void GPS::wake() {
     if (active) return;
+    if (!serial) return;  // Safety check
     
     // Send wake command
     uint8_t wakeCmd[] = {

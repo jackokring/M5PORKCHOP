@@ -234,7 +234,8 @@ void Display::showInfoBox(const String& title, const String& line1,
     pushAll();
     
     if (blocking) {
-        while (true) {
+        uint32_t startTime = millis();
+        while ((millis() - startTime) < 60000) {  // 60s timeout
             M5.update();
             M5Cardputer.update();
             if (M5Cardputer.Keyboard.isKeyPressed(KEY_ENTER)) {
@@ -266,7 +267,8 @@ bool Display::showConfirmBox(const String& title, const String& message) {
     
     pushAll();
     
-    while (true) {
+    uint32_t startTime = millis();
+    while ((millis() - startTime) < 30000) {  // 30s timeout, default No
         M5.update();
         M5Cardputer.update();
         
@@ -279,6 +281,7 @@ bool Display::showConfirmBox(const String& title, const String& message) {
         }
         delay(10);
     }
+    return false;  // Timeout = No
 }
 
 void Display::showProgress(const String& title, uint8_t percent) {

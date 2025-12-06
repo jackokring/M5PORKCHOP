@@ -403,7 +403,14 @@ bool WarhogMode::exportWigle(const char* path) {
             uint8_t hour = gps.time / 1000000;
             uint8_t minute = (gps.time / 10000) % 100;
             uint8_t second = (gps.time / 100) % 100;
-            f.printf("20%02d-%02d-%02d %02d:%02d:%02d,", year, month, day, hour, minute, second);
+            
+            // Validate date/time ranges
+            if (day > 0 && day <= 31 && month > 0 && month <= 12 && year <= 99 &&
+                hour < 24 && minute < 60 && second < 60) {
+                f.printf("20%02d-%02d-%02d %02d:%02d:%02d,", year, month, day, hour, minute, second);
+            } else {
+                f.printf("2025-01-01 00:00:00,");
+            }
         } else {
             f.printf("2025-01-01 00:00:00,");
         }

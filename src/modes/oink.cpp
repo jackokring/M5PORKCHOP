@@ -12,6 +12,9 @@
 #include <SD.h>
 #include <algorithm>
 
+// Spinlock for ISR synchronization
+static portMUX_TYPE oinkMux = portMUX_INITIALIZER_UNLOCKED;
+
 // Static members
 bool OinkMode::running = false;
 bool OinkMode::scanning = false;
@@ -453,7 +456,10 @@ void IRAM_ATTR OinkMode::promiscuousCallback(void* buf, wifi_promiscuous_pkt_typ
     
     if (len < 24) return;  // Minimum 802.11 header
     
+    // Atomic increment for packet count (ISR-safe)
+    portENTER_CRITICAL_ISR(&oinkMux);
     packetCount++;
+    portEXIT_CRITICAL_ISR(&oinkMux);
     
     const uint8_t* payload = pkt->payload;
     uint8_t frameSubtype = (payload[0] >> 4) & 0x0F;
@@ -490,6 +496,11 @@ void OinkMode::processBeacon(const uint8_t* payload, uint16_t len, int8_t rssi) 
     if (targetIndex >= 0 && targetIndex < (int)networks.size() && !beaconCaptured) {
         DetectedNetwork* target = &networks[targetIndex];
         if (memcmp(bssid, target->bssid, 6) == 0) {
+            // Free previous if exists (defensive)
+            if (beaconFrame) {
+                free(beaconFrame);
+                beaconFrame = nullptr;
+            }
             // Allocate and copy beacon frame
             beaconFrame = (uint8_t*)malloc(len);
             if (beaconFrame) {
@@ -976,6 +987,7 @@ bool OinkMode::saveHandshakePCAP(const CapturedHandshake& hs, const char* path) 
         pktLen = 32;
         
         // EAPOL data
+        if (32 + frame.len > sizeof(pkt)) continue;  // Bounds check
         memcpy(pkt + 32, frame.data, frame.len);
         pktLen += frame.len;
         
