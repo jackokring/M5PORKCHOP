@@ -209,8 +209,8 @@ void SettingsMenu::handleInput() {
     // Navigation with ; (up) and . (down)
     if (M5Cardputer.Keyboard.isKeyPressed(';')) {
         if (editing && item.type == SettingType::VALUE) {
-            // Adjust value down when editing
-            item.value = max(item.minVal, item.value - item.step);
+            // Adjust value UP when pressing up key
+            item.value = min(item.maxVal, item.value + item.step);
         } else {
             // Move selection up
             editing = false;
@@ -225,8 +225,8 @@ void SettingsMenu::handleInput() {
     
     if (M5Cardputer.Keyboard.isKeyPressed('.')) {
         if (editing && item.type == SettingType::VALUE) {
-            // Adjust value up when editing
-            item.value = min(item.maxVal, item.value + item.step);
+            // Adjust value DOWN when pressing down key
+            item.value = max(item.minVal, item.value - item.step);
         } else {
             // Move selection down
             editing = false;
