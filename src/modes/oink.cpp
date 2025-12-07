@@ -41,6 +41,10 @@ const uint8_t CHANNEL_HOP_ORDER[] = {1, 6, 11, 2, 3, 4, 5, 7, 8, 9, 10, 12, 13};
 const uint8_t CHANNEL_COUNT = sizeof(CHANNEL_HOP_ORDER);
 uint8_t currentHopIndex = 0;
 
+// Memory limits to prevent OOM
+const size_t MAX_NETWORKS = 200;       // Max tracked networks
+const size_t MAX_HANDSHAKES = 50;      // Max handshakes (each can be large)
+
 // Deauth timing
 static uint32_t lastDeauthTime = 0;
 static uint32_t lastMoodUpdate = 0;
@@ -545,13 +549,14 @@ void OinkMode::processBeacon(const uint8_t* payload, uint16_t len, int8_t rssi) 
             if (offset + 2 + ieLen > len) break;
             
             if (id == 0) {
-                if (ieLen > 0 && ieLen < 33) {
+                if (ieLen > 0 && ieLen <= 32) {
                     memcpy(net.ssid, payload + offset + 2, ieLen);
                     net.ssid[ieLen] = 0;
-                } else {
+                } else if (ieLen == 0) {
                     // Hidden network (zero-length SSID)
                     net.isHidden = true;
                 }
+                // If ieLen > 32, ignore malformed SSID
                 break;
             }
             
@@ -615,6 +620,19 @@ void OinkMode::processBeacon(const uint8_t* payload, uint16_t len, int8_t rssi) 
             net.channel = currentChannel;
         }
         
+        // Limit network count to prevent OOM
+        if (networks.size() >= MAX_NETWORKS) {
+            // Remove oldest network that isn't the target
+            for (size_t i = 0; i < networks.size(); i++) {
+                if ((int)i != targetIndex && !networks[i].isTarget) {
+                    networks.erase(networks.begin() + i);
+                    if (targetIndex > (int)i) targetIndex--;
+                    if (selectionIndex > (int)i) selectionIndex--;
+                    break;
+                }
+            }
+        }
+        
         networks.push_back(net);
         Mood::onNewNetwork(net.ssid, net.rssi, net.channel);
         
@@ -648,7 +666,7 @@ void OinkMode::processProbeResponse(const uint8_t* payload, uint16_t len, int8_t
             
             if (offset + 2 + ieLen > len) break;
             
-            if (id == 0 && ieLen > 0 && ieLen < 33) {
+            if (id == 0 && ieLen > 0 && ieLen <= 32) {
                 memcpy(networks[idx].ssid, payload + offset + 2, ieLen);
                 networks[idx].ssid[ieLen] = 0;
                 networks[idx].isHidden = false;
@@ -848,6 +866,21 @@ int OinkMode::findOrCreateHandshake(const uint8_t* bssid, const uint8_t* station
                 hs.beaconLen = beaconFrameLen;
                 Serial.printf("[OINK] Beacon attached to handshake for %02X:%02X:%02X:%02X:%02X:%02X\n",
                              bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
+            }
+        }
+    }
+    
+    // Limit handshake count to prevent OOM
+    if (handshakes.size() >= MAX_HANDSHAKES) {
+        // Remove oldest incomplete and saved handshake
+        for (size_t i = 0; i < handshakes.size(); i++) {
+            if (handshakes[i].saved && !handshakes[i].isComplete()) {
+                // Free beacon data before removing
+                if (handshakes[i].beaconData) {
+                    free(handshakes[i].beaconData);
+                }
+                handshakes.erase(handshakes.begin() + i);
+                break;
             }
         }
     }

@@ -124,7 +124,7 @@ void CapturesMenu::handleInput() {
     }
     
     if (M5Cardputer.Keyboard.isKeyPressed('.')) {
-        if (selectedIndex < captures.size() - 1) {
+        if (!captures.empty() && selectedIndex < captures.size() - 1) {
             selectedIndex++;
             if (selectedIndex >= scrollOffset + VISIBLE_ITEMS) {
                 scrollOffset = selectedIndex - VISIBLE_ITEMS + 1;

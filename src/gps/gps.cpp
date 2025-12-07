@@ -43,6 +43,8 @@ void GPS::update() {
 }
 
 void GPS::processSerial() {
+    if (!serial) return;  // Safety check
+    
     static uint32_t lastDebugTime = 0;
     static uint32_t bytesReceived = 0;
     

@@ -13,6 +13,10 @@ char FileServer::targetPassword[64] = "";
 uint32_t FileServer::connectStartTime = 0;
 uint32_t FileServer::lastReconnectCheck = 0;
 
+// File upload state (needs to be declared early for stop() to access it)
+static File uploadFile;
+static String uploadDir;
+
 // Black & white HTML interface with full filesystem navigation
 static const char HTML_TEMPLATE[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
@@ -451,6 +455,12 @@ void FileServer::startServer() {
 void FileServer::stop() {
     if (state == FileServerState::IDLE) return;
     
+    // Close any pending upload file
+    if (uploadFile) {
+        uploadFile.close();
+        Serial.println("[FILESERVER] Closed pending upload file");
+    }
+    
     if (server) {
         server->stop();
         delete server;
@@ -521,6 +531,9 @@ void FileServer::updateRunning() {
                 delete server;
                 server = nullptr;
             }
+            
+            // Stop mDNS before reconnect
+            MDNS.end();
             
             // Restart connection
             WiFi.disconnect(true);
@@ -652,10 +665,6 @@ void FileServer::handleDownload() {
     file.close();
 }
 
-// File upload state
-static File uploadFile;
-static String uploadDir;
-
 void FileServer::handleUpload() {
     server->send(200, "text/plain", "OK");
 }
@@ -692,6 +701,12 @@ void FileServer::handleUploadProcess() {
         if (uploadFile) {
             uploadFile.close();
             Serial.printf("[FILESERVER] Upload complete: %u bytes\n", upload.totalSize);
+        }
+    } else if (upload.status == UPLOAD_FILE_ABORTED) {
+        // Client disconnected or error - close file to prevent leak
+        if (uploadFile) {
+            uploadFile.close();
+            Serial.println("[FILESERVER] Upload aborted - file handle closed");
         }
     }
 }
