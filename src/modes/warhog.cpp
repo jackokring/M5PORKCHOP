@@ -71,12 +71,21 @@ void WarhogMode::start() {
     beaconFeatures.clear();
     beaconCount = 0;
     
+    // Reload scan interval from config
+    scanInterval = Config::gps().updateInterval * 1000;
+    Serial.printf("[WARHOG] Scan interval: %lu ms\n", scanInterval);
+    
     // Check if Enhanced ML mode is enabled (might have changed in settings)
     enhancedMode = (Config::ml().collectionMode == MLCollectionMode::ENHANCED);
     
-    // Initialize WiFi in STA mode for scanning
-    WiFi.mode(WIFI_STA);
-    WiFi.disconnect();
+    // Full WiFi reinitialization for clean slate
+    WiFi.disconnect(true);  // Disconnect and clear settings
+    WiFi.mode(WIFI_OFF);    // Turn off WiFi completely
+    delay(100);             // Let it settle
+    WiFi.mode(WIFI_STA);    // Station mode for scanning
+    delay(100);             // Let it initialize
+    
+    Serial.println("[WARHOG] WiFi initialized in STA mode");
     
     // If Enhanced mode, start promiscuous capture for beacons
     if (enhancedMode) {
@@ -130,19 +139,19 @@ void WarhogMode::update() {
         lastPhraseTime = now;
     }
     
-    // Check if async scan completed
-    int scanResult = WiFi.scanComplete();
-    if (scanResult >= 0) {
-        // Scan done with results
-        processScanResults();
-    } else if (scanResult == WIFI_SCAN_FAILED) {
-        // Scan failed, reset
-        WiFi.scanDelete();
-    }
-    
-    // Periodic scanning - only start new scan if not already scanning
-    if (now - lastScanTime >= scanInterval && scanResult != WIFI_SCAN_RUNNING) {
+    // Periodic scanning with synchronous scan
+    if (now - lastScanTime >= scanInterval) {
         performScan();
+        
+        // Process results immediately (synchronous scan)
+        int n = WiFi.scanComplete();
+        if (n >= 0) {
+            processScanResults();
+        }
+        
+        // Clean up
+        WiFi.scanDelete();
+        
         lastScanTime = now;
     }
 }
@@ -158,13 +167,29 @@ bool WarhogMode::isScanComplete() {
 void WarhogMode::performScan() {
     Serial.println("[WARHOG] Starting WiFi scan...");
     
-    // Start async scan
-    int result = WiFi.scanNetworks(true, true);  // async=true, hidden=true
+    // Temporarily disable promiscuous mode for scanning (conflicts with scan API)
+    bool wasEnhanced = enhancedMode;
+    if (wasEnhanced) {
+        esp_wifi_set_promiscuous(false);
+    }
     
-    if (result == WIFI_SCAN_RUNNING) {
-        // Will check completion in update()
+    // Use SYNCHRONOUS scan for reliability - async has issues on ESP32
+    // This blocks but is more reliable for wardriving
+    int result = WiFi.scanNetworks(false, true);  // async=false (blocking), hidden=true
+    
+    Serial.printf("[WARHOG] scanNetworks returned: %d\n", result);
+    
+    if (result >= 0) {
+        Serial.printf("[WARHOG] Scan complete, found %d networks\n", result);
     } else if (result == WIFI_SCAN_FAILED) {
         Serial.println("[WARHOG] Scan failed");
+    } else {
+        Serial.printf("[WARHOG] Unexpected scan result: %d\n", result);
+    }
+    
+    // Re-enable promiscuous if it was on
+    if (wasEnhanced) {
+        esp_wifi_set_promiscuous(true);
     }
 }
 
@@ -180,6 +205,9 @@ void WarhogMode::processScanResults() {
         WiFi.scanDelete();
         return;
     }
+    
+    // Reset count for this scan cycle
+    newCount = 0;
     
     // Get current GPS data
     GPSData gps = GPS::getData();
@@ -290,6 +318,9 @@ void WarhogMode::processScanResults() {
             // Update existing - maybe update GPS if we have better fix
             if (hasGPS && (entries[idx].latitude == 0 || 
                           ap.rssi > entries[idx].rssi)) {
+                // Track if this was missing coords (will need save)
+                bool wasMissingCoords = (entries[idx].latitude == 0);
+                
                 entries[idx].latitude = gps.latitude;
                 entries[idx].longitude = gps.longitude;
                 entries[idx].altitude = gps.altitude;
@@ -307,6 +338,11 @@ void WarhogMode::processScanResults() {
                 } else {
                     entries[idx].features = FeatureExtractor::extractFromScan(&ap);
                 }
+                
+                // If entry now has coords but wasn't saved yet, count as needing save
+                if (wasMissingCoords && !entries[idx].saved) {
+                    newCount++;
+                }
             }
         }
     }
@@ -316,7 +352,8 @@ void WarhogMode::processScanResults() {
     
     delete[] apRecords;
     
-    newCount = entries.size() - previousCount;
+    // Add newly discovered networks to count (entries that got coords are already counted above)
+    newCount += entries.size() - previousCount;
     
     if (newCount > 0) {
         // Use WARHOG-specific phrases for found networks
@@ -329,6 +366,11 @@ void WarhogMode::processScanResults() {
     }
     
     WiFi.scanDelete();
+    
+    // Re-enable promiscuous mode for beacon capture if Enhanced mode
+    if (enhancedMode) {
+        esp_wifi_set_promiscuous(true);
+    }
 }
 
 // Helper to escape XML special characters
@@ -406,6 +448,7 @@ void WarhogMode::saveNewEntries() {
         }
     }
     
+    f.flush();  // Ensure data hits SD immediately (crash protection)
     f.close();
     
     if (newSaved > 0) {
@@ -559,7 +602,7 @@ String WarhogMode::authModeToString(wifi_auth_mode_t mode) {
 
 String WarhogMode::generateFilename(const char* ext) {
     // Generate filename with date/time from GPS: YYYYMMDD_HHMMSS
-    char buf[48];
+    char buf[64];
     GPSData gps = GPS::getData();
     
     if (gps.date > 0 && gps.time > 0) {
@@ -571,10 +614,10 @@ String WarhogMode::generateFilename(const char* ext) {
         uint8_t minute = (gps.time / 10000) % 100;
         uint8_t second = (gps.time / 100) % 100;
         
-        snprintf(buf, sizeof(buf), "/warhog_20%02d%02d%02d_%02d%02d%02d.%s",
+        snprintf(buf, sizeof(buf), "/wardriving/warhog_20%02d%02d%02d_%02d%02d%02d.%s",
                 year, month, day, hour, minute, second, ext);
     } else {
-        snprintf(buf, sizeof(buf), "/warhog_%lu.%s", millis(), ext);
+        snprintf(buf, sizeof(buf), "/wardriving/warhog_%lu.%s", millis(), ext);
     }
     
     return String(buf);
