@@ -146,10 +146,13 @@ void WarhogMode::stop() {
     }
     
     // Cancel any running background scan
-    if (scanInProgress && scanTaskHandle != NULL) {
+    if (scanInProgress) {
         Serial.println("[WARHOG] Cancelling background scan...");
-        vTaskDelete(scanTaskHandle);
-        scanTaskHandle = NULL;
+        if (scanTaskHandle != NULL) {
+            vTaskDelete(scanTaskHandle);
+            scanTaskHandle = NULL;
+        }
+        // Always clean up scan data even if task just finished
         WiFi.scanDelete();
     }
     scanInProgress = false;

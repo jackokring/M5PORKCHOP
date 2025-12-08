@@ -68,6 +68,10 @@ static const uint32_t LOCK_TIME = 3000;         // 3 sec to discover clients bef
 static const uint32_t ATTACK_TIMEOUT = 15000;   // 15 sec per target
 static const uint32_t WAIT_TIME = 2000;         // 2 sec between targets
 
+// WAITING state variables (reset in init() to prevent stale state on restart)
+static bool checkedForPendingHandshake = false;
+static bool hasPendingHandshake = false;
+
 void OinkMode::init() {
     // Reset busy flag in case of abnormal stop
     oinkBusy = false;
@@ -95,6 +99,8 @@ void OinkMode::init() {
     attackStartTime = 0;
     lastDeauthTime = 0;
     lastMoodUpdate = 0;
+    checkedForPendingHandshake = false;
+    hasPendingHandshake = false;
     
     // Clear beacon frame if any
     if (beaconFrame) {
@@ -347,8 +353,7 @@ void OinkMode::update() {
             if (now - stateStartTime > WAIT_TIME) {
                 // Check for incomplete handshake only once at WAIT_TIME threshold
                 // to avoid repeated vector iteration overhead
-                static bool checkedForPendingHandshake = false;
-                static bool hasPendingHandshake = false;
+                // (statics moved to file scope and reset in init())
                 
                 if (!checkedForPendingHandshake) {
                     checkedForPendingHandshake = true;

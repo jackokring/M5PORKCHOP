@@ -80,6 +80,9 @@ void Porkchop::update() {
 void Porkchop::setMode(PorkchopMode mode) {
     if (mode == currentMode) return;
     
+    // Store the mode we're leaving for cleanup
+    PorkchopMode oldMode = currentMode;
+    
     // Only save "real" modes as previous (not SETTINGS/ABOUT/MENU/CAPTURES/FILE_TRANSFER/LOG_VIEWER)
     if (currentMode != PorkchopMode::SETTINGS && 
         currentMode != PorkchopMode::ABOUT && 
@@ -91,8 +94,8 @@ void Porkchop::setMode(PorkchopMode mode) {
     }
     currentMode = mode;
     
-    // Cleanup previous mode
-    switch (previousMode) {
+    // Cleanup the mode we're actually leaving (oldMode), not previousMode
+    switch (oldMode) {
         case PorkchopMode::OINK_MODE:
             OinkMode::stop();
             break;
