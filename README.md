@@ -251,12 +251,12 @@
 
     Bottom bar - the numbers that matter:
 
-        N:42    = 42 truffles sniffed - networks your snout found
-        HS:3    = 3 handshakes in the bag - ready for hashcat
-        D:127   = 127 clients yeeted - deauth frames sent
-        CH:6    = Currently snooping channel 6
-        PWN:xxx = Last network you pwned - shows after capture
-        1:23    = Uptime - how long this pig been running
+        N:42    = Networks found
+        HS:3    = Handshakes captured
+        D:127   = Deauths sent
+        CH:6    = Current channel
+        PWN:xxx = Last network pwned
+        1:23    = Uptime
 
     The grass under piggy's feet tells you what's happening. When you
     see it scrolling, channel hopping is active - the snout is working.
