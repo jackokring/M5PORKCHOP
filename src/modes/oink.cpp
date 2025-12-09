@@ -233,10 +233,19 @@ void OinkMode::stop() {
     beaconFrameLen = 0;
     beaconCaptured = false;
     
+    // Free per-handshake beacon memory to prevent leaks on repeated start/stop
+    for (auto& hs : handshakes) {
+        if (hs.beaconData) {
+            free(hs.beaconData);
+            hs.beaconData = nullptr;
+        }
+    }
+    
+    // Log heap status for debugging memory issues
+    Serial.printf("[OINK] Stopped - Free heap: %lu bytes\n", (unsigned long)ESP.getFreeHeap());
+    
     running = false;
     Display::setWiFiStatus(false);
-    
-    Serial.println("[OINK] Stopped");
 }
 
 void OinkMode::update() {
@@ -501,6 +510,12 @@ void OinkMode::update() {
             selectionIndex = 0;
         }
         lastScanTime = now;
+        
+        // Periodic heap monitoring for debugging memory issues
+        Serial.printf("[OINK] Heap: %lu free, Networks: %d, Handshakes: %d\n",
+                     (unsigned long)ESP.getFreeHeap(), 
+                     (int)networks.size(), 
+                     (int)handshakes.size());
     }
     
     // Release lock - allow promiscuous callback to process packets
