@@ -452,7 +452,7 @@ void PiggyBluesMode::scanForDevices() {
     Serial.println("[PIGGYBLUES] Scanning for BLE devices...");
     
     // Show scanning indicator (blocking scan will freeze UI)
-    Display::showToast("Scanning BLE...");
+    Display::showToast("Probing BLE...");
     
     // MUST stop advertising before scanning - they conflict!
     if (pAdvertising && pAdvertising->isAdvertising()) {
