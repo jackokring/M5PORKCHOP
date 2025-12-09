@@ -10,10 +10,10 @@ Preferences XP::prefs;
 bool XP::initialized = false;
 void (*XP::levelUpCallback)(uint8_t, uint8_t) = nullptr;
 
-// XP values for each event type
+// XP values for each event type (synced with docs/RPG_IMPLEMENTATION_PLAN.txt)
 static const uint16_t XP_VALUES[] = {
     1,      // NETWORK_FOUND
-    5,      // NETWORK_HIDDEN
+    3,      // NETWORK_HIDDEN (was 5, doc says 3)
     10,     // NETWORK_WPA3
     3,      // NETWORK_OPEN
     50,     // HANDSHAKE_CAPTURED
@@ -22,65 +22,65 @@ static const uint16_t XP_VALUES[] = {
     15,     // DEAUTH_SUCCESS
     2,      // WARHOG_LOGGED
     25,     // DISTANCE_KM
-    1,      // BLE_BURST
+    2,      // BLE_BURST (was 1, doc says 2)
     3,      // BLE_APPLE
-    10,     // GPS_LOCK
+    5,      // GPS_LOCK (was 10, doc says 5)
     25,     // ML_ROGUE_DETECTED
-    50,     // SESSION_30MIN
-    100,    // SESSION_60MIN
-    200,    // SESSION_120MIN
+    10,     // SESSION_30MIN (was 50, doc says 10)
+    25,     // SESSION_60MIN (was 100, doc says 25)
+    50,     // SESSION_120MIN (was 200, doc says 50)
     20      // LOW_BATTERY_CAPTURE
 };
 
-// 40 rank titles - Phrack swine flavor
+// 40 rank titles - Phrack swine flavor (synced with copilot-instructions.md)
 static const char* RANK_TITLES[] = {
     // Tier 1: The Beginning (1-5)
     "SCRIPT PIGGY",
-    "MUD SNORTER",
-    "PACKET PIGLET",
-    "NOOB ROOTER",
-    "SLOP BUCKET HACKER",
+    "BACON BIT",
+    "SQUEALING NOOB",
+    "PIGPEN CURIOUS",
+    "SLOP BUCKET SURFER",
     // Tier 2: Getting Serious (6-10)
-    "TRUFFLE SNIFFER",
-    "BACON APPRENTICE",
-    "CHANNEL HOPPER",
-    "DEAUTH DABBLER",
-    "HAM HANDED HACKER",
+    "TROUGH DIVER",
+    "MUD DAUBER",
+    "SNOUT POKER",
+    "CURLY TAIL CODER",
+    "PIGLET PROBER",
     // Tier 3: Intermediate (11-15)
-    "HANDSHAKE HUNTER",
-    "ROGUE ROOTER",
-    "PROMISCUOUS PORKER",
-    "WARDRIVE WANDERER",
-    "PCAP COLLECTOR",
+    "OINKER OPERATIVE",
+    "PORK PILOT",
+    "SAUSAGE LINKER",
+    "HOG HANDLER",
+    "BOAR BORER",
     // Tier 4: Advanced (16-20)
-    "EAPOL EVANGELIST",
-    "FRAME INJECTOR",
-    "SNOUT ZERO DAY",
-    "PORK PROTOCOL",
-    "EVIL TWIN FARMER",
+    "SWINE SWINDLER",
+    "ROOTER ELITE",
+    "SNORT SPECIALIST",
+    "HAMBONE HACKER",
+    "BRISTLE BREACHER",
     // Tier 5: Expert (21-25)
-    "SILICON SWINE",
-    "CHAOS SAUSAGE",
-    "BLACKHAT BOAR",
-    "802.11 WARLORD",
-    "ALPHA ROOTER",
+    "OINK-SEC ENGINEER",
+    "SNOUT SNIFFER PRO",
+    "PORK BARREL HACKER",
+    "TRUFFLE HUNTER",
+    "SWINE DEBUGGER",
     // Tier 6: Elite (26-30)
-    "KERNEL BACON",
-    "NATION STATE SWINE",
-    "ZERO CLICK HOG",
-    "PWNED PORK SUPREME",
-    "SHADOW BROKER BOAR",
+    "HAM SANDWICH ARTIST",
+    "PORKCHOP OPERATOR",
+    "MASTER SWINEHERD",
+    "OINK OVERLORD",
+    "BARON VON BACON",
     // Tier 7: Legendary (31-35)
-    "MYTHIC MUD DWELLER",
-    "ETERNAL OINK",
-    "VOID SNORTER",
-    "QUANTUM PIGLET",
-    "ASTRAL ROOTER",
+    "SQUEALER SUPREME",
+    "GRANDMASTER GROINKER",
+    "PORCINE PENETRATOR",
+    "LEGENDARY SNORTER",
+    "MYTHIC MUDWALLOWER",
     // Tier 8: Godtier (36-40)
-    "ELDER HOG",
-    "PRIME PORCINE",
-    "THE GREAT BOAR",
-    "OMEGA SWINE",
+    "APEX APORKALYPSE",
+    "DIVINE SWINEHERD",
+    "COSMIC PORKCHOP",
+    "ETERNAL OINKER",
     "LEGENDARY PORKCHOP"
 };
 static const uint8_t MAX_LEVEL = 40;
@@ -170,9 +170,13 @@ void XP::save() {
     Serial.printf("[XP] Saved - LV%d (%lu XP)\n", getLevel(), data.totalXP);
 }
 
+// Static for km tracking - needs to be reset on session start
+static uint32_t lastKmAwarded = 0;
+
 void XP::startSession() {
     memset(&session, 0, sizeof(session));
     session.startTime = millis();
+    lastKmAwarded = 0;  // Reset km counter for new session
     data.sessions++;
 }
 
@@ -256,7 +260,7 @@ void XP::addDistance(uint32_t meters) {
     session.distanceM += meters;
     
     // Award XP per km (check if we crossed a km boundary)
-    static uint32_t lastKmAwarded = 0;
+    // lastKmAwarded is defined at file scope and reset in startSession()
     uint32_t currentKm = session.distanceM / 1000;
     
     if (currentKm > lastKmAwarded) {
@@ -504,44 +508,62 @@ void XP::setLevelUpCallback(void (*callback)(uint8_t, uint8_t)) {
 
 void XP::drawBar(M5Canvas& canvas) {
     // Draw XP bar at bottom of main canvas (y=91, in the empty space)
+    // Format: "L## TITLE_FULL      ######.......... 100%"
+    // Progress bar and percentage aligned to right edge
     int barY = 91;
     
     canvas.setTextSize(1);
     canvas.setTextColor(COLOR_FG);
     canvas.setTextDatum(top_left);
     
-    // Format: "LV## TITLE"
-    char levelStr[8];
-    snprintf(levelStr, sizeof(levelStr), "LV%d", getLevel());
-    canvas.drawString(levelStr, 2, barY);
-    
-    // Title (truncate if needed)
-    const char* title = getTitle();
-    String titleStr = title;
-    if (titleStr.length() > 14) {
-        titleStr = titleStr.substring(0, 12) + "..";
-    }
-    canvas.drawString(titleStr, 28, barY);
-    
-    // Progress bar on right side
-    int barX = 150;
-    int barW = 60;
-    int barH = 8;
-    int progressBarY = barY + 2;
-    
-    // Draw bar outline
-    canvas.drawRect(barX, progressBarY, barW, barH, COLOR_FG);
-    
-    // Fill progress
+    // Calculate right-aligned elements first
+    const int BAR_LEN = 16;
     uint8_t progress = getProgress();
-    int fillW = (barW - 2) * progress / 100;
-    if (fillW > 0) {
-        canvas.fillRect(barX + 1, progressBarY + 1, fillW, barH - 2, COLOR_FG);
-    }
+    int filledBlocks = (progress * BAR_LEN + 50) / 100;  // Round to nearest
     
-    // Percentage on far right
+    // Build bar string: # for filled, . for empty
+    char barStr[20];
+    for (int i = 0; i < BAR_LEN; i++) {
+        barStr[i] = (i < filledBlocks) ? '#' : '.';
+    }
+    barStr[BAR_LEN] = '\0';
+    
+    // Percentage (4 chars max: "100%")
     char pctStr[8];
     snprintf(pctStr, sizeof(pctStr), "%d%%", progress);
+    int pctW = canvas.textWidth("100%");  // Fixed width for alignment
+    
+    // Position from right edge
+    int pctX = DISPLAY_W - 2 - pctW;
+    int barW = canvas.textWidth(barStr);
+    int barX = pctX - 3 - barW;  // 3px gap before percentage
+    
+    // Draw percentage right-aligned
     canvas.setTextDatum(top_right);
     canvas.drawString(pctStr, DISPLAY_W - 2, barY);
+    
+    // Draw progress bar
+    canvas.setTextDatum(top_left);
+    canvas.drawString(barStr, barX, barY);
+    
+    // Level number - left side
+    char levelStr[8];
+    snprintf(levelStr, sizeof(levelStr), "L%d", getLevel());
+    int levelW = canvas.textWidth(levelStr);
+    canvas.drawString(levelStr, 2, barY);
+    
+    // Title - fill space between level and bar (no truncation needed now)
+    const char* title = getTitle();
+    String titleStr = title;
+    int titleX = 2 + levelW + 4;  // 4px gap after level
+    int maxTitleW = barX - titleX - 4;  // Available space for title
+    
+    // Truncate only if really needed
+    while (canvas.textWidth(titleStr) > maxTitleW && titleStr.length() > 3) {
+        titleStr = titleStr.substring(0, titleStr.length() - 1);
+    }
+    if (titleStr.length() < strlen(title)) {
+        titleStr = titleStr.substring(0, titleStr.length() - 2) + "..";
+    }
+    canvas.drawString(titleStr, titleX, barY);
 }

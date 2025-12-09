@@ -217,21 +217,30 @@ void Display::drawBottomBar() {
     String stats;
     
     if (mode == PorkchopMode::WARHOG_MODE) {
-        // WARHOG: show unique networks, saved records, and GPS coords
+        // WARHOG: show unique networks, saved, distance, GPS info
         uint32_t unique = WarhogMode::getTotalNetworks();
         uint32_t saved = WarhogMode::getSavedCount();
+        uint32_t distM = XP::getSession().distanceM;
         GPSData gps = GPS::getData();
         
+        char buf[64];
         if (GPS::hasFix()) {
-            // Show coords with satellite count: "U:5 S:3 [42.36,-71.05]"
-            char buf[64];
-            snprintf(buf, sizeof(buf), "U:%lu S:%lu [%.2f,%.2f] S:%d", 
-                     unique, saved, gps.latitude, gps.longitude, gps.satellites);
-            stats = String(buf);
+            // Format distance nicely: meters or km
+            if (distM >= 1000) {
+                // Show as km with 1 decimal: "1.2km"
+                snprintf(buf, sizeof(buf), "U:%lu S:%lu D:%.1fkm [%.2f,%.2f]", 
+                         unique, saved, distM / 1000.0, gps.latitude, gps.longitude);
+            } else {
+                // Show as meters: "456m"
+                snprintf(buf, sizeof(buf), "U:%lu S:%lu D:%lum [%.2f,%.2f]", 
+                         unique, saved, distM, gps.latitude, gps.longitude);
+            }
         } else {
-            // No fix - show satellite count searching
-            stats = "U:" + String(unique) + " S:" + String(saved) + " GPS:" + String(gps.satellites) + "sat";
+            // No fix - show satellite count
+            snprintf(buf, sizeof(buf), "U:%lu S:%lu D:%lum GPS:%dsat", 
+                     unique, saved, distM, gps.satellites);
         }
+        stats = String(buf);
     } else if (mode == PorkchopMode::CAPTURES) {
         // CAPTURES: show selected capture's BSSID
         stats = CapturesMenu::getSelectedBSSID();
