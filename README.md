@@ -73,13 +73,13 @@
         * Channel hopping across all 802.11 channels
         * Promiscuous mode packet capture  
         * EAPOL frame detection and 4-way handshake reconstruction
-        * PMKID extraction from M1 frames (clientless attack!)
+        * PMKID yoink from M1 frames - no client needed, pure stealth
         * Deauth capability for... "authorized testing purposes"
         * Real-time ML classification of suspicious APs
         * Auto-attack mode cycles through targets automatically
         * Targeted deauth prioritizes discovered clients
         * PCAP export to SD for post-processing
-        * Hashcat 22000 format for PMKID (ready for cracking)
+        * Hashcat 22000 format export - fire up that GPU and let it rip
 
 
 ----[ 3.2 - WARHOG Mode
@@ -214,7 +214,7 @@
         | Open network (lol)     | 3      |
         | WPA3 network spotted   | 10     |
         | Handshake captured     | 50     |
-        | PMKID captured         | 75     |
+        | PMKID yoinked          | 75     |
         | Deauth success         | 15     |
         | AP logged with GPS     | 2      |
         | 1km wardriving         | 25     |
