@@ -44,8 +44,9 @@
     
     The piglet personality isn't just for show. It reacts to what you're
     doing - gets hyped when you pop a 4-way, goes full WARHOG when you're
-    driving around mapping networks, and gets sleepy when nothing's
-    happening. Feed it handshakes and it'll love you forever.
+    driving around mapping networks, spreads digital chaos in PIGGY BLUES
+    mode, visualizes the RF hellscape in HOG ON SPECTRUM, and gets sleepy
+    when nothing's happening. Feed it handshakes and it'll love you forever.
 
 
 --[ 2 - What the hell is this thing
@@ -54,14 +55,17 @@
     hardware. It's designed for:
 
         - Passive WiFi reconnaissance
-        - WPA/WPA2 handshake capture
+        - WPA/WPA2 handshake capture (PMKID yoink too)
         - GPS-enabled wardriving
+        - BLE notification spam (Apple, Android, Samsung, Windows)
+        - Real-time 2.4GHz spectrum visualization
         - ML-powered rogue AP detection
         - Looking cute while doing questionable things
 
     Your digital companion reacts to discoveries like any good attack pet
-    should. Captures make it happy. Boredom makes it sad. It's basically
-    you, but as an ASCII pig.
+    should. Captures make it happy. BLE chaos makes it chatty. Spectrum
+    mode makes it analytical. Boredom makes it sad. It's basically you,
+    but as an ASCII pig.
 
 
 --[ 3 - Capabilities
