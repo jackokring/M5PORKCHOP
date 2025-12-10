@@ -34,6 +34,7 @@ static const struct {
     { ACH_CLUTCH_CAPTURE, "CLUTCH CAPTURE", "Handshake at <10% battery" },
     { ACH_SPEED_RUN,      "SPEED RUN",      "50 networks in 10 minutes" },
     { ACH_CHAOS_AGENT,    "CHAOS AGENT",    "Send 1000 BLE packets" },
+    { ACH_NIETZSWINE,     "N13TZSCH3",      "Stare into the ether long enough" },
 };
 
 void AchievementsMenu::init() {

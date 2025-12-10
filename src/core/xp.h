@@ -45,6 +45,7 @@ enum PorkAchievement : uint32_t {
     ACH_CLUTCH_CAPTURE  = 1 << 13,  // Handshake at <10% battery
     ACH_SPEED_RUN       = 1 << 14,  // 50 networks in 10 minutes
     ACH_CHAOS_AGENT     = 1 << 15,  // 1000 BLE packets sent
+    ACH_NIETZSWINE      = 1 << 16,  // Stare at spectrum for 15 minutes
 };
 
 // Persistent XP data structure (stored in NVS)

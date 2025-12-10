@@ -39,6 +39,7 @@ private:
     static bool keyWasPressed;
     static uint8_t currentChannel;   // Current hop channel
     static uint32_t lastHopTime;     // Last channel hop time
+    static uint32_t startTime;       // When mode started (for achievement)
     
     static void handleInput();
     static void drawSpectrum(M5Canvas& canvas);

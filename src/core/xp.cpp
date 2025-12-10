@@ -103,7 +103,8 @@ static const char* ACHIEVEMENT_NAMES[] = {
     "SILICON PSYCHO",
     "CLUTCH CAPTURE",
     "SPEED RUN",
-    "CHAOS AGENT"
+    "CHAOS AGENT",
+    "N13TZSCH3"
 };
 
 // Level up phrases

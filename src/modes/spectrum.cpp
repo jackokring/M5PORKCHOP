@@ -44,6 +44,7 @@ uint32_t SpectrumMode::lastUpdateTime = 0;
 bool SpectrumMode::keyWasPressed = false;
 uint8_t SpectrumMode::currentChannel = 1;
 uint32_t SpectrumMode::lastHopTime = 0;
+uint32_t SpectrumMode::startTime = 0;
 
 void SpectrumMode::init() {
     networks.clear();
@@ -53,6 +54,7 @@ void SpectrumMode::init() {
     keyWasPressed = false;
     currentChannel = 1;
     lastHopTime = 0;
+    startTime = 0;
     busy = false;
 }
 
@@ -77,6 +79,7 @@ void SpectrumMode::start() {
     
     running = true;
     lastUpdateTime = millis();
+    startTime = millis();
     
     Display::setWiFiStatus(true);
     Serial.println("[SPECTRUM] Running - scanning all channels");
@@ -114,6 +117,14 @@ void SpectrumMode::update() {
     if (now - lastUpdateTime > UPDATE_INTERVAL_MS) {
         pruneStale();
         lastUpdateTime = now;
+    }
+    
+    // N13TZSCH3 achievement - stare into the ether for 15 minutes
+    if (startTime > 0 && (now - startTime) >= 15 * 60 * 1000) {
+        if (!XP::hasAchievement(ACH_NIETZSWINE)) {
+            XP::unlockAchievement(ACH_NIETZSWINE);
+            Display::showToast("the ether deauths back");
+        }
     }
 }
 

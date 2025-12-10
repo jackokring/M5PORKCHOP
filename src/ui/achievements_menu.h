@@ -21,7 +21,7 @@ private:
     static bool showingDetail;  // Showing achievement detail popup
     
     static const uint8_t VISIBLE_ITEMS = 5;
-    static const uint8_t TOTAL_ACHIEVEMENTS = 16;
+    static const uint8_t TOTAL_ACHIEVEMENTS = 17;
     
     static void handleInput();
     static void drawDetail(M5Canvas& canvas);
