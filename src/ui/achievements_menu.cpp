@@ -47,7 +47,7 @@ static const struct {
     { ACH_PMKID_FIEND,    "PMK1D F1END",    "Capture 10 PMKIDs" },
     { ACH_TRIPLE_THREAT,  "TR1PLE THREAT",  "Capture 3 handshakes in one session" },
     { ACH_HOT_STREAK,     "H0T STREAK",     "Capture 5 handshakes in one session" },
-    { ACH_FIRST_DEAUTH,   "F1RST BL00D",    "Your first successful deauth" },
+    { ACH_FIRST_DEAUTH,   "F1RST D3AUTH",   "Your first successful deauth" },
     { ACH_DEAUTH_THOUSAND,"DEAUTH TH0USAND","Land 1000 successful deauths" },
     { ACH_RAMPAGE,        "RAMPAGE",        "10 deauths in one session" },
     { ACH_HALF_MARATHON,  "HALF MARAT0N",   "Walk 21km in a single session" },

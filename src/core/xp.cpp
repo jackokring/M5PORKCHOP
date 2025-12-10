@@ -121,7 +121,7 @@ static const char* ACHIEVEMENT_NAMES[] = {
     "PMK1D F1END",
     "TR1PLE THREAT",
     "H0T STREAK",
-    "F1RST BL00D",
+    "F1RST D3AUTH",
     "DEAUTH TH0USAND",
     "RAMPAGE",
     "HALF MARAT0N",
