@@ -509,6 +509,11 @@ void SpectrumMode::promiscuousCallback(void* buf, wifi_promiscuous_pkt_type_t ty
     // Detect PMF (Protected Management Frames)
     bool hasPMF = detectPMF(payload, len);
     
+    // If PMF is required and we have RSN, it's WPA3 (or WPA2/3 transitional)
+    if (hasPMF && authmode == WIFI_AUTH_WPA2_PSK) {
+        authmode = WIFI_AUTH_WPA3_PSK;
+    }
+    
     // Update spectrum data
     onBeacon(bssid, channel, rssi, ssid, authmode, hasPMF);
 }
