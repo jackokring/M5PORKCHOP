@@ -335,6 +335,14 @@ void Porkchop::handleInput() {
         }
     }
     
+    // WARHOG mode - Backspace to stop and return to idle
+    if (currentMode == PorkchopMode::WARHOG_MODE) {
+        if (M5Cardputer.Keyboard.isKeyPressed(KEY_BACKSPACE)) {
+            setMode(PorkchopMode::IDLE);
+            return;
+        }
+    }
+    
     // PIGGYBLUES mode - Backspace to stop and return to idle
     if (currentMode == PorkchopMode::PIGGYBLUES_MODE) {
         if (M5Cardputer.Keyboard.isKeyPressed(KEY_BACKSPACE)) {
