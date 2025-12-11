@@ -171,7 +171,7 @@ void Display::drawTopBar() {
             modeColor = COLOR_ACCENT;
             break;
         case PorkchopMode::SPECTRUM_MODE:
-            modeStr = "HOG ON SPECTRUM";
+            modeStr = "SPECTRUM";
             modeColor = COLOR_ACCENT;
             break;
         case PorkchopMode::MENU:
@@ -190,7 +190,25 @@ void Display::drawTopBar() {
         case PorkchopMode::LOG_VIEWER:
             modeStr = "LOG VIEWER";
             break;
+        case PorkchopMode::CAPTURES:
+            modeStr = "LOOT";
+            modeColor = COLOR_ACCENT;
+            break;
+        case PorkchopMode::ACHIEVEMENTS:
+            modeStr = "PR00F";
+            modeColor = COLOR_ACCENT;
+            break;
     }
+    
+    // Append mood indicator
+    int happiness = Mood::getCurrentHappiness();
+    String moodLabel;
+    if (happiness > 70) moodLabel = "HYP3";
+    else if (happiness > 30) moodLabel = "GUD";
+    else if (happiness > -10) moodLabel = "0K";
+    else if (happiness > -50) moodLabel = "M3H";
+    else moodLabel = "S4D";
+    modeStr += " " + moodLabel;
     
     topBar.setTextColor(modeColor);
     topBar.setTextDatum(top_left);

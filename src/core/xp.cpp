@@ -852,8 +852,13 @@ void XP::drawBar(M5Canvas& canvas) {
     canvas.setTextDatum(top_right);
     canvas.drawString(pctStr, DISPLAY_W - 2, barY);
     
-    // Draw progress bar
+    // Draw XP: label before progress bar
+    int xpLabelW = canvas.textWidth("XP:");
+    int xpLabelX = barX - xpLabelW - 2;  // 2px gap before bar
     canvas.setTextDatum(top_left);
+    canvas.drawString("XP:", xpLabelX, barY);
+    
+    // Draw progress bar
     canvas.drawString(barStr, barX, barY);
     
     // Level number - left side
@@ -862,11 +867,11 @@ void XP::drawBar(M5Canvas& canvas) {
     int levelW = canvas.textWidth(levelStr);
     canvas.drawString(levelStr, 2, barY);
     
-    // Title - fill space between level and bar (no truncation needed now)
+    // Title - fill space between level and XP: label
     const char* title = getTitle();
     String titleStr = title;
     int titleX = 2 + levelW + 4;  // 4px gap after level
-    int maxTitleW = barX - titleX - 4;  // Available space for title
+    int maxTitleW = xpLabelX - titleX - 4;  // Available space for title
     
     // Truncate only if really needed
     while (canvas.textWidth(titleStr) > maxTitleW && titleStr.length() > 3) {

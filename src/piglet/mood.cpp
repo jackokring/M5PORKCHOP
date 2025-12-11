@@ -13,6 +13,33 @@ uint32_t Mood::lastPhraseChange = 0;
 uint32_t Mood::phraseInterval = 5000;
 uint32_t Mood::lastActivityTime = 0;
 
+// Phrase category enum for no-repeat tracking
+enum class PhraseCategory : uint8_t {
+    HAPPY, EXCITED, HUNTING, SLEEPY, SAD, WARHOG, WARHOG_FOUND,
+    PIGGYBLUES_TARGETED, PIGGYBLUES_STATUS, PIGGYBLUES_IDLE,
+    DEAUTH, DEAUTH_SUCCESS, PMKID, SNIFFING, MENU_IDLE,
+    COUNT  // Must be last
+};
+
+// Last used phrase index per category (-1 = none)
+static int8_t lastPhraseIdx[(int)PhraseCategory::COUNT] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
+
+// Helper: pick random phrase avoiding last used
+static int pickPhraseIdx(PhraseCategory cat, int count) {
+    int catIdx = (int)cat;
+    int idx;
+    if (count <= 1) {
+        idx = 0;
+    } else {
+        // Pick random, but skip last used
+        do {
+            idx = random(0, count);
+        } while (idx == lastPhraseIdx[catIdx] && count > 1);
+    }
+    lastPhraseIdx[catIdx] = idx;
+    return idx;
+}
+
 // Phrase categories
 const char* PHRASES_HAPPY[] = {
     "snout pwns all",
@@ -59,16 +86,6 @@ const char* PHRASES_SAD[] = {
     "empty trough",
     "sad lil piggy",
     "need dem truffles"
-};
-
-const char* PHRASES_IDLE[] = {
-    "oink?",
-    "[O] hunt",
-    "[W] roam",
-    "[B] spam BLE",
-    "piggy awaits",
-    "hack the planet",
-    "snout on standby"
 };
 
 // WARHOG wardriving phrases
@@ -212,7 +229,7 @@ void Mood::onHandshakeCaptured(const char* apName) {
         snprintf(buf, sizeof(buf), templates[idx], ap.c_str());
         currentPhrase = buf;
     } else {
-        int idx = random(0, sizeof(PHRASES_EXCITED) / sizeof(PHRASES_EXCITED[0]));
+        int idx = pickPhraseIdx(PhraseCategory::EXCITED, sizeof(PHRASES_EXCITED) / sizeof(PHRASES_EXCITED[0]));
         currentPhrase = PHRASES_EXCITED[idx];
     }
     lastPhraseChange = millis();
@@ -236,7 +253,7 @@ void Mood::onPMKIDCaptured(const char* apName) {
     }
     
     // Show PMKID-specific phrase
-    int idx = random(0, sizeof(PHRASES_PMKID_CAPTURED) / sizeof(PHRASES_PMKID_CAPTURED[0]));
+    int idx = pickPhraseIdx(PhraseCategory::PMKID, sizeof(PHRASES_PMKID_CAPTURED) / sizeof(PHRASES_PMKID_CAPTURED[0]));
     currentPhrase = PHRASES_PMKID_CAPTURED[idx];
     lastPhraseChange = millis();
     
@@ -307,11 +324,11 @@ void Mood::onMLPrediction(float confidence) {
     // High confidence = happy
     if (confidence > 0.8f) {
         happiness = min(happiness + 15, 100);
-        int idx = random(0, sizeof(PHRASES_EXCITED) / sizeof(PHRASES_EXCITED[0]));
+        int idx = pickPhraseIdx(PhraseCategory::EXCITED, sizeof(PHRASES_EXCITED) / sizeof(PHRASES_EXCITED[0]));
         currentPhrase = PHRASES_EXCITED[idx];
     } else if (confidence > 0.5f) {
         happiness = min(happiness + 5, 100);
-        int idx = random(0, sizeof(PHRASES_HAPPY) / sizeof(PHRASES_HAPPY[0]));
+        int idx = pickPhraseIdx(PhraseCategory::HAPPY, sizeof(PHRASES_HAPPY) / sizeof(PHRASES_HAPPY[0]));
         currentPhrase = PHRASES_HAPPY[idx];
     }
     
@@ -333,7 +350,7 @@ void Mood::onNoActivity(uint32_t seconds) {
         // Very bored after 5 minutes
         happiness = max(happiness - 2, -100);
         if (happiness < -20) {
-            int idx = random(0, sizeof(PHRASES_SLEEPY) / sizeof(PHRASES_SLEEPY[0]));
+            int idx = pickPhraseIdx(PhraseCategory::SLEEPY, sizeof(PHRASES_SLEEPY) / sizeof(PHRASES_SLEEPY[0]));
             currentPhrase = PHRASES_SLEEPY[idx];
             lastPhraseChange = now;  // Prevent immediate re-selection
         }
@@ -347,7 +364,7 @@ void Mood::onWiFiLost() {
     happiness = max(happiness - 20, -100);
     lastActivityTime = millis();
     
-    int idx = random(0, sizeof(PHRASES_SAD) / sizeof(PHRASES_SAD[0]));
+    int idx = pickPhraseIdx(PhraseCategory::SAD, sizeof(PHRASES_SAD) / sizeof(PHRASES_SAD[0]));
     currentPhrase = PHRASES_SAD[idx];
     lastPhraseChange = millis();
 }
@@ -380,27 +397,33 @@ void Mood::onLowBattery() {
 void Mood::selectPhrase() {
     const char** phrases;
     int count;
+    PhraseCategory cat;
     
     if (happiness > 70) {
         // High happiness but not from handshake - use HAPPY not EXCITED
         // EXCITED phrases reserved for actual handshake captures
         phrases = PHRASES_HAPPY;
         count = sizeof(PHRASES_HAPPY) / sizeof(PHRASES_HAPPY[0]);
+        cat = PhraseCategory::HAPPY;
     } else if (happiness > 30) {
         phrases = PHRASES_HAPPY;
         count = sizeof(PHRASES_HAPPY) / sizeof(PHRASES_HAPPY[0]);
+        cat = PhraseCategory::HAPPY;
     } else if (happiness > -10) {
         phrases = PHRASES_HUNTING;
         count = sizeof(PHRASES_HUNTING) / sizeof(PHRASES_HUNTING[0]);
+        cat = PhraseCategory::HUNTING;
     } else if (happiness > -50) {
         phrases = PHRASES_SLEEPY;
         count = sizeof(PHRASES_SLEEPY) / sizeof(PHRASES_SLEEPY[0]);
+        cat = PhraseCategory::SLEEPY;
     } else {
         phrases = PHRASES_SAD;
         count = sizeof(PHRASES_SAD) / sizeof(PHRASES_SAD[0]);
+        cat = PhraseCategory::SAD;
     }
     
-    int idx = random(0, count);
+    int idx = pickPhraseIdx(cat, count);
     currentPhrase = phrases[idx];
 }
 
@@ -438,12 +461,16 @@ void Mood::draw(M5Canvas& canvas) {
     // Draw filled bubble with pink background
     canvas.fillRoundRect(bubbleX, bubbleY, bubbleW, bubbleH, 6, COLOR_FG);
     
-    // Draw < arrow pointing to piglet (filled triangle would be better but text works)
-    canvas.setTextSize(1);
-    canvas.setTextColor(COLOR_FG);
-    canvas.drawString("<", bubbleX - 6, bubbleY + bubbleH / 2 - 4);
+    // Draw filled triangle arrow pointing to piglet (comic-style speech bubble tail)
+    int arrowTipX = bubbleX - 8;              // Tip of arrow (points toward piglet)
+    int arrowTipY = bubbleY + bubbleH / 2;    // Vertically centered on bubble
+    int arrowBaseX = bubbleX;                  // Base connects to bubble edge
+    int arrowTopY = arrowTipY - 5;            // Top of base
+    int arrowBottomY = arrowTipY + 5;         // Bottom of base
+    canvas.fillTriangle(arrowTipX, arrowTipY, arrowBaseX, arrowTopY, arrowBaseX, arrowBottomY, COLOR_FG);
     
     // Draw phrase inside bubble with word wrapping - BLACK text on pink
+    canvas.setTextSize(1);
     canvas.setTextDatum(top_left);
     canvas.setTextColor(COLOR_BG);  // Black text
     
@@ -451,19 +478,27 @@ void Mood::draw(M5Canvas& canvas) {
     int textY = bubbleY + 6;
     int lineHeight = 12;
     
-    // Word wrap logic
+    // Word wrap logic - avoids mid-word cuts
     String remaining = phrase;
     int lineNum = 0;
     while (remaining.length() > 0 && lineNum < 4) {
         String line;
-        if (remaining.length() <= maxCharsPerLine) {
+        if ((int)remaining.length() <= maxCharsPerLine) {
             line = remaining;
             remaining = "";
         } else {
+            // Try to find space before limit
             int splitPos = remaining.lastIndexOf(' ', maxCharsPerLine);
-            if (splitPos <= 0) splitPos = maxCharsPerLine;
+            if (splitPos <= 0) {
+                // No space found before limit - search forward for next space
+                splitPos = remaining.indexOf(' ', maxCharsPerLine);
+                if (splitPos <= 0) {
+                    // No space at all - take entire remaining string
+                    splitPos = remaining.length();
+                }
+            }
             line = remaining.substring(0, splitPos);
-            remaining = remaining.substring(splitPos + 1);
+            remaining = (splitPos < (int)remaining.length()) ? remaining.substring(splitPos + 1) : "";
         }
         canvas.drawString(line, textX, textY + lineNum * lineHeight);
         lineNum++;
@@ -517,8 +552,8 @@ const char* PHRASES_MENU_IDLE[] = {
 void Mood::onSniffing(uint16_t networkCount, uint8_t channel) {
     lastActivityTime = millis();
     
-    // Randomly pick sniffing phrase with channel info
-    int idx = random(0, sizeof(PHRASES_SNIFFING) / sizeof(PHRASES_SNIFFING[0]));
+    // Pick sniffing phrase with channel info (no repeat)
+    int idx = pickPhraseIdx(PhraseCategory::SNIFFING, sizeof(PHRASES_SNIFFING) / sizeof(PHRASES_SNIFFING[0]));
     char buf[64];
     snprintf(buf, sizeof(buf), "%s CH%d (%d APs)", PHRASES_SNIFFING[idx], channel, networkCount);
     currentPhrase = buf;
@@ -532,7 +567,7 @@ void Mood::onDeauthing(const char* apName, uint32_t deauthCount) {
     String ap = (apName && strlen(apName) > 0) ? String(apName) : "ghost AP";
     if (ap.length() > 10) ap = ap.substring(0, 10) + "..";
     
-    int idx = random(0, sizeof(PHRASES_DEAUTH) / sizeof(PHRASES_DEAUTH[0]));
+    int idx = pickPhraseIdx(PhraseCategory::DEAUTH, sizeof(PHRASES_DEAUTH) / sizeof(PHRASES_DEAUTH[0]));
     char buf[64];
     snprintf(buf, sizeof(buf), PHRASES_DEAUTH[idx], ap.c_str());
     
@@ -557,7 +592,7 @@ void Mood::onDeauthSuccess(const uint8_t* clientMac) {
     char macStr[8];
     snprintf(macStr, sizeof(macStr), "%02X%02X", clientMac[4], clientMac[5]);
     
-    int idx = random(0, sizeof(PHRASES_DEAUTH_SUCCESS) / sizeof(PHRASES_DEAUTH_SUCCESS[0]));
+    int idx = pickPhraseIdx(PhraseCategory::DEAUTH_SUCCESS, sizeof(PHRASES_DEAUTH_SUCCESS) / sizeof(PHRASES_DEAUTH_SUCCESS[0]));
     char buf[48];
     snprintf(buf, sizeof(buf), PHRASES_DEAUTH_SUCCESS[idx], macStr);
     currentPhrase = buf;
@@ -570,14 +605,14 @@ void Mood::onDeauthSuccess(const uint8_t* clientMac) {
 }
 
 void Mood::onIdle() {
-    int idx = random(0, sizeof(PHRASES_MENU_IDLE) / sizeof(PHRASES_MENU_IDLE[0]));
+    int idx = pickPhraseIdx(PhraseCategory::MENU_IDLE, sizeof(PHRASES_MENU_IDLE) / sizeof(PHRASES_MENU_IDLE[0]));
     currentPhrase = PHRASES_MENU_IDLE[idx];
     lastPhraseChange = millis();
 }
 
 void Mood::onWarhogUpdate() {
     lastActivityTime = millis();
-    int idx = random(0, sizeof(PHRASES_WARHOG) / sizeof(PHRASES_WARHOG[0]));
+    int idx = pickPhraseIdx(PhraseCategory::WARHOG, sizeof(PHRASES_WARHOG) / sizeof(PHRASES_WARHOG[0]));
     currentPhrase = PHRASES_WARHOG[idx];
     lastPhraseChange = millis();
 }
@@ -592,7 +627,7 @@ void Mood::onWarhogFound(const char* apName, uint8_t channel) {
     // Award XP for WARHOG network logged with GPS
     XP::addXP(XPEvent::WARHOG_LOGGED);
     
-    int idx = random(0, sizeof(PHRASES_WARHOG_FOUND) / sizeof(PHRASES_WARHOG_FOUND[0]));
+    int idx = pickPhraseIdx(PhraseCategory::WARHOG_FOUND, sizeof(PHRASES_WARHOG_FOUND) / sizeof(PHRASES_WARHOG_FOUND[0]));
     currentPhrase = PHRASES_WARHOG_FOUND[idx];
     lastPhraseChange = millis();
 }
@@ -622,17 +657,17 @@ void Mood::onPiggyBluesUpdate(const char* vendor, int8_t rssi, uint8_t targetCou
     
     if (vendor != nullptr && rssi != 0) {
         // Targeted phrase with vendor info
-        int idx = random(0, sizeof(PHRASES_PIGGYBLUES_TARGETED) / sizeof(PHRASES_PIGGYBLUES_TARGETED[0]));
+        int idx = pickPhraseIdx(PhraseCategory::PIGGYBLUES_TARGETED, sizeof(PHRASES_PIGGYBLUES_TARGETED) / sizeof(PHRASES_PIGGYBLUES_TARGETED[0]));
         snprintf(buf, sizeof(buf), PHRASES_PIGGYBLUES_TARGETED[idx], vendor, rssi);
         currentPhrase = buf;
     } else if (targetCount > 0) {
         // Status phrase with target counts
-        int idx = random(0, sizeof(PHRASES_PIGGYBLUES_STATUS) / sizeof(PHRASES_PIGGYBLUES_STATUS[0]));
+        int idx = pickPhraseIdx(PhraseCategory::PIGGYBLUES_STATUS, sizeof(PHRASES_PIGGYBLUES_STATUS) / sizeof(PHRASES_PIGGYBLUES_STATUS[0]));
         snprintf(buf, sizeof(buf), PHRASES_PIGGYBLUES_STATUS[idx], targetCount, totalFound);
         currentPhrase = buf;
     } else {
         // Idle phrase
-        int idx = random(0, sizeof(PHRASES_PIGGYBLUES_IDLE) / sizeof(PHRASES_PIGGYBLUES_IDLE[0]));
+        int idx = pickPhraseIdx(PhraseCategory::PIGGYBLUES_IDLE, sizeof(PHRASES_PIGGYBLUES_IDLE) / sizeof(PHRASES_PIGGYBLUES_IDLE[0]));
         currentPhrase = PHRASES_PIGGYBLUES_IDLE[idx];
     }
     lastPhraseChange = millis();
