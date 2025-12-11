@@ -217,6 +217,79 @@ test/
 4. Define `setUp()`, `tearDown()`, `main()` with `UNITY_BEGIN()`/`UNITY_END()`
 5. Add testable functions to `test/mocks/testable_functions.h`
 
+### Writing Testable Functions (Lessons Learned)
+
+When extracting logic from source files to `test/mocks/testable_functions.h` for unit testing:
+
+**1. Pure Functions Only**
+- Functions must have NO side effects (no Serial, WiFi, Display, SD, etc.)
+- Take inputs as parameters, return outputs - no global state
+- Use `inline` to avoid multiple definition linker errors
+
+**2. Calculate Expected Values Carefully**
+When writing tests that check string lengths or buffer sizes, manually trace through the function:
+```cpp
+// Example: escapeCSV("Net\"work") 
+// Input: N, e, t, ", w, o, r, k = 8 chars
+// Opening quote: outPos = 1
+// N,e,t: outPos = 4  
+// " doubled to "": outPos = 6
+// w,o,r,k: outPos = 10
+// Closing quote: outPos = 11
+// Result: "Net""work" = 11 chars, NOT 12
+```
+Off-by-one errors are the most common test failures. Trace through the algorithm step-by-step.
+
+**3. Test File Structure**
+```cpp
+#include <unity.h>
+#include "../mocks/testable_functions.h"
+
+void setUp(void) {}
+void tearDown(void) {}
+
+void test_functionName_scenario(void) {
+    // Arrange
+    char input[] = "test";
+    char output[32];
+    
+    // Act
+    size_t result = myFunction(input, output, sizeof(output));
+    
+    // Assert
+    TEST_ASSERT_EQUAL_UINT(expected, result);
+    TEST_ASSERT_EQUAL_STRING("expected", output);
+}
+
+int main(int argc, char **argv) {
+    UNITY_BEGIN();
+    RUN_TEST(test_functionName_scenario);
+    return UNITY_END();
+}
+```
+
+**4. Common Pitfalls**
+- **Null terminator**: Don't count `\0` in string length, but DO allocate space for it
+- **Buffer overflow checks**: Test with `output = nullptr, maxLen = 0` to verify size calculation
+- **Edge cases**: Empty string, max length string, null pointer, single character
+- **Boundary values**: Test at exact boundaries (e.g., RSSI = -30 and -29 for threshold at -30)
+
+**5. Coverage Environment**
+The `native_coverage` environment requires both compile AND link flags:
+```ini
+[env:native_coverage]
+build_flags =
+    -fprofile-arcs
+    -ftest-coverage
+    -lgcov        # MUST link gcov library
+    --coverage    # MUST be in build_flags, not separate
+```
+Missing `-lgcov` causes `undefined reference to '__gcov_init'` linker errors.
+
+**6. CI-Only Testing (Windows)**
+Tests only run in GitHub Actions CI (Ubuntu). Do NOT attempt `pio test -e native` on Windows.
+Push and monitor CI runs at: https://github.com/neledov/M5PORKCHOP/actions
+
 ### Hardware Testing
 For features that can't be unit tested:
 1. Verify mode transitions
