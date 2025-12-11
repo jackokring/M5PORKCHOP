@@ -58,12 +58,12 @@ int Mood::getEffectiveHappiness() {
 enum class PhraseCategory : uint8_t {
     HAPPY, EXCITED, HUNTING, SLEEPY, SAD, WARHOG, WARHOG_FOUND,
     PIGGYBLUES_TARGETED, PIGGYBLUES_STATUS, PIGGYBLUES_IDLE,
-    DEAUTH, DEAUTH_SUCCESS, PMKID, SNIFFING, MENU_IDLE,
+    DEAUTH, DEAUTH_SUCCESS, PMKID, SNIFFING, MENU_IDLE, RARE,
     COUNT  // Must be last
 };
 
 // Last used phrase index per category (-1 = none)
-static int8_t lastPhraseIdx[(int)PhraseCategory::COUNT] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
+static int8_t lastPhraseIdx[(int)PhraseCategory::COUNT] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
 
 // Helper: pick random phrase avoiding last used
 static int pickPhraseIdx(PhraseCategory cat, int count) {
@@ -214,6 +214,24 @@ const char* PHRASES_PMKID_CAPTURED[] = {
     "SILENT BUT DEADLY",
     "PASSIVE AGGRESSION",
     "GHOST MODE PWN"
+};
+
+// Rare phrases - 5% chance to appear for surprise variety
+const char* PHRASES_RARE[] = {
+    "hack the planet",
+    "zero cool was here",
+    "the gibson awaits",
+    "mess with the best",
+    "phreak the airwaves",
+    "big truffle energy",
+    "oink or be oinked",
+    "sudo make sandwich",
+    "curly tail chaos",
+    "snout of justice",
+    "802.11 mudslinger",
+    "wardriving wizard",
+    "never trust a pig",
+    "pwn responsibly"
 };
 
 void Mood::init() {
@@ -455,7 +473,33 @@ void Mood::selectPhrase() {
     // Use effective happiness (base + momentum) for phrase selection
     int effectiveMood = getEffectiveHappiness();
     
-    if (effectiveMood > 70) {
+    // Phase 3: 5% chance for rare phrase (surprise variety)
+    int rareRoll = random(0, 100);
+    if (rareRoll < 5) {
+        phrases = PHRASES_RARE;
+        count = sizeof(PHRASES_RARE) / sizeof(PHRASES_RARE[0]);
+        cat = PhraseCategory::RARE;
+        int idx = pickPhraseIdx(cat, count);
+        currentPhrase = phrases[idx];
+        return;
+    }
+    
+    // Phase 2: Mood bleed-through - extreme moods can override category
+    // When very happy (>80), 30% chance to use excited phrases
+    // When very sad (<-60), 30% chance to use sad phrases
+    int bleedRoll = random(0, 100);
+    
+    if (effectiveMood > 80 && bleedRoll < 30) {
+        // Extremely happy - use excited phrases regardless of context
+        phrases = PHRASES_EXCITED;
+        count = sizeof(PHRASES_EXCITED) / sizeof(PHRASES_EXCITED[0]);
+        cat = PhraseCategory::EXCITED;
+    } else if (effectiveMood < -60 && bleedRoll < 30) {
+        // Extremely sad - melancholy bleeds through
+        phrases = PHRASES_SAD;
+        count = sizeof(PHRASES_SAD) / sizeof(PHRASES_SAD[0]);
+        cat = PhraseCategory::SAD;
+    } else if (effectiveMood > 70) {
         // High happiness but not from handshake - use HAPPY not EXCITED
         // EXCITED phrases reserved for actual handshake captures
         phrases = PHRASES_HAPPY;
