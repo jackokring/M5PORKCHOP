@@ -1,8 +1,8 @@
 // Warhog Mode - Wardriving with GPS
+// Refactored "GPS as Gate" architecture - no entries[] accumulation
 #pragma once
 
 #include <Arduino.h>
-#include <vector>
 #include <map>
 #include <set>
 #include <esp_wifi.h>
@@ -10,21 +10,6 @@
 #include <freertos/task.h>
 #include "../gps/gps.h"
 #include "../ml/features.h"
-
-struct WardrivingEntry {
-    uint8_t bssid[6];
-    char ssid[33];
-    int8_t rssi;
-    uint8_t channel;
-    wifi_auth_mode_t authmode;
-    double latitude;
-    double longitude;
-    double altitude;
-    uint32_t timestamp;
-    bool saved;
-    WiFiFeatures features;  // ML features for training data
-    uint8_t label;          // 0=unknown, 1=normal, 2=rogue, 3=evil_twin
-};
 
 // BSSID key for map lookup (6 bytes as uint64_t)
 inline uint64_t bssidToKey(const uint8_t* bssid) {
@@ -45,16 +30,11 @@ public:
     static void triggerScan();
     static bool isScanComplete();
     
-    // Data access
-    static const std::vector<WardrivingEntry>& getEntries() { return entries; }
-    static size_t getEntryCount() { return entries.size(); }
-    static size_t getNewCount() { return newCount; }
-    
-    // Export
+    // Export (data already on disk, these are for format info)
     static bool exportCSV(const char* path);
     static bool exportKismet(const char* path);
     static bool exportWigle(const char* path);
-    static bool exportMLTraining(const char* path);  // ML feature vectors for training
+    static bool exportMLTraining(const char* path);
     
     // GPS
     static bool hasGPSFix();
@@ -65,7 +45,8 @@ public:
     static uint32_t getOpenNetworks() { return openNetworks; }
     static uint32_t getWEPNetworks() { return wepNetworks; }
     static uint32_t getWPANetworks() { return wpaNetworks; }
-    static uint32_t getSavedCount() { return savedCount; }  // Records written with GPS fix
+    static uint32_t getSavedCount() { return savedCount; }  // Geotagged networks (CSV)
+    static uint32_t getMLOnlyCount() { return mlOnlyCount; } // ML-only networks (no GPS)
     
 private:
     static bool running;
@@ -74,38 +55,42 @@ private:
     static bool scanInProgress;
     static uint32_t scanStartTime;
     
-    static std::vector<WardrivingEntry> entries;
-    static std::set<uint64_t> seenBSSIDs;  // Lightweight duplicate tracking (persists after entries cleared)
-    static size_t newCount;
+    static std::set<uint64_t> seenBSSIDs;  // Duplicate tracking for session
     
     // Statistics
-    static uint32_t totalNetworks;
+    static uint32_t totalNetworks;   // All unique networks seen
     static uint32_t openNetworks;
     static uint32_t wepNetworks;
     static uint32_t wpaNetworks;
-    static uint32_t savedCount;     // Records saved with GPS fix
-    static String currentFilename;  // Current session CSV file
+    static uint32_t savedCount;      // Networks saved with GPS to CSV
+    static uint32_t mlOnlyCount;     // Networks saved to ML file without GPS
+    static String currentFilename;   // Current session CSV file
+    static String currentMLFilename; // Current session ML training file
     
     // Enhanced ML mode - beacon capture
     static bool enhancedMode;
-    static std::map<uint64_t, WiFiFeatures> beaconFeatures;  // BSSID -> features from beacons
+    static std::map<uint64_t, WiFiFeatures> beaconFeatures;
     static uint32_t beaconCount;
-    static volatile bool beaconMapBusy;  // Guard for beacon map access
+    static volatile bool beaconMapBusy;
     
     // Background scan task
     static TaskHandle_t scanTaskHandle;
     static volatile int scanResult;
     
-    // Periodic ML export
-    static uint32_t lastMLExport;
-    static const uint32_t ML_EXPORT_INTERVAL = 60000;  // 60 seconds
-    
     static void performScan();
     static void scanTask(void* pvParameters);
     static void processScanResults();
-    static void saveNewEntries();  // Auto-save entries with GPS to CSV
-    static void compactSavedEntries();  // Move saved entries to seenBSSIDs, free RAM
-    static int findEntry(const uint8_t* bssid);
+    
+    // File helpers - write directly per-network
+    static bool ensureCSVFileReady();
+    static bool ensureMLFileReady();
+    static void appendCSVEntry(const uint8_t* bssid, const char* ssid,
+                               int8_t rssi, uint8_t channel, wifi_auth_mode_t auth,
+                               double lat, double lon, double alt);
+    static void appendMLEntry(const uint8_t* bssid, const char* ssid,
+                              const WiFiFeatures& features, uint8_t label,
+                              double lat, double lon);
+    
     static String authModeToString(wifi_auth_mode_t mode);
     static String generateFilename(const char* ext);
     
@@ -113,5 +98,4 @@ private:
     static void promiscuousCallback(void* buf, wifi_promiscuous_pkt_type_t type);
     static void startEnhancedCapture();
     static void stopEnhancedCapture();
-
 };
