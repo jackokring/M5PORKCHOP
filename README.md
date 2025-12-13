@@ -293,9 +293,37 @@
     progress and check what buffs/debuffs are currently messing with
     your piglet's performance.
 
-    The buff system ties mood to mechanics. Happy pig = aggressive pig.
-    Sad pig = sluggish pig. Keep the happiness meter up and you'll
-    notice the difference.
+    Two tabs: ST4TS shows your lifetime scoreboard, B00STS shows
+    what's actively buffing or debuffing your pig.
+
+
+----[ 3.10.1 - Class System
+
+    Every 5 levels your pig promotes to a new class tier. Classes
+    grant PERMANENT CUMULATIVE buffs - higher tier = more stacking:
+
+        +--------+--------+------------------------------------------+
+        | LEVELS | CLASS  | BUFF UNLOCKED                            |
+        +--------+--------+------------------------------------------+
+        | 1-5    | SH0AT  | (starter tier - no perks yet)            |
+        | 6-10   | SN1FF3R| P4CK3T NOSE: -10% channel hop interval   |
+        | 11-15  | PWNER  | H4RD SNOUT: +1 deauth burst frame        |
+        | 16-20  | R00T   | R04D H0G: +15% distance XP               |
+        | 21-25  | R0GU3  | SH4RP TUSKS: +1s lock time               |
+        | 26-30  | EXPL01T| CR4CK NOSE: +10% capture XP              |
+        | 31-35  | WARL0RD| IR0N TUSKS: -1ms deauth jitter           |
+        | 36-40  | L3G3ND | OMNI P0RK: +5% all effects               |
+        +--------+--------+------------------------------------------+
+
+    Example: L38 player has ALL 7 class buffs active simultaneously.
+    That's -10% hop, +1 burst, +15% dist XP, +1s lock, +10% cap XP,
+    -1ms jitter, and +5% on everything. The grind pays off.
+
+
+----[ 3.10.2 - Mood Buffs/Debuffs
+
+    The mood system ties happiness to mechanics. Happy pig = aggressive.
+    Sad pig = sluggish. Keep the meter up and feel the difference.
 
     BUFFS (Positive Effects):
 
@@ -336,6 +364,8 @@
         BL3 BL4STS  = BLE spam packets sent
         S3SS10NS    = How many times you've fired this thing up
         GH0STS      = Hidden SSID networks found
+        WP4THR33    = WPA3 networks spotted (the future)
+        G30L0CS     = GPS-tagged network discoveries
 
     Keep the pig happy. Happy pig = effective pig.
 
@@ -501,9 +531,9 @@
         | Sound      | Beeps when things happen      | ON      |
         | Brightness | Display brightness            | 80%     |
         | Dim After  | Screen dim timeout, 0=never   | 30s     |
-        | Dim Level  | Brightness when dimmed        | 10%     |
+        | Dim Level  | Brightness when dimmed        | 20%     |
         | CH Hop     | Channel hop interval          | 500ms   |
-        | Scan Time  | Dwell time per channel        | 2000ms  |
+        | Lock Time  | Client discovery window       | 3000ms  |
         | Deauth     | Enable deauth attacks         | ON      |
         | Rnd MAC    | Randomize MAC on mode start   | ON      |
         | GPS        | Enable GPS module             | ON      |
@@ -513,6 +543,9 @@
         | Timezone   | UTC offset for timestamps     | 0       |
         | ML Mode    | Basic/Enhanced beacon capture | Basic   |
         | SD Log     | Debug logging to SD card      | OFF     |
+        | BLE Burst  | BLE advertisement interval    | 200ms   |
+        | BLE Adv    | Per-packet duration           | 100ms   |
+        | BLE Rescan | Target device refresh rate    | 60s     |
         +------------+-------------------------------+---------+
 
 
@@ -595,6 +628,8 @@
     |   |   +-- porkchop.cpp/h    # State machine, mode management
     |   |   +-- config.cpp/h      # Configuration (SPIFFS persistence)
     |   |   +-- sdlog.cpp/h       # SD card debug logging
+    |   |   +-- wsl_bypasser.cpp/h # Frame injection, MAC randomization
+    |   |   +-- xp.cpp/h          # RPG XP/leveling, achievements, NVS
     |   |
     |   +-- ui/
     |   |   +-- display.cpp/h     # Triple-canvas display system
@@ -603,6 +638,7 @@
     |   |   +-- captures_menu.cpp/h   # LOOT menu - browse captured handshakes
     |   |   +-- achievements_menu.cpp/h # Proof of pwn viewer
     |   |   +-- log_viewer.cpp/h  # View SD card logs
+    |   |   +-- swine_stats.cpp/h # Lifetime stats, buff/debuff system
     |   |
     |   +-- piglet/
     |   |   +-- avatar.cpp/h      # Derpy ASCII pig (flips L/R)
