@@ -33,6 +33,16 @@ bool Display::dimmed = false;
 bool Display::snapping = false;
 String Display::bottomOverlay = "";
 
+// PWNED banner state (displayed in top bar)
+static String lootSSID = "";
+static uint32_t lootDisplayUntil = 0;
+const uint32_t LOOT_DISPLAY_MS = 60000;  // 1 minute
+
+void Display::showLoot(const String& ssid) {
+    lootSSID = ssid;
+    lootDisplayUntil = millis() + LOOT_DISPLAY_MS;
+}
+
 extern Porkchop porkchop;
 
 void Display::init() {
@@ -227,29 +237,43 @@ void Display::drawTopBar() {
     else moodLabel = "S4D";
     modeStr += " " + moodLabel;
     
+    // Append PWNED banner if active (only in OINK mode)
+    if (mode == PorkchopMode::OINK_MODE && lootSSID.length() > 0 && millis() < lootDisplayUntil) {
+        modeStr += " PWNED " + lootSSID;
+    }
+    
     topBar.setTextColor(modeColor);
     topBar.setTextDatum(top_left);
-    topBar.drawString(modeStr, 2, 2);
-
-    // Clock (from GPS or --:--)
-    topBar.setTextColor(COLOR_FG);
+    
+    // Calculate right side width first for truncation
     String timeStr = GPS::hasFix() ? GPS::getTimeString() : "--:--";
-    
-    // Right side: battery + status icons
-    topBar.setTextDatum(top_right);
-    
-    // Battery percentage
     int battLevel = M5.Power.getBatteryLevel();
     String battStr = String(battLevel) + "%";
-    
-    // Status icons
     String status = "";
     status += gpsStatus ? "G" : "-";
     status += wifiStatus ? "W" : "-";
     status += mlStatus ? "M" : "-";
+    String rightStr = battStr + " " + status + " " + timeStr;
+    int rightWidth = topBar.textWidth(rightStr);
+    
+    // Truncate left string if it would overlap right side
+    int maxLeftWidth = DISPLAY_W - rightWidth - 8;  // 8px margin
+    while (topBar.textWidth(modeStr) > maxLeftWidth && modeStr.length() > 10) {
+        modeStr = modeStr.substring(0, modeStr.length() - 1);
+    }
+    if (topBar.textWidth(modeStr) > maxLeftWidth && modeStr.length() > 3) {
+        modeStr = modeStr.substring(0, modeStr.length() - 2) + "..";
+    }
+    
+    topBar.drawString(modeStr, 2, 2);
+
+    // Clock (from GPS or --:--)
+    topBar.setTextColor(COLOR_FG);
+    
+    // Right side: battery + status icons
+    topBar.setTextDatum(top_right);
     
     // Draw battery then status
-    String rightStr = battStr + " " + status + " " + timeStr;
     topBar.drawString(rightStr, DISPLAY_W - 2, 2);
 }
 

@@ -43,6 +43,9 @@ public:
     static void showLevelUp(uint8_t oldLevel, uint8_t newLevel);  // RPG level up popup
     static void showClassPromotion(const char* oldClass, const char* newClass);  // Class tier promotion popup
     
+    // PWNED banner (shown in top bar for 1 minute after capture)
+    static void showLoot(const String& ssid);
+    
     // Bottom bar overlay (for confirmation dialogs)
     static void setBottomOverlay(const String& message);  // Set custom bottom bar text
     static void clearBottomOverlay();                     // Clear overlay, restore normal
