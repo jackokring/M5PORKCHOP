@@ -145,6 +145,7 @@ public:
     static bool excludeNetwork(int index); // Add selected network to exclusion list
     static bool isExcluded(const uint8_t* bssid);  // Check if BSSID is excluded
     static uint16_t getExcludedCount();   // Number of excluded networks
+    static void removeBoarBro(uint64_t bssid);  // Remove from exclusion list
     static const std::set<uint64_t>& getExcludedSet() { return boarBros; }
     
 private:

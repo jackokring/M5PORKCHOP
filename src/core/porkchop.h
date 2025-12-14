@@ -19,7 +19,8 @@ enum class PorkchopMode : uint8_t {
     ABOUT,          // About screen
     FILE_TRANSFER,  // WiFi file transfer mode
     LOG_VIEWER,     // View SD card logs
-    SWINE_STATS     // Lifetime stats and buffs overlay
+    SWINE_STATS,    // Lifetime stats and buffs overlay
+    BOAR_BROS       // Manage excluded networks
 };
 
 // Events for async callbacks

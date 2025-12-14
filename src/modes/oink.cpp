@@ -2101,12 +2101,32 @@ bool OinkMode::saveBoarBros() {
                  (uint8_t)((bssid >> 16) & 0xFF),
                  (uint8_t)((bssid >> 8) & 0xFF),
                  (uint8_t)(bssid & 0xFF));
-        f.println(hex);
+        
+        // Try to find SSID from current networks
+        String ssid = "";
+        for (const auto& net : networks) {
+            if (bssidToUint64(net.bssid) == bssid) {
+                ssid = String(net.ssid);
+                break;
+            }
+        }
+        
+        if (ssid.length() > 0) {
+            f.printf("%s %s\n", hex, ssid.c_str());
+        } else {
+            f.println(hex);
+        }
     }
     
     f.close();
     Serial.printf("[OINK] Saved %d BOAR BROS\n", (int)boarBros.size());
     return true;
+}
+
+void OinkMode::removeBoarBro(uint64_t bssid) {
+    boarBros.erase(bssid);
+    saveBoarBros();
+    Serial.printf("[OINK] Removed BOAR BRO\n");
 }
 
 bool OinkMode::excludeNetwork(int index) {

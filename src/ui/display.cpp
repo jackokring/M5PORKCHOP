@@ -20,6 +20,7 @@
 #include "captures_menu.h"
 #include "achievements_menu.h"
 #include "swine_stats.h"
+#include "boar_bros_menu.h"
 
 // Static member initialization
 M5Canvas Display::topBar(&M5.Display);
@@ -135,6 +136,10 @@ void Display::update() {
         case PorkchopMode::SWINE_STATS:
             SwineStats::draw(mainCanvas);
             break;
+            
+        case PorkchopMode::BOAR_BROS:
+            BoarBrosMenu::draw(mainCanvas);
+            break;
     }
     
     drawBottomBar();
@@ -220,6 +225,14 @@ void Display::drawTopBar() {
             break;
         case PorkchopMode::SWINE_STATS:
             modeStr = "SW1N3 ST4TS";
+            modeColor = COLOR_ACCENT;
+            break;
+        case PorkchopMode::BOAR_BROS:
+            {
+                char buf[24];
+                snprintf(buf, sizeof(buf), "B04R BR0S (%d)", BoarBrosMenu::getCount());
+                modeStr = buf;
+            }
             modeColor = COLOR_ACCENT;
             break;
     }
@@ -356,6 +369,9 @@ void Display::drawBottomBar() {
     } else if (mode == PorkchopMode::SPECTRUM_MODE) {
         // SPECTRUM: show selected network info or scan status
         stats = SpectrumMode::getSelectedInfo();
+    } else if (mode == PorkchopMode::BOAR_BROS) {
+        // BOAR BROS: show key hints
+        stats = "[;/.] scroll  [D] delete  [Bksp] exit";
     } else {
         // Default: Networks, Handshakes, Deauths
         uint16_t netCount = porkchop.getNetworkCount();
