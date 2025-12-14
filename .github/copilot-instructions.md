@@ -4,6 +4,7 @@
 
 M5Porkchop is a WiFi security research tool for the M5Cardputer (ESP32-S3 based) with a "piglet" mascot personality. It features:
 - **OINK Mode**: WiFi scanning, handshake capture, PMKID capture, deauth attacks
+  - **DO NO HAM Mode**: Passive-only recon toggle (no attacks, fast hopping, PMKID still works)
 - **WARHOG Mode**: Wardriving with GPS logging
 - **PIGGYBLUES Mode**: BLE notification spam (AppleJuice, FastPair, Samsung, SwiftPair)
 - **HOG ON SPECTRUM Mode**: Real-time WiFi spectrum analyzer with Gaussian lobes
@@ -194,6 +195,7 @@ Mood phrases are context-aware arrays in `mood.cpp`:
 - `PHRASES_HAPPY[]` - On handshake capture
 - `PHRASES_EXCITED[]` - Major events (many networks, high activity)
 - `PHRASES_HUNTING[]` - During OINK mode scanning
+- `PHRASES_PASSIVE_RECON[]` - During DO NO HAM passive mode
 - `PHRASES_SLEEPY[]` - Low activity periods
 - `PHRASES_SAD[]` - No activity
 - `PHRASES_IDLE[]` - Idle state
@@ -752,6 +754,30 @@ WPA*01*PMKID*MAC_AP*MAC_CLIENT*ESSID***01
 - These are useless for cracking (no cached PMK for client)
 - Code skips zero PMKIDs during extraction AND save
 - If piglet announces PMKID capture, it's a real crackable one
+
+### OINK Mode - DO NO HAM (Passive Recon)
+Toggle in Settings Menu enables passive-only mode with hardcoded optimal values:
+```cpp
+const uint16_t DNH_HOP_INTERVAL = 150;     // 150ms = fast sweeps for mobile recon
+const size_t DNH_MAX_NETWORKS = 300;       // More networks for passive collecting
+const uint32_t DNH_STALE_TIMEOUT = 120000; // 2 minutes before network considered stale
+```
+
+**Behavior when `Config::wifi().doNoHam` is true:**
+- State machine stays in `SCANNING` forever - never transitions to LOCKING/ATTACKING
+- Uses 150ms channel hop interval (vs buff-modified ~500ms in attack mode)
+- Network capacity increased to 300 (vs 200)
+- Stale timeout extended to 120s (vs 60s)
+- MAC randomization always enabled (regardless of setting)
+- PMKID capture still works - M1 frames are passive catches
+- Calls `Mood::onPassiveRecon()` instead of `onSniffing()` for zen phrases
+
+**Implementation locations:**
+- `config.h`: `bool doNoHam = false;` in WiFiConfig struct
+- `config.cpp`: Load/save in WiFi section
+- `settings_menu.cpp`: Toggle after "Rnd MAC" (items[12])
+- `oink.cpp`: DNH constants, state machine SCANNING case, network capacity, stale timeout
+- `mood.cpp`: `PHRASES_PASSIVE_RECON[]` array, `onPassiveRecon()` function, `PhraseCategory::PASSIVE_RECON`
 
 ### MAC Randomization
 `WSLBypasser::randomizeMAC()` generates a random locally-administered MAC on mode start:

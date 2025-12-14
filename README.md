@@ -97,6 +97,28 @@
         * Both enabled by default, toggle in Settings if you're feeling bold
 
 
+------[ 3.1.1 - DO NO HAM Mode
+
+    Feeling peaceful? Got legal concerns? Toggle "DO NO HAM" in Settings
+    and OINK becomes a pure passive observer:
+
+        * Zero frames transmitted - pure promiscuous sniffing
+        * Fast 150ms channel hops - optimized for walking/driving
+        * 300 network capacity (vs 200 in attack mode)
+        * 2 minute stale timeout (vs 60s) - keeps networks longer
+        * MAC always randomized - stealth by default
+        * PMKID capture still works! M1 frames are passive catches
+
+    Perfect for:
+        - Legal recon in sensitive environments
+        - Fast-moving scenarios (car, bike, skateboard, running from security)
+        - When you just want to observe without disturbing the peace
+        - Catching PMKIDs from natural client reconnections
+
+    The piglet goes zen mode with peaceful phrases like "quiet observer"
+    and "sniff dont bite". Same pink pig, less criminal energy.
+
+
 ----[ 3.2 - WARHOG Mode
 
     GPS + WiFi = tactical mapping. Hook up an AT6668 and go mobile:
