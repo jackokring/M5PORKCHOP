@@ -43,6 +43,31 @@ static char pendingHandshakeSSID[33] = {0};
 static volatile bool pendingPMKIDCapture = false;
 static char pendingPMKIDSSID[33] = {0};
 
+// Pending handshake/PMKID creation (callback queues, update() does push_back)
+// This avoids vector reallocation in callback context
+struct PendingHandshakeCreate {
+    uint8_t bssid[6];
+    uint8_t station[6];
+    uint8_t messageNum;        // Which EAPOL message triggered this
+    uint8_t eapolData[256];    // Copy of EAPOL frame
+    uint16_t eapolLen;
+    uint8_t pmkid[16];         // If M1, may contain PMKID
+    bool hasPMKID;
+};
+static volatile bool pendingHandshakeCreateBusy = false;
+static volatile bool pendingHandshakeCreateReady = false;
+static PendingHandshakeCreate pendingHandshakeCreate;
+
+struct PendingPMKIDCreate {
+    uint8_t bssid[6];
+    uint8_t station[6];
+    uint8_t pmkid[16];
+    char ssid[33];
+};
+static volatile bool pendingPMKIDCreateBusy = false;
+static volatile bool pendingPMKIDCreateReady = false;
+static PendingPMKIDCreate pendingPMKIDCreate;
+
 // Pending log messages (simple ring buffer for debug output)
 #define PENDING_LOG_SIZE 4
 #define PENDING_LOG_LEN 96
@@ -347,6 +372,88 @@ void OinkMode::update() {
         Display::showLoot(lastPwnedSSID);  // Show PWNED banner in top bar
         SDLog::log("OINK", "PMKID captured: %s", pendingPMKIDSSID);
         pendingPMKIDCapture = false;
+    }
+    
+    // Process pending handshake creation (callback queued, we do push_back here)
+    if (pendingHandshakeCreateReady && !pendingHandshakeCreateBusy) {
+        pendingHandshakeCreateBusy = true;  // Prevent callback from overwriting
+        
+        // Create or find handshake entry in main thread context
+        int idx = findOrCreateHandshakeSafe(pendingHandshakeCreate.bssid, pendingHandshakeCreate.station);
+        if (idx >= 0) {
+            CapturedHandshake& hs = handshakes[idx];
+            uint8_t msgNum = pendingHandshakeCreate.messageNum;
+            
+            // Store the EAPOL frame (data is fixed array, check len==0 for "empty")
+            if (msgNum >= 1 && msgNum <= 4 && pendingHandshakeCreate.eapolLen > 0) {
+                int msgIdx = msgNum - 1;
+                if (hs.frames[msgIdx].len == 0) {  // Not already captured
+                    uint16_t copyLen = min((uint16_t)512, pendingHandshakeCreate.eapolLen);
+                    memcpy(hs.frames[msgIdx].data, pendingHandshakeCreate.eapolData, copyLen);
+                    hs.frames[msgIdx].len = copyLen;
+                    hs.frames[msgIdx].messageNum = msgNum;
+                    hs.frames[msgIdx].timestamp = millis();
+                    hs.capturedMask |= (1 << msgIdx);
+                    hs.lastSeen = millis();
+                    
+                    queueLog("[OINK] M%d captured (deferred)", msgNum);
+                    
+                    // Check if handshake is now complete
+                    if (hs.isComplete() && !hs.saved) {
+                        pendingHandshakeComplete = true;
+                        // Get SSID for this BSSID
+                        for (const auto& net : networks) {
+                            if (memcmp(net.bssid, pendingHandshakeCreate.bssid, 6) == 0) {
+                                strncpy(pendingHandshakeSSID, net.ssid, 32);
+                                pendingHandshakeSSID[32] = 0;
+                                strncpy(hs.ssid, net.ssid, 32);
+                                hs.ssid[32] = 0;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Handle PMKID from M1 if present
+            if (pendingHandshakeCreate.hasPMKID) {
+                int pIdx = findOrCreatePMKIDSafe(pendingHandshakeCreate.bssid, pendingHandshakeCreate.station);
+                if (pIdx >= 0 && !pmkids[pIdx].saved) {
+                    memcpy(pmkids[pIdx].pmkid, pendingHandshakeCreate.pmkid, 16);
+                    // Get SSID
+                    for (const auto& net : networks) {
+                        if (memcmp(net.bssid, pendingHandshakeCreate.bssid, 6) == 0) {
+                            strncpy(pmkids[pIdx].ssid, net.ssid, 32);
+                            pmkids[pIdx].ssid[32] = 0;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        
+        pendingHandshakeCreateReady = false;
+        pendingHandshakeCreateBusy = false;
+    }
+    
+    // Process pending PMKID creation (callback queued, we do push_back here)
+    if (pendingPMKIDCreateReady && !pendingPMKIDCreateBusy) {
+        pendingPMKIDCreateBusy = true;  // Prevent callback from overwriting
+        
+        // Create PMKID entry in main thread context
+        int idx = findOrCreatePMKIDSafe(pendingPMKIDCreate.bssid, pendingPMKIDCreate.station);
+        if (idx >= 0 && !pmkids[idx].saved) {
+            memcpy(pmkids[idx].pmkid, pendingPMKIDCreate.pmkid, 16);
+            pmkids[idx].timestamp = millis();
+            if (pendingPMKIDCreate.ssid[0] != 0) {
+                strncpy(pmkids[idx].ssid, pendingPMKIDCreate.ssid, 32);
+                pmkids[idx].ssid[32] = 0;
+            }
+            queueLog("[OINK] PMKID created (deferred)");
+        }
+        
+        pendingPMKIDCreateReady = false;
+        pendingPMKIDCreateBusy = false;
     }
     
     // ============ End Deferred Event Processing ============
@@ -1095,8 +1202,15 @@ void OinkMode::processDataFrame(const uint8_t* payload, uint16_t len, int8_t rss
     // Check for QoS Data frame (subtype has bit 3 set = 0x08, 0x09, etc.)
     // Frame control byte 0: bits 4-7 = subtype, bit 3 of subtype = QoS
     uint8_t subtype = (payload[0] >> 4) & 0x0F;
-    if (subtype & 0x08) {
+    bool isQoS = (subtype & 0x08) != 0;
+    if (isQoS) {
         offset += 2;  // QoS control field
+    }
+    
+    // Check for HTC field (High Throughput Control, +HTC/Order bit)
+    // Only present in QoS data frames when Order bit (bit 7 of FC byte 1) is set
+    if (isQoS && (payload[1] & 0x80)) {
+        offset += 4;  // HTC field
     }
     
     if (offset + 8 > len) return;
@@ -1198,9 +1312,10 @@ void OinkMode::processEAPOL(const uint8_t* payload, uint16_t len,
                         break;  // Skip invalid PMKID
                     }
                     
-                    // Check if we already have this PMKID
+                    // Check if we already have this PMKID (lookup only - no push_back)
                     int pmkIdx = findOrCreatePMKID(bssid, station);
                     if (pmkIdx >= 0 && !pmkids[pmkIdx].saved) {
+                        // Existing PMKID entry - update it directly (field writes are safe)
                         CapturedPMKID& p = pmkids[pmkIdx];
                         memcpy(p.pmkid, pmkidData, 16);
                         p.timestamp = millis();
@@ -1224,6 +1339,31 @@ void OinkMode::processEAPOL(const uint8_t* payload, uint16_t len,
                             pendingPMKIDSSID[32] = 0;
                             pendingPMKIDCapture = true;
                         }
+                    } else if (pmkIdx < 0) {
+                        // New PMKID - queue for creation in main thread
+                        if (!pendingPMKIDCreateBusy && !pendingPMKIDCreateReady) {
+                            memcpy(pendingPMKIDCreate.bssid, bssid, 6);
+                            memcpy(pendingPMKIDCreate.station, station, 6);
+                            memcpy(pendingPMKIDCreate.pmkid, pmkidData, 16);
+                            // Get SSID
+                            int netIdx = findNetwork(bssid);
+                            if (netIdx >= 0) {
+                                strncpy(pendingPMKIDCreate.ssid, networks[netIdx].ssid, 32);
+                                pendingPMKIDCreate.ssid[32] = 0;
+                            } else {
+                                pendingPMKIDCreate.ssid[0] = 0;
+                            }
+                            pendingPMKIDCreateReady = true;
+                            
+                            queueLog("[OINK] PMKID queued for creation");
+                            
+                            // Also queue the mood event
+                            if (!pendingPMKIDCapture) {
+                                strncpy(pendingPMKIDSSID, pendingPMKIDCreate.ssid, 32);
+                                pendingPMKIDSSID[32] = 0;
+                                pendingPMKIDCapture = true;
+                            }
+                        }
                     }
                     break;  // Found it, stop searching
                 }
@@ -1231,61 +1371,114 @@ void OinkMode::processEAPOL(const uint8_t* payload, uint16_t len,
         }
     }
     
-    // Find or create handshake entry
+    // Find or create handshake entry (lookup only - no push_back)
     int hsIdx = findOrCreateHandshake(bssid, station);
-    if (hsIdx < 0) return;
     
-    CapturedHandshake& hs = handshakes[hsIdx];
-    
-    // Store this frame
-    uint8_t frameIdx = messageNum - 1;
-    uint16_t copyLen = min((uint16_t)512, len);
-    memcpy(hs.frames[frameIdx].data, payload, copyLen);
-    hs.frames[frameIdx].len = copyLen;
-    hs.frames[frameIdx].messageNum = messageNum;
-    hs.frames[frameIdx].timestamp = millis();
-    
-    // Update mask
-    hs.capturedMask |= (1 << frameIdx);
-    hs.lastSeen = millis();
-    
-    // Look up SSID from networks if not set
-    if (hs.ssid[0] == 0) {
-        int netIdx = findNetwork(bssid);
-        if (netIdx >= 0) {
-            strncpy(hs.ssid, networks[netIdx].ssid, 32);
-            hs.ssid[32] = 0;  // Ensure null termination
+    if (hsIdx >= 0) {
+        // Existing handshake entry - update it directly (field writes are safe)
+        CapturedHandshake& hs = handshakes[hsIdx];
+        
+        // Store this frame
+        uint8_t frameIdx = messageNum - 1;
+        uint16_t copyLen = min((uint16_t)512, len);
+        memcpy(hs.frames[frameIdx].data, payload, copyLen);
+        hs.frames[frameIdx].len = copyLen;
+        hs.frames[frameIdx].messageNum = messageNum;
+        hs.frames[frameIdx].timestamp = millis();
+        
+        // Update mask
+        hs.capturedMask |= (1 << frameIdx);
+        hs.lastSeen = millis();
+        
+        // Look up SSID from networks if not set
+        if (hs.ssid[0] == 0) {
+            int netIdx = findNetwork(bssid);
+            if (netIdx >= 0) {
+                strncpy(hs.ssid, networks[netIdx].ssid, 32);
+                hs.ssid[32] = 0;  // Ensure null termination
+            }
         }
-    }
-    
-    queueLog("[OINK] EAPOL M%d captured! SSID:%s BSSID:%02X:%02X:%02X:%02X:%02X:%02X [%s%s%s%s]",
-             messageNum, 
-             hs.ssid[0] ? hs.ssid : "?",
-             bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5],
-             hs.hasM1() ? "1" : "-",
-             hs.hasM2() ? "2" : "-",
-             hs.hasM3() ? "3" : "-",
-             hs.hasM4() ? "4" : "-");
-    
-    // Only trigger mood + beep when handshake becomes complete (not for each frame)
-    // DEFERRED: Queue handshake event for main thread (avoids String ops in callback)
-    if (hs.isComplete() && !hs.saved) {
-        if (!pendingHandshakeComplete) {
-            strncpy(pendingHandshakeSSID, hs.ssid, 32);
-            pendingHandshakeSSID[32] = 0;
-            pendingHandshakeComplete = true;
+        
+        queueLog("[OINK] EAPOL M%d captured! SSID:%s BSSID:%02X:%02X:%02X:%02X:%02X:%02X [%s%s%s%s]",
+                 messageNum, 
+                 hs.ssid[0] ? hs.ssid : "?",
+                 bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5],
+                 hs.hasM1() ? "1" : "-",
+                 hs.hasM2() ? "2" : "-",
+                 hs.hasM3() ? "3" : "-",
+                 hs.hasM4() ? "4" : "-");
+        
+        // Only trigger mood + beep when handshake becomes complete (not for each frame)
+        // DEFERRED: Queue handshake event for main thread (avoids String ops in callback)
+        if (hs.isComplete() && !hs.saved) {
+            if (!pendingHandshakeComplete) {
+                strncpy(pendingHandshakeSSID, hs.ssid, 32);
+                pendingHandshakeSSID[32] = 0;
+                pendingHandshakeComplete = true;
+            }
+            autoSaveCheck();
         }
-        autoSaveCheck();
+    } else {
+        // New handshake - queue for creation in main thread
+        if (!pendingHandshakeCreateBusy && !pendingHandshakeCreateReady) {
+            memcpy(pendingHandshakeCreate.bssid, bssid, 6);
+            memcpy(pendingHandshakeCreate.station, station, 6);
+            pendingHandshakeCreate.messageNum = messageNum;
+            
+            // Copy EAPOL frame
+            uint16_t copyLen = min((uint16_t)sizeof(pendingHandshakeCreate.eapolData), len);
+            memcpy(pendingHandshakeCreate.eapolData, payload, copyLen);
+            pendingHandshakeCreate.eapolLen = copyLen;
+            
+            // Check if this M1 has PMKID already extracted (handled above)
+            pendingHandshakeCreate.hasPMKID = false;  // PMKID handled separately
+            
+            pendingHandshakeCreateReady = true;
+            queueLog("[OINK] EAPOL M%d queued for creation", messageNum);
+        }
     }
 }
 
 int OinkMode::findOrCreateHandshake(const uint8_t* bssid, const uint8_t* station) {
-    // Look for existing handshake with same BSSID+station pair
+    // CALLBACK VERSION: Lookup only, no push_back
+    // If not found, returns -1 and caller must queue to pendingHandshakeCreate
     for (int i = 0; i < (int)handshakes.size(); i++) {
         if (memcmp(handshakes[i].bssid, bssid, 6) == 0 &&
             memcmp(handshakes[i].station, station, 6) == 0) {
             return i;
         }
+    }
+    return -1;  // Not found - caller must queue for creation in main thread
+}
+
+int OinkMode::findOrCreatePMKID(const uint8_t* bssid, const uint8_t* station) {
+    // CALLBACK VERSION: Lookup only, no push_back
+    // If not found, returns -1 and caller must queue to pendingPMKIDCreate
+    for (int i = 0; i < (int)pmkids.size(); i++) {
+        if (memcmp(pmkids[i].bssid, bssid, 6) == 0 &&
+            memcmp(pmkids[i].station, station, 6) == 0) {
+            return i;
+        }
+    }
+    return -1;  // Not found - caller must queue for creation in main thread
+}
+
+// Safe versions for main thread use (does vector operations safely)
+int OinkMode::findOrCreateHandshakeSafe(const uint8_t* bssid, const uint8_t* station) {
+    // This version is ONLY called from update() in main loop context
+    // It's safe to do vector operations here
+    
+    // Look for existing
+    for (int i = 0; i < (int)handshakes.size(); i++) {
+        if (memcmp(handshakes[i].bssid, bssid, 6) == 0 &&
+            memcmp(handshakes[i].station, station, 6) == 0) {
+            return i;
+        }
+    }
+    
+    // Limit check
+    if (handshakes.size() >= MAX_HANDSHAKES) {
+        return -1;
     }
     
     // Create new entry
@@ -1299,7 +1492,7 @@ int OinkMode::findOrCreateHandshake(const uint8_t* bssid, const uint8_t* station
     hs.beaconData = nullptr;
     hs.beaconLen = 0;
     
-    // Try to copy the global beacon if it matches this BSSID
+    // Attach beacon if available
     if (beaconCaptured && beaconFrame && beaconFrameLen > 0) {
         const uint8_t* beaconBssid = beaconFrame + 16;
         if (memcmp(beaconBssid, bssid, 6) == 0) {
@@ -1307,25 +1500,18 @@ int OinkMode::findOrCreateHandshake(const uint8_t* bssid, const uint8_t* station
             if (hs.beaconData) {
                 memcpy(hs.beaconData, beaconFrame, beaconFrameLen);
                 hs.beaconLen = beaconFrameLen;
-                queueLog("[OINK] Beacon attached to handshake for %02X:%02X:%02X:%02X:%02X:%02X",
-                         bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
             }
         }
-    }
-    
-    // Limit handshake count to prevent OOM
-    // NOTE: Don't do vector erase/free in callback - just drop if at capacity
-    // Complete handshakes are auto-saved, so dropping new ones is acceptable
-    if (handshakes.size() >= MAX_HANDSHAKES) {
-        return -1;  // At capacity, can't create new handshake
     }
     
     handshakes.push_back(hs);
     return handshakes.size() - 1;
 }
 
-int OinkMode::findOrCreatePMKID(const uint8_t* bssid, const uint8_t* station) {
-    // Look for existing PMKID with same BSSID+station pair
+int OinkMode::findOrCreatePMKIDSafe(const uint8_t* bssid, const uint8_t* station) {
+    // This version is ONLY called from update() in main loop context
+    
+    // Look for existing
     for (int i = 0; i < (int)pmkids.size(); i++) {
         if (memcmp(pmkids[i].bssid, bssid, 6) == 0 &&
             memcmp(pmkids[i].station, station, 6) == 0) {
@@ -1333,7 +1519,7 @@ int OinkMode::findOrCreatePMKID(const uint8_t* bssid, const uint8_t* station) {
         }
     }
     
-    // Limit PMKID count to prevent OOM
+    // Limit check
     if (pmkids.size() >= MAX_PMKIDS) {
         return -1;
     }

@@ -190,6 +190,8 @@ private:
     static int findNetwork(const uint8_t* bssid);
     static int findOrCreateHandshake(const uint8_t* bssid, const uint8_t* station);
     static int findOrCreatePMKID(const uint8_t* bssid, const uint8_t* station);
+    static int findOrCreateHandshakeSafe(const uint8_t* bssid, const uint8_t* station);  // Main thread only
+    static int findOrCreatePMKIDSafe(const uint8_t* bssid, const uint8_t* station);      // Main thread only
     static void sortNetworksByPriority();
     static bool hasHandshakeFor(const uint8_t* bssid);
     static int getNextTarget();  // Smart target selection
