@@ -351,6 +351,10 @@ void OinkMode::update() {
     
     // ============ End Deferred Event Processing ============
     
+    // RELEASE LOCK EARLY - state machine doesn't need exclusive vector access
+    // This minimizes packet drop window from ~10ms to ~0.5ms
+    oinkBusy = false;
+    
     // Sync grass animation with channel hopping state
     Avatar::setGrassMoving(channelHopping);
     
@@ -650,7 +654,9 @@ void OinkMode::update() {
     }
     
     // Periodic network cleanup - remove stale entries
+    // Brief lock for vector erase operations
     if (now - lastScanTime > 30000) {
+        oinkBusy = true;  // Brief lock for cleanup
         uint32_t staleTimeout = Config::wifi().doNoHam ? DNH_STALE_TIMEOUT : 60000;
         for (auto it = networks.begin(); it != networks.end();) {
             if (now - it->lastSeen > staleTimeout) {
@@ -683,10 +689,8 @@ void OinkMode::update() {
                      (unsigned long)ESP.getFreeHeap(), 
                      (int)networks.size(), 
                      (int)handshakes.size());
+        oinkBusy = false;  // Release cleanup lock
     }
-    
-    // Release lock - allow promiscuous callback to process packets
-    oinkBusy = false;
 }
 
 void OinkMode::startScan() {
