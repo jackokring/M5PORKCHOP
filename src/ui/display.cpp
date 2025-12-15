@@ -341,19 +341,30 @@ void Display::drawBottomBar() {
         // LOG_VIEWER: show scroll hint
         stats = "[;/.] scroll  [Bksp] exit";
     } else if (mode == PorkchopMode::OINK_MODE) {
-        // OINK: show Networks, Handshakes, Deauths, Channel, and BRO count
+        // OINK: show Networks, Handshakes, Channel, and optionally Deauths/BRO count
         // (PWNED banner is shown in top bar)
+        // In DO NO HAM mode, hide D: counter since we're passive
         uint16_t netCount = OinkMode::getNetworkCount();
         uint16_t hsCount = OinkMode::getCompleteHandshakeCount();
         uint32_t deauthCount = OinkMode::getDeauthCount();
         uint8_t channel = OinkMode::getChannel();
         uint16_t broCount = OinkMode::getExcludedCount();
+        bool passive = Config::wifi().doNoHam;
         char buf[64];
-        if (broCount > 0) {
-            // Show BOAR BRO count
-            snprintf(buf, sizeof(buf), "N:%d HS:%d D:%lu CH:%d BRO:%d", netCount, hsCount, deauthCount, channel, broCount);
+        if (passive) {
+            // DO NO HAM: no D: counter (we don't deauth)
+            if (broCount > 0) {
+                snprintf(buf, sizeof(buf), "N:%d HS:%d CH:%d BRO:%d DOIN NO HAM", netCount, hsCount, channel, broCount);
+            } else {
+                snprintf(buf, sizeof(buf), "N:%d HS:%d CH:%d DOIN NO HAM", netCount, hsCount, channel);
+            }
         } else {
-            snprintf(buf, sizeof(buf), "N:%d HS:%d D:%lu CH:%d", netCount, hsCount, deauthCount, channel);
+            // Attack mode: show D: counter
+            if (broCount > 0) {
+                snprintf(buf, sizeof(buf), "N:%d HS:%d D:%lu CH:%d BRO:%d", netCount, hsCount, deauthCount, channel, broCount);
+            } else {
+                snprintf(buf, sizeof(buf), "N:%d HS:%d D:%lu CH:%d", netCount, hsCount, deauthCount, channel);
+            }
         }
         stats = String(buf);
     } else if (mode == PorkchopMode::PIGGYBLUES_MODE) {

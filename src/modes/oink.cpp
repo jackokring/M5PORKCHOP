@@ -471,6 +471,18 @@ void OinkMode::update() {
     // This minimizes packet drop window from ~10ms to ~0.5ms
     oinkBusy = false;
     
+    // DO NO HAM: Immediately abort any active attack if passive mode is enabled
+    // This ensures toggling D key stops attacks right away, not after current cycle
+    if (Config::wifi().doNoHam && autoState != AutoState::SCANNING && autoState != AutoState::BORED) {
+        Serial.println("[OINK] DO NO HAM enabled - aborting attack, returning to passive scan");
+        autoState = AutoState::SCANNING;
+        stateStartTime = now;
+        deauthing = false;
+        channelHopping = true;
+        targetIndex = -1;
+        memset(targetBssid, 0, 6);
+    }
+    
     // Sync grass animation with channel hopping state
     Avatar::setGrassMoving(channelHopping);
     

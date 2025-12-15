@@ -78,75 +78,109 @@
 
 ----[ 3.1 - OINK Mode
 
-    The bread and butter. Press 'O' and let the piglet loose:
+    This is why you're here. Press 'O' and watch your pig go feral.
 
-        * Channel hopping across all 802.11 channels
-        * Promiscuous mode packet capture  
-        * EAPOL frame detection and 4-way handshake reconstruction
-        * PMKID yoink from M1 frames - no client needed, pure stealth
-        * Smart PMKID filtering - zero/empty PMKIDs get tossed (useless cruft)
-        * Deauth capability for... "authorized testing purposes"
-        * Real-time ML classification of suspicious APs
-        * Auto-attack mode cycles through targets automatically
-        * Targeted deauth prioritizes discovered clients
-        * PCAP export to SD for post-processing
-        * Hashcat 22000 format export - both EAPOL (_hs.22000) and PMKID (.22000)
-        * Fire up that GPU: `hashcat -m 22000 loot.22000 wordlist.txt`
+    The hunt begins. Your piglet drops into promiscuous mode and starts
+    hopping channels like a crackhead at a frequency buffet. Every beacon,
+    every probe, every EAPOL frame gets slurped into its pink little brain.
 
-    Stealth features (because WIDS exist):
+    What you get:
 
-        * MAC randomization on mode start - new identity each time
-        * Deauth jitter (1-5ms random delays) - no machine-perfect timing
-        * Both enabled by default, toggle in Settings if you're feeling bold
+        * 802.11 channel surfing - all 13 channels, no rest for the wicked
+        * Raw packet capture - everything the radio can hear
+        * 4-way handshake reconstruction - we catch 'em, we stitch 'em
+        * PMKID yoink from M1 frames - clientless attack, pure stealth
+        * Smart filtering - empty PMKIDs get yeeted (they're useless cruft)
+        * Deauth capability - for "authorized penetration testing" wink wink
+        * ML classification - spot rogue APs before they spot you
+        * Auto-attack - cycles through targets like a rotisserie of pain
+        * Targeted deauth - discovered clients get personal attention
+        * Hashcat 22000 export - GPU goes brrrrrr
 
-    BOAR BROS system:
+    When a handshake drops, your pig loses its mind. Three beeps for 
+    PMKID, happy oinks for EAPOL. Feed it enough and watch the XP climb.
 
-        While in OINK mode, press [E] to add the selected network to your
-        BOAR BROS exclusion list. Tagged networks are permanently ignored:
+    Output format: `hashcat -m 22000 *.22000 rockyou.txt`
+    
+    Your GPU will thank you. Your electric bill won't.
 
-        * Excluded from attack targeting - your home router stays safe
-        * Excluding current target aborts attack immediately - instant mercy
-        * Excluded from deauth storms - don't pwn your own network
-        * Persists across reboots in /boar_bros.txt on SD card
-        * Hidden networks stored as "NONAME BRO"
-        * View/manage in menu: BOAR BROS (shows count: BRO: X)
-        * Delete bros from the list with [D] key in management menu
-        * Visible in HOG ON SPECTRUM mode with [BRO] indicator
 
-        Your neighbor's router? Fair game. Your own? BOAR BRO.
+    Stealth features (because WIDS exist and sysadmins have feelings):
+
+        * MAC randomization - new identity every mode start
+        * Deauth jitter (1-5ms random delays) - no machine-gun timing
+        * Both ON by default - we're not amateurs here
+
+    Want to get caught? Turn 'em off. We won't judge. Actually we will.
+
+
+    BOAR BROS - because nuking your own router is just sad:
+
+        Every hog needs a pack. Press [B] and that network becomes
+        family. Family don't get deauth'd. Family don't get stalked.
+        Family lives in /boar_bros.txt on your SD card forever.
+
+        * Home router? BRO. Work WiFi? ...your call.
+        * Hit [B] mid-attack and watch the frames stop cold
+        * Hidden networks join as "NONAME BRO" - anonymous bros welcome
+        * Spectrum mode tags 'em with [BRO] - visible loyalty
+        * Menu lets you manage your crew, [D] to cut ties
+
+        The exclusion list isn't about mercy. It's about not having
+        to explain to your roommate why Netflix keeps dropping.
+
+
+    Quick toggle - tactical mode switch:
+
+        Smash [D] while hunting to flip between chaos and zen:
+
+        * "BRAVO 6, GOING DARK" - attacks die instantly, ghost mode
+        * "WEAPONS HOT" - back to business after a 5s sweep
+        * Persists to config - your preference survives reboots
+        * Bottom bar screams "DOIN NO HAM" so you don't forget
+
+        Perfect for when security walks by. Or your conscience kicks in.
+        (just kidding, we know you don't have one)
 
 
 ------[ 3.1.1 - DO NO HAM Mode
 
-    Feeling peaceful? Got legal concerns? Toggle "DO NO HAM" in Settings
-    and OINK becomes a pure passive observer:
+    Sometimes you gotta be a good pig. Legal recon. Sensitive location.
+    Your mom's house. Whatever. Press [D] or toggle in Settings.
 
-        * Zero frames transmitted - pure promiscuous sniffing
-        * Fast 150ms channel hops - optimized for walking/driving
-        * 300 network capacity (vs 200 in attack mode)
-        * 2 minute stale timeout (vs 60s) - keeps networks longer
-        * MAC always randomized - stealth by default
-        * PMKID capture still works! M1 frames are passive catches
+    What changes:
 
-    Perfect for:
-        - Legal recon in sensitive environments
-        - Fast-moving scenarios (car, bike, skateboard, running from security)
-        - When you just want to observe without disturbing the peace
-        - Catching PMKIDs from natural client reconnections
+        * Zero TX - not a single frame leaves your radio
+        * 150ms channel hops - fast sweeps for drive-by recon
+        * 150 network cap - OOM protection when you're collecting hundreds
+        * 45s stale timeout - networks fall off faster when you're mobile
+        * MAC always randomized - stealth isn't optional here
+        * PMKID still works - M1 frames are passive catches, no TX needed
 
-    The piglet goes zen mode with peaceful phrases like "quiet observer"
-    and "sniff dont bite". Same pink pig, less criminal energy.
+    The beautiful thing about PMKID: APs just... give it to you. In the
+    first message of the handshake. Before any client even responds.
+    You're not attacking. You're receiving a gift. Legally distinct.
+
+    Perfect scenarios:
+
+        * Warwalking through office buildings (educational purposes)
+        * Fast recon from moving vehicles (passenger seat, officer)
+        * When you actually need to use the WiFi you're sniffing
+        * Catching natural reconnections without forcing them
+
+    Your pig goes zen. Phrases like "quiet observer" and "sniff dont bite".
+    Same ASCII face, zero criminal energy. The piglet equivalent of yoga.
 
 
 ------[ 3.1.2 - Stationary Operation Tuning
 
-    Sitting in one spot? Camping a target? Different tactics apply.
+    Parked somewhere? Camping a target? Time to optimize for the kill.
 
-    When you're NOT moving, your targets aren't either. You can afford
-    patience. The key insight: discovering clients BEFORE attacking is
-    exponentially more effective than broadcast deauth.
+    When you're planted, so are your targets. Patience pays. The secret
+    sauce: find the clients BEFORE you start swinging. Targeted deauth
+    is exponentially more effective than broadcast spam.
 
-    The math:
+    The math doesn't lie:
 
         +----------+------------------+-------------------+
         | Clients  | Targeted Deauths | Broadcast Deauths |
@@ -158,26 +192,27 @@
         |    3     |      15-24       |         1         |
         +----------+------------------+-------------------+
 
-    See that? One client = 5-8x more deauth pressure. Two clients = 10-16x.
-    Targeted deauth makes clients reconnect. Broadcast is just noise.
+    One client = 5-8x the pain. Two clients = 10-16x. Three? Absolute
+    carnage. Broadcast deauth is like yelling "FIRE" in a crowded room.
+    Targeted deauth is whispering in someone's ear "your session is over."
 
-    Optimal stationary config:
+    Optimal camping config:
 
         +------------+----------+---------+------------------------------+
-        | Setting    | OPTIMAL  | Default | Why                          |
+        | Setting    | CAMPING  | Default | Why                          |
         +------------+----------+---------+------------------------------+
-        | CH Hop     | 800ms    | 500ms   | Thorough coverage, no rush   |
+        | CH Hop     | 800ms    | 500ms   | Thorough sweep, no rush      |
         | Lock Time  | 6000ms   | 4000ms  | MORE CLIENTS = MORE PWNS     |
         | Deauth     | ON       | ON      | Obviously                    |
-        | Rnd MAC    | ON       | ON      | Stealth                      |
-        | DO NO HAM  | OFF      | OFF     | Want those handshakes        |
+        | Rnd MAC    | ON       | ON      | Still need stealth           |
+        | DO NO HAM  | OFF      | OFF     | We're here for handshakes    |
         +------------+----------+---------+------------------------------+
 
-    Lock Time is THE lever for stationary ops. During LOCKING state,
-    the piglet sniffs data frames to discover connected clients. More
-    time = more clients found = targeted deauth avalanche.
+    Lock Time is THE lever. During LOCKING state, your pig sniffs data
+    frames to find connected clients. More time = more clients = more
+    surgical strikes = more handshakes = more passwords = more dopamine.
 
-    State machine timing breakdown:
+    The state machine:
 
         SCANNING (5s) --> LOCKING (6s*) --> ATTACKING (up to 15s)
                               |                    |
@@ -189,55 +224,94 @@
 
     * With recommended 6000ms Lock Time
 
-    Class buffs that help stationary ops:
+    Class perks that stack with stationary ops:
 
-        Level 21-25 (R0GU3):  SH4RP TUSKS +1s lock - even more discovery
-        Level 11-15 (PWNER):  H4RD SNOUT +1 burst - harder hits
-        Level 31-35 (WARL0RD): 1R0N TUSKS -1ms jitter - tighter bursts
+        R0GU3 (L21-25):  SH4RP TUSKS +1s lock - even more client discovery
+        PWNER (L11-15):  H4RD SNOUT +1 burst frame - hit harder
+        WARL0RD (L31+):  1R0N TUSKS -1ms jitter - tighter burst timing
 
-    TL;DR: Bump Lock Time to 6000ms. Thank us later.
+    TL;DR: Set Lock Time to 6000ms. Park your ass. Wait. Profit.
 
-    On the move? DO NO HAM mode is your friend. Fast 150ms hops catch
-    networks as you walk past. No attacks means no legal heat. PMKIDs
-    still get yoinked passively. Save the attack configs for when you're
-    parked. Mobile = passive recon. Stationary = surgical strikes.
+    Mobile recon? DO NO HAM mode. Stationary assault? Lock Time 6000ms.
+    Know the difference. Be the difference. Oink responsibly.
 
 
 ----[ 3.2 - WARHOG Mode
 
-    GPS + WiFi = tactical mapping. Hook up an AT6668 and go mobile:
+    Strap a GPS to your pig and hit the streets. Press 'W' to go full
+    wardriver - your ancestors did this with a Pringles can, you get to
+    do it with style.
 
-        * Real-time GPS coordinate display on bottom bar
-        * Automatic network discovery and logging
-        * Memory-safe design (auto-saves at 2000 entries)
-        * Feature extraction for ML training
-        * Multiple export formats:
-            - CSV: Simple, spreadsheet-ready
-            - Wigle: Upload your wardriving data to wigle.net
-            - Kismet NetXML: For your Kismet workflow
-            - ML Training: 32-feature vectors for model training
+    When your piglet has a fix, every network it sniffs gets tagged with
+    coordinates, timestamped, and dumped to SD. Wigle leaderboard chasers,
+    this is your mode.
+
+    What's happening under the hood:
+
+        * Real-time lat/lon on the bottom bar - watch yourself move
+        * Per-scan direct-to-disk writes - no RAM accumulation, no OOM
+        * 5000 BSSID cache before dedup stops (more than enough)
+        * Crash protection: 60s auto-dumps, worst case = 1 min data loss
+        * 32-feature ML extraction for every AP (Enhanced mode)
+
+    Export formats for your collection:
+
+        * CSV: Spreadsheet warriors, this is yours
+        * Wigle: Upload directly to wigle.net, flex your coverage
+        * Kismet NetXML: For the old school with Kismet workflows
+        * ML Training: Feature vectors for Edge Impulse, feed the brain
+
+    No GPS? No coordinates. The pig still logs networks but you get zeros
+    in the lat/lon columns. ML training data still useful though - Enhanced
+    mode extracts features regardless of GPS lock.
+
+    Pro tip: Set ML Mode to Enhanced before you roll out. Basic mode uses
+    the scan API. Enhanced mode parses raw 802.11 beacons. More features,
+    more fingerprinting power, more rogue AP detection. Worth the CPU.
+
+    When you're done, hit G0 or Backspace. Final export triggers. Your
+    wardriving data lives in /wardriving/ on the SD card. Bring it home,
+    upload it, brag about your coverage. Repeat.
 
 
 ----[ 3.3 - PIGGY BLUES Mode
 
-    When you feel like spreading digital chaos, press 'B' and watch 
-    nearby phones lose their minds:
+    Press 'B' and become everyone's least favorite person in the room.
 
-        * BLE notification spam for Apple, Android, Samsung, Windows
-        * Apple Nearby Action floods - fake AirPods pairing requests
-        * Google FastPair bombardment - endless earbuds popups
-        * Samsung Galaxy Buds/Watch pairing spam
-        * Windows SwiftPair beacon storms
-        * Smart targeting - scans for nearby devices and prioritizes
-          payloads matching detected vendors
-        * Random chaos mode when no targets identified
+    Your pig transforms into a BLE irritant generator. Every phone in
+    range starts lighting up with fake pairing requests, phantom earbuds,
+    and notification spam that just. Won't. Stop.
 
-    The piglet gets real chatty in this mode. Something about 
-    "spreading the oink" and "making friends the hard way."
+    The attack surface:
 
-    WARNING: This will annoy everyone around you. Educational use only.
-    Don't be that guy at the coffee shop. Actually, maybe be that guy
-    once, for science.
+        * AppleJuice floods - "AirPods Pro want to connect" x infinity
+        * Google FastPair spam - Android's worst nightmare, popup city
+        * Samsung Buds/Watch impersonation - Galaxy users aren't safe
+        * Windows SwiftPair storms - laptops join the party too
+        * Continuous passive scanning - finds devices, tailors payloads
+        * Vendor-aware targeting - Macs get Apple spam, Pixels get Google
+
+    The piglet gets REAL chatty in this mode. "making friends the hard
+    way" and "spreading the oink" are just the start. It knows what it's
+    doing. It's enjoying itself. Maybe too much.
+
+    How it works:
+
+        1. NimBLE async scan finds nearby devices
+        2. Manufacturer data fingerprints the vendor
+        3. Targeted payloads get crafted and queued
+        4. Opportunistic advertising in scan gaps
+        5. Repeat until you get escorted out or bored
+
+    Random chaos mode kicks in when no specific targets are found. Just
+    blanket-spams all protocol types. Scorched earth BLE policy.
+
+    DISCLAIMER: This WILL annoy everyone within ~10 meters. Educational
+    use only. Don't be that guy at the coffee shop. Or do. Once. For
+    science. Then delete this from your device before anyone finds it.
+
+    Achievement hunters: APPLE_FARMER, PARANOID_ANDROID, SAMSUNG_SPRAY,
+    WINDOWS_PANIC, BLE_BOMBER, OINKAGEDDON. You know what to do.
 
 
 ----[ 3.4 - HOG ON SPECTRUM Mode
@@ -268,17 +342,29 @@
 
 ----[ 3.5 - File Transfer Mode
 
-    Need to grab those juicy PCAPs off your piglet? WiFi file transfer:
+    Time to exfil. Your pig caught the goods, now get 'em off the device.
 
-        * Connects to YOUR WiFi network (configure SSID/password in settings)
-        * Black & white web interface at porkchop.local or device IP
-        * Browse SD card directories (/handshakes, /wardriving, etc.)
-        * Download captured handshakes and wardriving data
-        * Upload files back to the piglet
-        * No cables, no fuss
+    PORKCHOP fires up a WiFi AP client (connects to YOUR network) and
+    serves a janky black-and-white web interface. No CSS crimes here,
+    just function.
 
-    Set your network creds in Settings before trying to connect or the
-    pig will stare at you blankly wondering what you expected.
+        * Hit porkchop.local or the IP shown on screen
+        * Browse SD card: /handshakes, /wardriving, /mldata, /logs
+        * Download your .22000 files for hashcat
+        * Upload wordlists, configs, whatever fits
+        * No drivers, no cables, no USB permission bullsh*t
+
+    Setup requirements:
+        1. Configure WiFi SSID and password in Settings FIRST
+        2. Make sure you're in range of that network
+        3. Enter File Transfer from menu
+
+    If you skip step 1, the pig just stares at you. It can't read your
+    mind. It also can't connect to "linksys" with password "admin123"
+    if you didn't tell it to.
+
+    The web UI is deliberately ugly. It's functional. You're here to
+    move files, not admire rounded corners. Get in, get out, get cracking.
 
 
 ----[ 3.6 - LOOT Menu & WPA-SEC Integration
@@ -643,10 +729,11 @@
         | O     | OINK - start hunting             |
         | W     | WARHOG - start wardriving        |
         | B     | PIGGY BLUES - BLE chaos mode     |
+        |       | (in OINK: add BOAR BRO)          |
         | H     | HOG ON SPECTRUM - WiFi analyzer  |
         | S     | SWINE STATS - lifetime stats     |
         | T     | Tweak settings                   |
-        | E     | Exclude network (BOAR BRO)       |
+        | D     | Toggle DO NO HAM (in OINK mode)  |
         | P     | Screenshot - save to SD card     |
         | `     | Toggle menu / Go back            |
         | ;     | Navigate up / Scroll left        |
@@ -861,32 +948,52 @@
 
 --[ 10 - Legal sh*t
 
-    LISTEN CAREFULLY.
+    READ THIS PART, SKID.
 
-    This tool is for AUTHORIZED SECURITY RESEARCH and EDUCATIONAL
-    PURPOSES ONLY.
+    PORKCHOP is for AUTHORIZED SECURITY RESEARCH and EDUCATIONAL USE.
+    Period. Full stop. End of discussion.
 
-        * Only use on networks YOU OWN or have EXPLICIT WRITTEN PERMISSION
-        * Deauth attacks are ILLEGAL in most jurisdictions without consent
-        * Wardriving laws vary by location - know your local regulations
-        * The authors assume ZERO LIABILITY for misuse
-        * Don't be an a**hole
+        * Your networks only. Or written permission. IN WRITING.
+        * Deauth attacks are ILLEGAL in most places. Surprise!
+        * Wardriving legality varies. Google your jurisdiction.
+        * BLE spam is a dick move even if technically legal
+        * Authors assume ZERO LIABILITY. Not our problem.
+        * If you get caught, you never heard of us
 
-    If you use this to pwn your neighbor's WiFi, you deserve whatever
-    happens to you. We made a cute pig, not a get-out-of-jail-free card.
+    The law doesn't care that it's "just research" when you're sitting
+    in a police station explaining why you were parked outside a bank
+    with a directional antenna.
+
+    Your neighbor's WiFi password is not your WiFi password. Your
+    neighbor's streaming services are not your streaming services.
+    "But I only wanted to test..." is not a legal defense.
+
+    We made a cute ASCII pig that hunts WiFi. We did not make a magic
+    immunity talisman against federal telecommunications laws. The pig
+    can't testify on your behalf. The pig will not visit you in prison.
+
+    Don't be stupid. Don't be evil. Don't make us regret publishing this.
 
 
 --[ 11 - Greetz
 
-    Shouts to the legends:
+    Respect to those who came before:
 
-        * evilsocket & the pwnagotchi project - the original inspiration
-        * M5Stack - for making affordable hacking hardware
-        * Edge Impulse - democratizing ML on embedded
-        * The ESP32 community - keeping the hacking spirit alive
-        * You - for reading this far
+        * evilsocket & pwnagotchi - you started this madness
+        * M5Stack - cheap hardware, expensive possibilities
+        * Edge Impulse - ML for the rest of us
+        * The ESP32 underground - keeping embedded hacking alive
+        * Phrack Magazine - the OG zine we're poorly imitating
+        * Binrev, 2600, and the scene that won't die
+        * You - for scrolling past the legal section
 
     "The WiFi is free if you're brave enough."
+    
+    "With great packet injection comes great legal liability."
+    
+    "I used to be a script kiddie like you, then I took a deauth to the knee."
+
+    Stay paranoid. Stay curious. Stay out of trouble (mostly).
 
 OINK! OINK!
 

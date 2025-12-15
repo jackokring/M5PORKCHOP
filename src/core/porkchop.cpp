@@ -386,10 +386,10 @@ void Porkchop::handleInput() {
             setMode(PorkchopMode::IDLE);
             return;
         }
-        // E key - add selected network to BOAR BROS exclusion list
-        static bool eWasPressed = false;
-        bool ePressed = M5Cardputer.Keyboard.isKeyPressed('e') || M5Cardputer.Keyboard.isKeyPressed('E');
-        if (ePressed && !eWasPressed) {
+        // B key - add selected network to BOAR BROS exclusion list
+        static bool bWasPressed = false;
+        bool bPressed = M5Cardputer.Keyboard.isKeyPressed('b') || M5Cardputer.Keyboard.isKeyPressed('B');
+        if (bPressed && !bWasPressed) {
             int idx = OinkMode::getSelectionIndex();
             if (OinkMode::excludeNetwork(idx)) {
                 Display::showToast("BOAR BRO added!");
@@ -400,7 +400,29 @@ void Porkchop::handleInput() {
                 delay(500);
             }
         }
-        eWasPressed = ePressed;
+        bWasPressed = bPressed;
+        
+        // D key - toggle DO NO HAM (passive recon mode)
+        static bool dWasPressed = false;
+        bool dPressed = M5Cardputer.Keyboard.isKeyPressed('d') || M5Cardputer.Keyboard.isKeyPressed('D');
+        if (dPressed && !dWasPressed) {
+            // Toggle DO NO HAM mode
+            bool newState = !Config::wifi().doNoHam;
+            Config::wifi().doNoHam = newState;
+            Config::save();  // Persist to config file
+            
+            if (newState) {
+                Display::showToast("DO NO HAM: ON");
+                delay(400);
+                Display::showToast("BRAVO 6, GOING DARK");
+            } else {
+                Display::showToast("DO NO HAM: OFF");
+                delay(400);
+                Display::showToast("WEAPONS HOT");
+            }
+            delay(500);
+        }
+        dWasPressed = dPressed;
     }
     
     // WARHOG mode - Backspace to stop and return to idle
