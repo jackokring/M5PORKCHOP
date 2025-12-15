@@ -39,6 +39,7 @@ static uint8_t pendingDeauthStation[6] = {0};
 
 static volatile bool pendingHandshakeComplete = false;
 static char pendingHandshakeSSID[33] = {0};
+static volatile bool pendingAutoSave = false;  // Trigger autoSaveCheck from main loop
 
 static volatile bool pendingPMKIDCapture = false;
 static char pendingPMKIDSSID[33] = {0};
@@ -49,7 +50,7 @@ struct PendingHandshakeCreate {
     uint8_t bssid[6];
     uint8_t station[6];
     uint8_t messageNum;        // Which EAPOL message triggered this
-    uint8_t eapolData[256];    // Copy of EAPOL frame
+    uint8_t eapolData[512];    // Copy of EAPOL frame (matches EAPOLFrame.data size)
     uint16_t eapolLen;
     uint8_t pmkid[16];         // If M1, may contain PMKID
     bool hasPMKID;
@@ -374,6 +375,12 @@ void OinkMode::update() {
         pendingPMKIDCapture = false;
     }
     
+    // Process pending auto-save (callback set flag, we do SD I/O here)
+    if (pendingAutoSave) {
+        autoSaveCheck();
+        pendingAutoSave = false;
+    }
+    
     // Process pending handshake creation (callback queued, we do push_back here)
     if (pendingHandshakeCreateReady && !pendingHandshakeCreateBusy) {
         pendingHandshakeCreateBusy = true;  // Prevent callback from overwriting
@@ -411,6 +418,8 @@ void OinkMode::update() {
                                 break;
                             }
                         }
+                        // Auto-save complete handshake (safe here - main thread context)
+                        autoSaveCheck();
                     }
                 }
             }
@@ -1410,13 +1419,14 @@ void OinkMode::processEAPOL(const uint8_t* payload, uint16_t len,
         
         // Only trigger mood + beep when handshake becomes complete (not for each frame)
         // DEFERRED: Queue handshake event for main thread (avoids String ops in callback)
+        // NOTE: autoSaveCheck() is called from main loop, not here (callback context)
         if (hs.isComplete() && !hs.saved) {
             if (!pendingHandshakeComplete) {
                 strncpy(pendingHandshakeSSID, hs.ssid, 32);
                 pendingHandshakeSSID[32] = 0;
                 pendingHandshakeComplete = true;
             }
-            autoSaveCheck();
+            pendingAutoSave = true;  // Queue auto-save for main loop
         }
     } else {
         // New handshake - queue for creation in main thread
