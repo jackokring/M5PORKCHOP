@@ -27,7 +27,7 @@ enum class TitleOverride : uint8_t {
 // XP event types for tracking
 enum class XPEvent : uint8_t {
     NETWORK_FOUND,          // +1 XP
-    NETWORK_HIDDEN,         // +5 XP
+    NETWORK_HIDDEN,         // +3 XP
     NETWORK_WPA3,           // +10 XP
     NETWORK_OPEN,           // +3 XP
     NETWORK_WEP,            // +5 XP (rare find!)
@@ -37,16 +37,16 @@ enum class XPEvent : uint8_t {
     DEAUTH_SUCCESS,         // +15 XP
     WARHOG_LOGGED,          // +2 XP
     DISTANCE_KM,            // +25 XP
-    BLE_BURST,              // +1 XP
+    BLE_BURST,              // +2 XP
     BLE_APPLE,              // +3 XP
     BLE_ANDROID,            // +2 XP
     BLE_SAMSUNG,            // +2 XP
     BLE_WINDOWS,            // +2 XP
-    GPS_LOCK,               // +10 XP
+    GPS_LOCK,               // +5 XP
     ML_ROGUE_DETECTED,      // +25 XP
-    SESSION_30MIN,          // +50 XP
-    SESSION_60MIN,          // +100 XP
-    SESSION_120MIN,         // +200 XP
+    SESSION_30MIN,          // +10 XP
+    SESSION_60MIN,          // +25 XP
+    SESSION_120MIN,         // +50 XP
     LOW_BATTERY_CAPTURE,    // +20 XP bonus
     // DO NO HAM / BOAR BROS events (v0.1.4+)
     DNH_NETWORK_PASSIVE,    // +2 XP - network found in passive mode
@@ -55,7 +55,7 @@ enum class XPEvent : uint8_t {
     BOAR_BRO_MERCY          // +15 XP - excluded mid-attack target
 };
 
-// Achievement bitflags (uint64_t for 47 achievements)
+// Achievement bitflags (uint64_t for 60 achievements)
 enum PorkAchievement : uint64_t {
     ACH_NONE            = 0,
     // Original 17 achievements (bits 0-16)
@@ -135,7 +135,7 @@ enum PorkAchievement : uint64_t {
     ACH_FIVE_FAMILIES   = 1ULL << 54,  // 5 bros added lifetime
     ACH_MERCY_MODE      = 1ULL << 55,  // First mid-attack exclusion
     ACH_WITNESS_PROTECT = 1ULL << 56,  // 25 bros added lifetime (unlocks P4C1F1ST_P0RK)
-    ACH_FULL_ROSTER     = 1ULL << 57,  // Currently have 100 bros (max limit)
+    ACH_FULL_ROSTER     = 1ULL << 57,  // Currently have 50 bros (max limit)
     
     // Combined DO NO HAM + BOAR BROS achievements (bits 58-59)
     ACH_INNER_PEACE     = 1ULL << 58,  // 1hr passive + 10 bros + 0 deauths this session

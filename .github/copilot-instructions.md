@@ -897,7 +897,7 @@ Press [E] in OINK mode to add the selected network to the exclusion list:
 - Excluded networks skipped in `getNextTarget()` for attack targeting
 - Excluded networks skipped in deauth storms
 - Persists across reboots via SD card file
-- Max 100 entries (`MAX_BOAR_BROS`)
+- Max 50 entries (`MAX_BOAR_BROS`)
 
 **Key Functions:**
 - `OinkMode::excludeNetwork(int index)` - Add network to boarBros map
@@ -1136,7 +1136,7 @@ The game includes a mood-based buff/debuff system that modifies deauth packet ra
 - **SWINE STATS** menu item (between HOG ON SPECTRUM and FILE TRANSFER)
 
 **Tabbed Display Layout:**
-SWINE STATS uses a two-tab interface (switch with `;` / `.` keys):
+SWINE STATS uses a two-tab interface (switch with `,` / `/` keys):
 
 Tab 1 - ST4TS:
 ```

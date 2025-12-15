@@ -16,7 +16,7 @@ void (*XP::levelUpCallback)(uint8_t, uint8_t) = nullptr;
 // XP values for each event type (synced with docs/RPG_IMPLEMENTATION_PLAN.txt)
 static const uint16_t XP_VALUES[] = {
     1,      // NETWORK_FOUND
-    3,      // NETWORK_HIDDEN (was 5, doc says 3)
+    3,      // NETWORK_HIDDEN
     10,     // NETWORK_WPA3
     3,      // NETWORK_OPEN
     5,      // NETWORK_WEP (rare find!)
@@ -26,16 +26,16 @@ static const uint16_t XP_VALUES[] = {
     15,     // DEAUTH_SUCCESS
     2,      // WARHOG_LOGGED
     25,     // DISTANCE_KM
-    2,      // BLE_BURST (was 1, doc says 2)
+    2,      // BLE_BURST
     3,      // BLE_APPLE
     2,      // BLE_ANDROID
     2,      // BLE_SAMSUNG
     2,      // BLE_WINDOWS
-    5,      // GPS_LOCK (was 10, doc says 5)
+    5,      // GPS_LOCK
     25,     // ML_ROGUE_DETECTED
-    10,     // SESSION_30MIN (was 50, doc says 10)
-    25,     // SESSION_60MIN (was 100, doc says 25)
-    50,     // SESSION_120MIN (was 200, doc says 50)
+    10,     // SESSION_30MIN
+    25,     // SESSION_60MIN
+    50,     // SESSION_120MIN
     20,     // LOW_BATTERY_CAPTURE
     // DO NO HAM / BOAR BROS events (v0.1.4+)
     2,      // DNH_NETWORK_PASSIVE - same as regular network
@@ -1081,7 +1081,7 @@ void XP::checkAchievements() {
     
     // 100 bros = Full Roster (max limit)
     // Note: Check OinkMode::boarBros.size() when available
-    if (data.boarBrosAdded >= 100 && !hasAchievement(ACH_FULL_ROSTER)) {
+    if (data.boarBrosAdded >= 50 && !hasAchievement(ACH_FULL_ROSTER)) {
         unlockAchievement(ACH_FULL_ROSTER);
     }
     

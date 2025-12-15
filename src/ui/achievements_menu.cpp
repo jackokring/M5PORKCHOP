@@ -79,7 +79,7 @@ static const struct {
     { ACH_FIVE_FAMILIES,  "F1V3 F4M1L13S",  "5 networks in BOAR BROS" },
     { ACH_MERCY_MODE,     "M3RCY M0D3",     "First mid-attack exclusion" },
     { ACH_WITNESS_PROTECT,"W1TN3SS PR0T3CT","25 networks protected (unlocks title)" },
-    { ACH_FULL_ROSTER,    "FULL R0ST3R",    "100 networks in BOAR BROS (max)" },
+    { ACH_FULL_ROSTER,    "FULL R0ST3R",    "50 networks in BOAR BROS (max)" },
     // Combined DO NO HAM + BOAR BROS achievements
     { ACH_INNER_PEACE,    "1NN3R P34C3",    "1hr passive + 10 bros + no deauths" },
     { ACH_PACIFIST_RUN,   "P4C1F1ST RUN",   "50+ networks, all added as bros" },
