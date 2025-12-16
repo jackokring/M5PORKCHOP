@@ -57,6 +57,7 @@
         5.1 - Flashing Methods & Progress Preservation
     6 - Controls
     7 - Configuration
+        7.1 - Color Themes
     8 - ML Training Pipeline
     9 - Code Structure
     10 - Legal sh*t
@@ -822,6 +823,7 @@
         | Brightness | Display brightness            | 80%     |
         | Dim After  | Screen dim timeout, 0=never   | 30s     |
         | Dim Level  | Brightness when dimmed        | 20%     |
+        | Theme      | Color scheme for UI           | P1NK    |
         | CH Hop     | Channel hop interval          | 500ms   |
         | Lock Time  | Client discovery window       | 4000ms  |
         | Deauth     | Enable deauth attacks         | ON      |
@@ -845,6 +847,33 @@
     running Cardputer-Adv with Cap LoRa868 module, change pins to:
     RX=15, TX=13. Yes, swapped - ESP32 RX receives from GPS TX.
     GPS reinits automatically when pins change - no reboot.
+
+
+----[ 7.1 - Color Themes
+
+    Your piglet isn't locked to pink. Cycle through themes with ; and .
+    on the Theme setting. 10 options, from tactical to absurd:
+
+        +------------+--------------------------------------------+
+        | Theme      | Vibe                                       |
+        +------------+--------------------------------------------+
+        | P1NK       | Classic piglet pink on black (default)     |
+        | CYB3R      | Electric cyan. Because it's 2077 somewhere |
+        | M4TR1X     | Green phosphor. See the code, Neo          |
+        | AMB3R      | Warm terminal amber. Old school CRT feels  |
+        | BL00D      | Aggressive red. For when you mean business |
+        | GH0ST      | Grey on black. Low-viz stealth mode        |
+        +------------+--------------------------------------------+
+        | PAP3R      | Black on white. The inverted heresy        |
+        | BUBBLEGUM  | Hot pink on white. Aggressively visible    |
+        | M1NT       | Teal on white. Refreshing. Minty.          |
+        | SUNBURN    | Orange on white. Eye damage included       |
+        +------------+--------------------------------------------+
+
+    Dark themes (top) keep things tactical. Inverted themes (bottom)
+    exist for outdoor visibility or psychological warfare on bystanders.
+
+    Theme persists across reboots. Your piglet remembers its aesthetic.
 
 
 --[ 8 - ML Training Pipeline
