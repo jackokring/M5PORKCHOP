@@ -39,6 +39,7 @@ const PorkTheme THEMES[THEME_COUNT] = {
     {"SUNBURN",   0x0000, 0xFD20},  // Black on amber
     // Retro modes
     {"L1TTL3M1XY", 0x0B80, 0x9DE7}, // OG Game Boy LCD
+    {"B4NSH33",   0x37E0, 0x0000},  // P1 phosphor green CRT
 };
 
 uint16_t getColorFG() {

@@ -870,6 +870,7 @@
         | SUNBURN    | Orange on white. Eye damage included       |
         +------------+--------------------------------------------+
         | L1TTL3M1XY | OG Game Boy LCD. 1989 pea-soup nostalgia   |
+        | B4NSH33    | P1 phosphor green. VT100 ghost vibes       |
         +------------+--------------------------------------------+
 
     Dark themes (top) keep things tactical. Inverted themes (bottom)
@@ -1046,6 +1047,16 @@
         * Phrack Magazine - the OG zine we're poorly imitating
         * Binrev, 2600, and the scene that won't die
         * You - for scrolling past the legal section
+
+    Special shoutout to the Cardputer-ADV + LoRa testing crew:
+
+        * L1TTL3M1XY - sacrificed hardware to my broken RX/TX pin configs
+        * BansheeBacklash - emotional support through the GPIO nightmare
+
+    These absolute units stuck around while we debugged pin 13 vs 15
+    shenanigans on hardware they bought with real money. Their themes
+    are immortalized in the firmware. Heroes don't always wear capes,
+    sometimes they just have too many ESP32s.
 
     "The WiFi is free if you're brave enough."
     
