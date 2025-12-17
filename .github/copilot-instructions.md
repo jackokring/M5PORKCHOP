@@ -6,11 +6,13 @@ M5Porkchop is a WiFi security research tool for the M5Cardputer (ESP32-S3 based)
 - **OINK Mode**: WiFi scanning, handshake capture, PMKID capture, deauth attacks
   - **DO NO HAM Mode**: Passive-only recon toggle (no attacks, fast hopping, PMKID still works)
   - **BOAR BROS**: Network exclusion list (press B to exclude, persists to SD)
-- **WARHOG Mode**: Wardriving with GPS logging
+- **WARHOG Mode**: Wardriving with GPS logging, dual export (internal CSV + WiGLE v1.6)
+- **PORK TRACKS**: WiGLE file browser and uploader (upload wardrives from device)
 - **PIGGYBLUES Mode**: BLE notification spam (AppleJuice, FastPair, Samsung, SwiftPair)
 - **HOG ON SPECTRUM Mode**: Real-time WiFi spectrum analyzer with Gaussian lobes
 - **RPG XP System**: Level up from BACON N00B to MUDGE UNCHA1NED (40 ranks)
 - **WPA-SEC Integration**: Distributed cloud cracking with status tracking
+- **WiGLE Integration**: Upload wardrives to wigle.net directly from device
 - Interactive ASCII piglet avatar with mood-based phrases
 - Settings menu with persistent configuration
 - SD card logging and log viewer
@@ -100,7 +102,7 @@ Commit messages MUST be in full Phrack mode:
 
 ### Modes
 - `src/modes/oink.cpp/h` - OinkMode: WiFi scanning, channel hopping, promiscuous mode, handshake capture
-- `src/modes/warhog.cpp/h` - WarhogMode: GPS-enabled wardriving, multiple export formats (CSV, Wigle, Kismet, ML Training)
+- `src/modes/warhog.cpp/h` - WarhogMode: GPS-enabled wardriving, dual export (internal CSV + WiGLE v1.6), ML training data collection
 - `src/modes/piggyblues.cpp/h` - PiggyBluesMode: BLE notification spam targeting Apple/Android/Samsung/Windows devices
 - `src/modes/spectrum.cpp/h` - SpectrumMode: Real-time WiFi spectrum analyzer with Gaussian lobes, channel hopping
 
@@ -448,8 +450,16 @@ bool Config::loadWigleKeyFromFile() {
 **Controls:**
 - `[U]` Upload selected file to wigle.net
 - `[R]` Refresh file list
+- `[D]` Nuke all tracks (deletes both .csv and .wigle.csv, clears upload tracking)
 - `[Enter]` Show file details
 - `[\`]` Exit to menu
+
+**Nuke Feature:**
+- Confirms with modal dialog (Y/N/Enter)
+- Deletes all files matching `/wardriving/*.csv` and `/wardriving/*.wigle.csv`
+- Clears `/wigle_uploaded.txt` (upload tracking)
+- Shows toast with count of deleted files
+- Refreshes file list after nuke
 
 **Integration:**
 - `PorkchopMode::WIGLE_MENU` in porkchop.h
@@ -907,7 +917,7 @@ Session files are created with GPS timestamp or millis+random suffix:
 - **CSV**: `/wardriving/warhog_YYYYMMDD_HHMMSS.csv` - BSSID, SSID, RSSI, channel, auth, GPS coords
 - **ML Training**: `/mldata/ml_training_YYYYMMDD_HHMMSS.ml.csv` - 32-feature vector with labels
 
-Legacy export functions (`exportWigle`, `exportKismet`) are deprecated - data is already on disk.
+Data is written directly to SD card per-network - no batch export needed.
 
 ### Data Safety
 - SSIDs are properly escaped (CSV quotes, XML entities)
@@ -1339,20 +1349,47 @@ Triggered after `showLevelUp()` with 500ms delay.
 - **Keys**: `xp` (uint32), `lvl` (uint8), `hi_hs` (uint16), `hi_net` (uint16), `hi_km` (uint16), `ach` (uint16)
 - **Size**: ~40 bytes total in NVS
 
-### XP Events and Values
+### XP Events and Values (27 total)
 ```cpp
+// Network discovery
 NETWORK_FOUND      = 1     // Normal network discovered
 NETWORK_HIDDEN     = 3     // Hidden SSID found
+NETWORK_WPA3       = 10    // WPA3 network (security researcher cred)
+NETWORK_OPEN       = 3     // Open network found
+NETWORK_WEP        = 5     // WEP network (ancient relic!)
+
+// Captures
 HANDSHAKE_CAPTURED = 50    // WPA handshake grabbed
-DEAUTH_SUCCESS     = 15    // Deauth frames sent
+PMKID_CAPTURED     = 75    // Clientless PMKID (skill!)
+
+// Deauth
+DEAUTH_SENT        = 2     // Frame transmitted
+DEAUTH_SUCCESS     = 15    // Successful deauth
+
+// Wardriving
 WARHOG_LOGGED      = 2     // AP logged with GPS
-WARHOG_KM          = 25    // 1km walked while wardriving
+DISTANCE_KM        = 25    // 1km walked while wardriving
 GPS_LOCK           = 5     // First GPS fix of session
-BLE_BURST          = 2     // BLE spam burst sent
+
+// BLE (PIGGYBLUES)
+BLE_BURST          = 2     // Generic BLE spam burst
+BLE_APPLE          = 3     // AppleJuice popup triggered
+BLE_ANDROID        = 2     // FastPair notification
+BLE_SAMSUNG        = 2     // Samsung Buds spam
+BLE_WINDOWS        = 2     // SwiftPair notification
+
+// ML Detection
+ML_ROGUE_DETECTED  = 25    // Rogue AP detected
+
+// Session time
 SESSION_30MIN      = 10    // 30 minutes active
-SESSION_1HR        = 25    // 1 hour active
-SESSION_2HR        = 50    // 2 hours active (dedication)
-// DO NO HAM / BOAR BROS events (v0.1.4+)
+SESSION_60MIN      = 25    // 1 hour active
+SESSION_120MIN     = 50    // 2 hours (dedication!)
+
+// Special
+LOW_BATTERY_CAPTURE = 20   // Handshake at <10% battery
+
+// DO NO HAM / BOAR BROS (v0.1.4+)
 DNH_NETWORK_PASSIVE = 2    // Network found in passive mode
 DNH_PMKID_GHOST    = 100   // PMKID captured passively (rare!)
 BOAR_BRO_ADDED     = 5     // Network added to BOAR BROS
