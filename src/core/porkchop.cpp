@@ -336,8 +336,22 @@ void Porkchop::handleInput() {
         return;
     }
     
-    // Menu toggle with backtick
+    // Menu toggle with backtick - context-sensitive "back one level"
     if (M5Cardputer.Keyboard.isKeyPressed('`')) {
+        // In active modes: go to IDLE
+        if (currentMode == PorkchopMode::OINK_MODE ||
+            currentMode == PorkchopMode::WARHOG_MODE ||
+            currentMode == PorkchopMode::PIGGYBLUES_MODE ||
+            currentMode == PorkchopMode::SPECTRUM_MODE) {
+            setMode(PorkchopMode::IDLE);
+            return;
+        }
+        // In IDLE: open menu
+        if (currentMode == PorkchopMode::IDLE) {
+            setMode(PorkchopMode::MENU);
+            return;
+        }
+        // Other modes (FILE_TRANSFER, etc): go to menu
         setMode(PorkchopMode::MENU);
         return;
     }

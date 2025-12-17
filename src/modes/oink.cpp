@@ -2448,3 +2448,30 @@ bool OinkMode::excludeNetwork(int index) {
                   ssid.c_str(), (int)boarBros.size(), isMidAttack);
     return true;
 }
+
+// Exclude network by BSSID directly (for use from other modes like SPECTRUM)
+bool OinkMode::excludeNetworkByBSSID(const uint8_t* bssid, const char* ssidIn) {
+    if (boarBros.size() >= MAX_BOAR_BROS) {
+        Serial.println("[OINK] excludeNetworkByBSSID: max bros reached");
+        return false;
+    }
+    
+    uint64_t bssid64 = bssidToUint64(bssid);
+    
+    // Check if already excluded
+    if (boarBros.count(bssid64) > 0) {
+        return false;
+    }
+    
+    // Store BSSID with SSID (use NONAME BRO for hidden/empty networks)
+    String ssid = (ssidIn && ssidIn[0]) ? String(ssidIn) : "NONAME BRO";
+    boarBros[bssid64] = ssid;
+    saveBoarBros();
+    
+    // Award XP for BOAR BROS action
+    XP::addXP(XPEvent::BOAR_BRO_ADDED);  // +5 XP
+    
+    Serial.printf("[OINK] Added BOAR BRO via BSSID: %s (new mapSize=%d)\n", 
+                  ssid.c_str(), (int)boarBros.size());
+    return true;
+}

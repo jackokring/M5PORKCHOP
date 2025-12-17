@@ -151,6 +151,7 @@ public:
     static bool loadBoarBros();           // Load from SD
     static bool saveBoarBros();           // Save to SD
     static bool excludeNetwork(int index); // Add selected network to exclusion list
+    static bool excludeNetworkByBSSID(const uint8_t* bssid, const char* ssid); // Add by BSSID directly
     static bool isExcluded(const uint8_t* bssid);  // Check if BSSID is excluded
     static uint16_t getExcludedCount();   // Number of excluded networks
     static void removeBoarBro(uint64_t bssid);  // Remove from exclusion list
