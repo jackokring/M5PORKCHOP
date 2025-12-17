@@ -484,7 +484,7 @@
     hubris to ship it as "production ready." We have the second part.
     Working on the first.
     
-    Translation: don't bet your pentest report on these classifications yet.
+    TL;DR: don't bet your pentest report on these classifications yet.
     But feel free to collect data and help train the pig's brain.
 
     Here's what we're building toward - the ML system extracts
@@ -949,7 +949,7 @@
 
     WiGLE (wigle.net) - for wardrive uploads:
 
-        1. Create account at wigle.net (free)
+        1. Create account at wigle.net
         2. Go to Account -> API Token section
         3. Generate or copy your API name and token
         4. Create file on SD card root: /wigle_key.txt
@@ -962,7 +962,7 @@
 
     WPA-SEC (wpa-sec.stanev.org) - for distributed cracking:
 
-        1. Register at wpa-sec.stanev.org (free)
+        1. Register at wpa-sec.stanev.org
         2. Get your 32-character hex API key from profile
         3. Create file on SD card root: /wpasec_key.txt
         4. Contents: just the key, nothing else
@@ -1023,7 +1023,7 @@
 
 ----[ 8.3 - Training on Edge Impulse
 
-    Edge Impulse handles the heavy lifting:
+    Edge Impulse does the grunt work. You just click buttons:
 
         1. Create project at studio.edgeimpulse.com
         2. Upload your labeled ml_training.csv
