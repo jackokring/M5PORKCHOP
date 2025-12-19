@@ -465,7 +465,9 @@ void Display::drawBottomBar() {
         uint16_t netCount = porkchop.getNetworkCount();
         uint16_t hsCount = porkchop.getHandshakeCount();
         uint16_t deauthCount = porkchop.getDeauthCount();
-        stats = "N:" + String(netCount) + " HS:" + String(hsCount) + " D:" + String(deauthCount);
+        char buf[32];
+        snprintf(buf, sizeof(buf), "N:%03d HS:%02d D:%04d", netCount, hsCount, deauthCount);
+        stats = String(buf);
     }
     
     bottomBar.drawString(stats, 2, 3);
