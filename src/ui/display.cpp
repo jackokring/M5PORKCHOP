@@ -461,12 +461,11 @@ void Display::drawBottomBar() {
         // BOAR BROS: show delete hint
         stats = "[D] DELETE";
     } else {
-        // Default: Networks, Handshakes, Deauths
+        // Default: Networks, Handshakes (D: irrelevant in idle - pig isnt deauthing)
         uint16_t netCount = porkchop.getNetworkCount();
         uint16_t hsCount = porkchop.getHandshakeCount();
-        uint16_t deauthCount = porkchop.getDeauthCount();
         char buf[32];
-        snprintf(buf, sizeof(buf), "N:%03d HS:%02d D:%04d", netCount, hsCount, deauthCount);
+        snprintf(buf, sizeof(buf), "N:%03d HS:%02d", netCount, hsCount);
         stats = String(buf);
     }
     
