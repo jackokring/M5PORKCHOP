@@ -414,10 +414,10 @@ void Display::drawBottomBar() {
                 // Hidden network - show last 4 bytes of BSSID
                 const uint8_t* bssid = OinkMode::getTargetBSSID();
                 if (bssid) {
-                    snprintf(buf, sizeof(buf), "LOCK:??%02X%02X C:%d CH:%d", 
+                    snprintf(buf, sizeof(buf), "LOCK:??%02X%02X C:%02d CH:%02d", 
                              bssid[4], bssid[5], clients, channel);
                 } else {
-                    snprintf(buf, sizeof(buf), "LOCK:??? C:%d CH:%d", clients, channel);
+                    snprintf(buf, sizeof(buf), "LOCK:??? C:%02d CH:%02d", clients, channel);
                 }
             } else {
                 // Normal network - truncate SSID if too long
@@ -426,21 +426,21 @@ void Display::drawBottomBar() {
                 ssidShort[12] = '\0';
                 // Uppercase for readability
                 for (int i = 0; ssidShort[i]; i++) ssidShort[i] = toupper(ssidShort[i]);
-                snprintf(buf, sizeof(buf), "LOCK:%s C:%d CH:%d", ssidShort, clients, channel);
+                snprintf(buf, sizeof(buf), "LOCK:%s C:%02d CH:%02d", ssidShort, clients, channel);
             }
         } else if (passive) {
             // DO NO HAM: no D: counter (we don't deauth)
             if (broCount > 0) {
-                snprintf(buf, sizeof(buf), "N:%03d HS:%d CH:%02d BRO:%d DOIN NO HAM", netCount, hsCount, channel, broCount);
+                snprintf(buf, sizeof(buf), "N:%03d HS:%02d CH:%02d BRO:%02d  DOIN NO HAM", netCount, hsCount, channel, broCount);
             } else {
-                snprintf(buf, sizeof(buf), "N:%03d HS:%d CH:%02d DOIN NO HAM", netCount, hsCount, channel);
+                snprintf(buf, sizeof(buf), "N:%03d HS:%02d CH:%02d  DOIN NO HAM", netCount, hsCount, channel);
             }
         } else {
             // Attack mode: show D: counter
             if (broCount > 0) {
-                snprintf(buf, sizeof(buf), "N:%03d HS:%d D:%lu CH:%02d BRO:%d", netCount, hsCount, deauthCount, channel, broCount);
+                snprintf(buf, sizeof(buf), "N:%03d HS:%02d D:%04lu CH:%02d BRO:%02d", netCount, hsCount, deauthCount, channel, broCount);
             } else {
-                snprintf(buf, sizeof(buf), "N:%03d HS:%d D:%lu CH:%02d", netCount, hsCount, deauthCount, channel);
+                snprintf(buf, sizeof(buf), "N:%03d HS:%02d D:%04lu CH:%02d", netCount, hsCount, deauthCount, channel);
             }
         }
         stats = String(buf);
@@ -841,7 +841,7 @@ void Display::drawModeInfo(M5Canvas& canvas, PorkchopMode mode) {
         uint16_t hsCount = OinkMode::getCompleteHandshakeCount();
         uint32_t deauthCnt = OinkMode::getDeauthCount();
         char stats[48];
-        snprintf(stats, sizeof(stats), "N:%03d HS:%d D:%lu [BKSP]=STOP", 
+        snprintf(stats, sizeof(stats), "N:%03d HS:%02d D:%04lu [BKSP]=STOP", 
                  (int)networks.size(), hsCount, deauthCnt);
         canvas.drawString(stats, 2, MAIN_H - 12);
     } else if (mode == PorkchopMode::WARHOG_MODE) {
