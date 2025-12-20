@@ -4,8 +4,13 @@
 
 M5Porkchop is a WiFi security research tool for the M5Cardputer (ESP32-S3 based) with a "piglet" mascot personality. It features:
 - **OINK Mode**: WiFi scanning, handshake capture, PMKID capture, deauth attacks
-  - **DO NO HAM Mode**: Passive-only recon toggle (no attacks, fast hopping, PMKID still works)
+  - **DO NO HAM Toggle**: Passive-only recon within OINK (D key, no attacks, fast hopping)
   - **BOAR BROS**: Network exclusion list (press B to exclude, persists to SD)
+- **DO NO HAM Mode**: Standalone passive WiFi reconnaissance (separate from OINK)
+  - Pure listening mode - catches natural client reconnects
+  - PMKID capture from AP beacons (no deauth needed)
+  - Handshake capture from natural reconnections
+  - Fast channel hopping for maximum coverage
 - **WARHOG Mode**: Wardriving with GPS logging, dual export (internal CSV + WiGLE v1.6)
 - **PORK TRACKS**: WiGLE file browser and uploader (upload wardrives from device)
 - **PIGGYBLUES Mode**: BLE notification spam (AppleJuice, FastPair, Samsung, SwiftPair)
@@ -232,7 +237,7 @@ Used in: `showToast()`, `showLevelUp()`, `showClassPromotion()`, warning dialogs
 - **`.`** - Next/Down/Increase value
 - **Enter** - Select/Toggle/Confirm
 - **Backtick (`)** - Open menu / Exit to previous mode
-- **O/W/B/H/S/T** - Quick mode shortcuts from IDLE (Oink/Warhog/piggyBlues/Hog on spectrum/Swine stats/Tweak settings)
+- **O/W/B/H/S/T/D** - Quick mode shortcuts from IDLE (Oink/Warhog/piggyBlues/Hog on spectrum/Swine stats/Tweak settings/Do no ham)
 - **B** - In OINK mode: Add selected network to BOAR BROS exclusion list
 - **D** - In OINK mode: Toggle DO NO HAM (passive mode) - "BRAVO 6, GOING DARK" / "WEAPONS HOT"
 - **P** - Take screenshot (saves to `/screenshots/screenshotNNN.bmp` on SD card)
@@ -1115,7 +1120,77 @@ if (Config::wifi().doNoHam && autoState != AutoState::SCANNING && autoState != A
 ```cpp
 mac[0] = (mac[0] & 0xFC) | 0x02;  // Set local bit, clear multicast
 ```
-**Why**: Prevents device fingerprinting across sessions. Uses ESP32 hardware RNG (`esp_fill_random`). Called in OINK, WARHOG, and SPECTRUM mode start() if `Config::wifi().randomizeMAC` is true (default ON).
+**Why**: Prevents device fingerprinting across sessions. Uses ESP32 hardware RNG (`esp_fill_random`). Called in OINK, WARHOG, SPECTRUM, and DNH mode start() if `Config::wifi().randomizeMAC` is true (default ON).
+
+## DO NO HAM Mode (Standalone)
+
+### Overview
+Separate passive-only reconnaissance mode. Unlike the OINK mode toggle, this is a dedicated mode accessed from the menu or 'D' key from IDLE. Pure listening mode for stealthy recon.
+
+### Architecture
+- `src/modes/donoham.h` - DoNoHamMode class, DNHState enum
+- `src/modes/donoham.cpp` - Full implementation
+
+### Key Differences from OINK Mode Toggle
+| Feature | OINK Toggle | DNH Mode |
+|---------|-------------|----------|
+| Access | D key in OINK | D key from IDLE or menu |
+| State Machine | SCANNING only | HOPPING + DWELLING |
+| Network Storage | Shared with OINK | Separate vectors |
+| PMKID Dwell | Via OINK hybrid fix | Native DWELLING state |
+| Attack Resume | Toggle D again | Never (different mode) |
+
+### Constants
+```cpp
+static const size_t DNH_MAX_NETWORKS = 100;
+static const size_t DNH_MAX_PMKIDS = 50;
+static const size_t DNH_MAX_HANDSHAKES = 25;
+static const uint32_t DNH_STALE_TIMEOUT = 30000;  // 30s
+static const uint16_t DNH_HOP_INTERVAL = 200;     // 200ms per channel
+static const uint16_t DNH_DWELL_TIME = 300;       // 300ms dwell for SSID
+```
+
+### State Machine
+```
+DNHState:
+  HOPPING -> Cycles through channels at HOP_INTERVAL
+  DWELLING -> Pauses on channel to catch beacon for SSID backfill
+```
+Dwell is triggered when PMKID is captured but network SSID is unknown.
+
+### Shared Callback Pattern
+DNH mode reuses OINK's promiscuous callback:
+```cpp
+// In OinkMode::promiscuousCallback()
+if (DoNoHamMode::isRunning()) {
+    if (type == WIFI_PKT_MGMT && frameSubtype == 0x08) {
+        DoNoHamMode::handleBeacon(payload, len, rssi);
+    } else if (type == WIFI_PKT_DATA) {
+        DoNoHamMode::handleEAPOL(payload, len, rssi);
+    }
+    return;  // Don't process in OINK
+}
+```
+
+### XP Events
+- `DNH_NETWORK_PASSIVE` (2 XP) - Network discovered in DNH mode
+- `DNH_PMKID_GHOST` (100 XP) - Passive PMKID capture (rare!)
+- `HANDSHAKE_CAPTURED` (50 XP) - Natural handshake from reconnect
+
+### Display
+- Top bar: "DO NO HAM" with COLOR_ACCENT
+- Bottom bar: `N:xxx P:xx HS:xx CH:xx DNH`
+- Avatar state: NEUTRAL (calm, passive)
+
+### Capture Process
+1. **Beacon** → handleBeacon() → pendingNetworkAdd → update() → networks vector
+2. **M1 EAPOL** → handleEAPOL() → PMKID extraction → pendingPMKIDCreate → update()
+3. **M2/M3/M4** → handleEAPOL() → pendingHandshakeAdd → update() → handshakes vector
+4. **Valid Pair** → pendingHandshakeCapture → UI toast + XP
+
+### Saving
+- `saveAllPMKIDs()` - hashcat 22000 WPA*01 format to `/handshakes/BSSID.22000`
+- `saveAllHandshakes()` - hashcat 22000 WPA*02 format to `/handshakes/BSSID_hs.22000`
 
 ### WARHOG Mode - seenBSSIDs Set Growth
 The `seenBSSIDs` std::set grows during wardriving session:
