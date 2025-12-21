@@ -1961,7 +1961,8 @@ bool OinkMode::saveHandshake22000(const CapturedHandshake& hs, const char* path)
         eapolFrame = &hs.frames[1];  // M2
     }
     
-    if (nonceFrame->len < 51 || eapolFrame->len < 95) {
+    // MIC field is at offset 81-96 (16 bytes), so we need len >= 97 to read it safely
+    if (nonceFrame->len < 51 || eapolFrame->len < 97) {
         Serial.printf("[OINK] Frame too short for 22000 export (nonce:%d eapol:%d)\n",
                       nonceFrame->len, eapolFrame->len);
         return false;
