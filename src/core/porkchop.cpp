@@ -75,22 +75,22 @@ void Porkchop::init() {
     // Order: Modes -> Data/Stats -> Services
     std::vector<MenuItem> mainMenuItems = {
         // === MODES ===
-        {"OINK", 1, "HUNT FOR HANDSHAKES"},
-        {"CHILL DONOHAM", 14, "PASSIVE RECON (NO ATTACKS)"},
-        {"SGT WARHOG", 2, "WARDRIVE WITH GPS"},
-        {"PIGGY BLUES", 8, "BLE NOTIFICATION SPAM"},
-        {"HOG ON SPECTRUM", 10, "WIFI SPECTRUM ANALYZER"},
+        {"OINK", 1, "GO MENTAL - DEAUTH N CAPTURE INNIT"},
+        {"CHILL DONOHAM", 14, "PEACEFUL TING - JAH GUIDE THE SCAN"},
+        {"SGT WARHOG", 2, "RECON WALK - OSCAR MIKE WITH GPS"},
+        {"PIGGY BLUES", 8, "SLAY MODE - DEATH DROP ON BLE"},
+        {"HOG ON SPECTRUM", 10, "SPECTRUM GAZE - NIETZSCHE KNOWS"},
         // === DATA & STATS ===
-        {"SWINE STATS", 11, "LIFETIME STATS & BUFFS"},
-        {"LOOT", 4, "VIEW SAVED LOOT"},
-        {"PORK TRACKS", 13, "UPLOAD TO WIGLE"},
-        {"BOAR BROS", 12, "MANAGE FRIENDLY NETWORKS"},
-        {"ACHIEVEMENTS", 9, "PROOF OF PWN"},
+        {"SWINE STATS", 11, "RPG STATS - BUFFS DEBUFFS CLASSES"},
+        {"LOOT", 4, "WAR CHEST - HASHCAT/WPA-SEC READY CAPTURES"},
+        {"PORK TRACKS", 13, "WARDRIVING DATA - SHARE THE COORDZ"},
+        {"BOAR BROS", 12, "WHITELIST - RESPECT THE BRO CODE"},
+        {"ACHIEVEMENTS", 9, "UNLOCK LOG - SECRET TITLES N BADGES"},
         // === SERVICES ===
-        {"FILE TRANSFER", 3, "WIFI FILE SERVER"},
-        {"LOG VIEWER", 7, "DEBUG LOG TAIL"},
-        {"SETTINGS", 5, "TWEAK THE PIG"},
-        {"ABOUT", 6, "CREDITS AND INFO"}
+        {"FILE TRANSFER", 3, "HTTP SERVER - SD CARD WEB ACCESS"},
+        {"LOG VIEWER", 7, "SYSTEM TAIL - DEBUG LOG VIEWER"},
+        {"SETTINGS", 5, "CONFIG PANEL - PINS WIFI LOGGING"},
+        {"ABOUT", 6, "META DATA - VERSION N CONTRIBUTORS"}
     };
     Menu::setItems(mainMenuItems);
     Menu::setTitle("PORKCHOP OS");
