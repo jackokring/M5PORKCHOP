@@ -424,10 +424,10 @@ void Display::drawBottomBar() {
                     snprintf(buf, sizeof(buf), "LOCK:??? C:%02d CH:%02d", clients, channel);
                 }
             } else {
-                // Normal network - truncate SSID if too long
-                char ssidShort[13];
-                strncpy(ssidShort, targetSSID, 12);
-                ssidShort[12] = '\0';
+                // Normal network - truncate SSID if too long (14 chars, +2 from prev 12)
+                char ssidShort[15];
+                strncpy(ssidShort, targetSSID, 14);
+                ssidShort[14] = '\0';
                 // Uppercase for readability
                 for (int i = 0; ssidShort[i]; i++) ssidShort[i] = toupper(ssidShort[i]);
                 snprintf(buf, sizeof(buf), "LOCK:%s C:%02d CH:%02d", ssidShort, clients, channel);
