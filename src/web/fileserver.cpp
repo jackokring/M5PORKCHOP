@@ -277,7 +277,7 @@ static const char HTML_TEMPLATE[] PROGMEM = R"rawliteral(
         <div class="fkey"><span>Tab</span> Switch</div>
     </div>
     
-    <div class="status" id="status">Ready | Arrow keys navigate | Space select | Enter open | Tab switch pane</div>
+    <div class="status" id="status">awaiting orders | ↑↓ nav | space sel | enter exec | tab flip</div>
     
     <!-- New Folder Modal -->
     <div class="modal" id="newFolderModal" onclick="if(event.target===this)hideModal()">
@@ -343,7 +343,7 @@ async function loadSDInfo() {
         document.getElementById('sdInfo').textContent = 
             formatSize(d.used * 1024) + ' / ' + formatSize(d.total * 1024) + ' (' + pct + '%)';
     } catch(e) {
-        document.getElementById('sdInfo').textContent = 'SD unavailable';
+        document.getElementById('sdInfo').textContent = 'no sd. no loot.';
     }
 }
 
@@ -355,7 +355,7 @@ async function loadPane(id, path) {
     
     document.getElementById('path' + id).textContent = path || '/';
     const list = document.getElementById('list' + id);
-    list.innerHTML = '<div style="padding:20px;opacity:0.5">Loading...</div>';
+    list.innerHTML = '<div style="padding:20px;opacity:0.5">jacking in...</div>';
     
     try {
         const r = await fetch('/api/ls?dir=' + encodeURIComponent(path) + '&full=1');
@@ -379,7 +379,7 @@ async function loadPane(id, path) {
         
         renderPane(id);
     } catch(e) {
-        list.innerHTML = '<div style="padding:20px;opacity:0.5">Error loading</div>';
+        list.innerHTML = '<div style="padding:20px;opacity:0.5">load failed</div>';
     }
     updateSelectionInfo(id);
 }
@@ -389,7 +389,7 @@ function renderPane(id) {
     const list = document.getElementById('list' + id);
     
     if (pane.items.length === 0) {
-        list.innerHTML = '<div style="padding:20px;opacity:0.4;text-align:center">Empty</div>';
+        list.innerHTML = '<div style="padding:20px;opacity:0.4;text-align:center">void</div>';
         return;
     }
     
@@ -583,14 +583,14 @@ function getSelectedPaths() {
 async function deleteSelected() {
     const items = getSelectedPaths();
     if (items.length === 0) {
-        setStatus('Nothing selected');
+        setStatus('select targets first');
         return;
     }
     
-    const msg = 'Delete ' + items.length + ' item(s)? This cannot be undone.';
+    const msg = 'nuke ' + items.length + ' item(s)? no undo. no regrets.';
     if (!confirm(msg)) return;
     
-    setStatus('Deleting ' + items.length + ' items...');
+    setStatus('nuking ' + items.length + ' targets...');
     
     try {
         const resp = await fetch('/api/bulkdelete', {
@@ -599,21 +599,21 @@ async function deleteSelected() {
             body: JSON.stringify({ paths: items.map(i => i.path) })
         });
         const result = await resp.json();
-        setStatus('Deleted ' + result.deleted + '/' + items.length + ' items');
+        setStatus('nuked ' + result.deleted + '/' + items.length);
         refresh();
     } catch(e) {
-        setStatus('Delete error: ' + e.message);
+        setStatus('nuke failed: ' + e.message);
     }
 }
 
 async function downloadSelected() {
     const items = getSelectedPaths().filter(i => !i.isDir);
     if (items.length === 0) {
-        setStatus('No files selected (folders not downloadable as bulk)');
+        setStatus('no files marked. dirs need zip. we aint got zip.');
         return;
     }
     
-    setStatus('Downloading ' + items.length + ' file(s)...');
+    setStatus('exfiltrating ' + items.length + ' file(s)...');
     
     // Download files sequentially (browser limitation)
     for (let i = 0; i < items.length; i++) {
@@ -626,7 +626,7 @@ async function downloadSelected() {
         });
     }
     
-    setStatus('Downloaded ' + items.length + ' file(s)');
+    setStatus('exfil complete: ' + items.length);
 }
 
 function downloadFile(paneId, idx) {
@@ -661,8 +661,8 @@ function hideModal() {
 
 async function createFolder() {
     const name = document.getElementById('newFolderName').value.trim();
-    if (!name) { alert('Enter folder name'); return; }
-    if (name.includes('/') || name.includes('..')) { alert('Invalid name'); return; }
+    if (!name) { alert('name the directory'); return; }
+    if (name.includes('/') || name.includes('..')) { alert('illegal characters'); return; }
     
     const pane = panes[activePane];
     const path = (pane.path === '/' ? '' : pane.path) + '/' + name;
@@ -670,14 +670,14 @@ async function createFolder() {
     try {
         const resp = await fetch('/mkdir?f=' + encodeURIComponent(path));
         if (resp.ok) {
-            setStatus('Created: ' + name);
+            setStatus('spawned: ' + name);
             hideModal();
             loadPane(activePane, pane.path);
         } else {
-            setStatus('Failed to create folder');
+            setStatus('spawn failed');
         }
     } catch(e) {
-        setStatus('Error: ' + e.message);
+        setStatus('fault: ' + e.message);
     }
 }
 
@@ -691,7 +691,7 @@ async function uploadFiles(files) {
     
     let uploaded = 0;
     for (let i = 0; i < files.length; i++) {
-        setStatus('Uploading ' + (i+1) + '/' + files.length + ': ' + files[i].name);
+        setStatus('injecting ' + (i+1) + '/' + files.length + ': ' + files[i].name);
         fill.style.width = '0%';
         
         const formData = new FormData();
@@ -710,12 +710,12 @@ async function uploadFiles(files) {
             });
             uploaded++;
         } catch(e) {
-            setStatus('Upload failed: ' + files[i].name);
+            setStatus('inject failed: ' + files[i].name);
         }
     }
     
     bar.classList.remove('active');
-    setStatus('Uploaded ' + uploaded + '/' + files.length + ' files');
+    setStatus('injected ' + uploaded + '/' + files.length + ' payloads');
     loadPane(activePane, pane.path);
 }
 
