@@ -269,6 +269,12 @@ void DoNoHamMode::update() {
                 networks[idx].rssi = pendingNetwork.rssi;
                 networks[idx].lastSeen = pendingNetwork.lastSeen;
                 networks[idx].beaconCount++;
+                // Backfill SSID if we didn't have it before (critical for PMKID save)
+                if (networks[idx].ssid[0] == 0 && pendingNetwork.ssid[0] != 0) {
+                    strncpy(networks[idx].ssid, pendingNetwork.ssid, 32);
+                    networks[idx].ssid[32] = 0;
+                    Serial.printf("[DNH] SSID backfilled for existing network: %s\n", networks[idx].ssid);
+                }
             } else {
                 // Add new
                 networks.push_back(pendingNetwork);
