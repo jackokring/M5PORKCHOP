@@ -14,6 +14,9 @@ extern Porkchop porkchop;
 static Preferences moodPrefs;
 static const char* MOOD_NVS_NAMESPACE = "porkmood";
 
+// Riddle LED state - declared early for processQueue()
+static bool riddleActive = false;
+
 // Static members
 String Mood::currentPhrase = "oink";
 int Mood::happiness = 50;
@@ -127,6 +130,12 @@ static bool processQueue() {
     Mood::lastQueuePop = now;
     Mood::lastPhraseChange = now;
     
+    // If riddle just finished, turn off LED
+    if (Mood::phraseQueueCount == 0 && riddleActive) {
+        riddleActive = false;
+        Display::setLED(0, 0, 0);  // LED off - riddle complete
+    }
+    
     return Mood::phraseQueueCount > 0;  // True if more phrases waiting
 }
 
@@ -194,6 +203,7 @@ static const int RIDDLE_COUNT = 5;
 
 // Once per boot - shown flag persists until reboot
 static bool riddleShownThisBoot = false;
+// riddleActive declared earlier for processQueue() access
 
 // Function to trigger a riddle (called from selectPhrase)
 static bool tryQueueRiddle() {
@@ -209,6 +219,8 @@ static bool tryQueueRiddle() {
     
     // Mark as shown - no more riddles this boot
     riddleShownThisBoot = true;
+    riddleActive = true;  // LED mode active
+    Display::setLED(255, 0, 0);  // Red glow during riddle
     
     // Pick random riddle
     int pick = random(0, RIDDLE_COUNT);

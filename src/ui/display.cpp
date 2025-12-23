@@ -669,6 +669,11 @@ void Display::flashSiren(uint8_t cycles) {
     neopixelWrite(LED_PIN, 0, 0, 0);
 }
 
+void Display::setLED(uint8_t r, uint8_t g, uint8_t b) {
+    // Static LED glow - for ambient effects like riddle mode
+    neopixelWrite(LED_PIN, r, g, b);
+}
+
 void Display::showLevelUp(uint8_t oldLevel, uint8_t newLevel) {
     // Level up popup - pink filled box with black text, auto-dismiss after 2.5s
     // Level up phrases
