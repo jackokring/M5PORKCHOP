@@ -223,7 +223,7 @@ static void dataNotifyCallback(NimBLERemoteCharacteristic* pChar,
         }
         receivedChunks++;
         
-        // Send ACK
+        // Send ACK (3 bytes: cmd + 16-bit chunk number)
         uint8_t ack[3] = {CMD_ACK_CHUNK, (uint8_t)(seq & 0xFF), (uint8_t)(seq >> 8)};
         pCtrlChar->writeValue(ack, 3, false);
         
@@ -292,10 +292,10 @@ static void sendCommand(uint8_t cmd) {
     }
 }
 
-static void sendCommand(uint8_t cmd, uint8_t arg1, uint8_t arg2) {
+static void sendCommand(uint8_t cmd, uint8_t type, uint16_t index) {
     if (pCtrlChar) {
-        uint8_t data[3] = {cmd, arg1, arg2};
-        pCtrlChar->writeValue(data, 3, false);
+        uint8_t data[4] = {cmd, type, (uint8_t)(index & 0xFF), (uint8_t)(index >> 8)};
+        pCtrlChar->writeValue(data, 4, false);
     }
 }
 
@@ -445,12 +445,25 @@ bool connect() {
         return false;
     }
     
-    // Subscribe to notifications
+    // Subscribe to notifications (MUST subscribe to data/status before starting sync)
     if (pCtrlChar->canNotify()) {
-        pCtrlChar->subscribe(true, ctrlNotifyCallback);
+        if (!pCtrlChar->subscribe(true, ctrlNotifyCallback)) {
+            snprintf(lastError, sizeof(lastError), "Failed to subscribe to control");
+            pClient->disconnect();
+            state = State::ERROR;
+            return false;
+        }
     }
     if (pDataChar->canNotify()) {
-        pDataChar->subscribe(true, dataNotifyCallback);
+        if (!pDataChar->subscribe(true, dataNotifyCallback)) {
+            snprintf(lastError, sizeof(lastError), "Failed to subscribe to data");
+            pClient->disconnect();
+            state = State::ERROR;
+            return false;
+        }
+    }
+    if (pStatusChar && pStatusChar->canNotify()) {
+        pStatusChar->subscribe(true, nullptr);  // Subscribe but no callback needed
     }
     
     state = State::CONNECTED;

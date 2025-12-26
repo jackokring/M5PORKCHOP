@@ -149,6 +149,7 @@ private:
     // Protocol helpers
     static void sendCommand(uint8_t cmd);
     static void sendCommand(uint8_t cmd, uint8_t param1, uint8_t param2);
+    static void sendCommand(uint8_t cmd, uint8_t type, uint16_t index);
     static void requestNextCapture();
     static uint32_t calculateCRC32(const uint8_t* data, uint16_t len);
     
