@@ -27,7 +27,7 @@
 #include "../modes/bacon.h"
 #include "../gps/gps.h"
 #include "../web/fileserver.h"
-#include "../web/wpasec.h"
+#include "../core/heap_policy.h"
 #include "menu.h"
 #include "settings_menu.h"
 #include "captures_menu.h"
@@ -95,6 +95,149 @@ static void getSystemTimeString(char* out, size_t len) {
 }
 
 static portMUX_TYPE displayMux = portMUX_INITIALIZER_UNLOCKED;
+
+// Heap health tracking (rate-limited)
+static uint8_t heapHealthPct = 100;
+static uint32_t lastHeapHealthSampleMs = 0;
+static uint32_t heapHealthToastStartMs = 0;
+static uint32_t lastHeapHealthToastMs = 0;
+static uint8_t heapHealthToastDelta = 0;
+static bool heapHealthToastImproved = false;
+static bool heapHealthToastActive = false;
+static size_t heapHealthPeakFree = 0;
+static size_t heapHealthPeakLargest = 0;
+static const uint32_t HEAP_HEALTH_SAMPLE_MS = 1000;
+static const uint32_t HEAP_HEALTH_TOAST_MS = 5000;  // Match XP top bar duration
+static const uint8_t HEAP_HEALTH_TOAST_MIN_DELTA = 5;
+
+static void drawHeartIcon(M5Canvas& canvas, int x, int y, uint16_t color) {
+    // Upright heart built from two circles + triangle
+    canvas.fillCircle(x + 2, y + 2, 2, color);
+    canvas.fillCircle(x + 6, y + 2, 2, color);
+    canvas.fillTriangle(x, y + 3, x + 8, y + 3, x + 4, y + 6, color);
+}
+
+static uint8_t computeHeapHealthPercent(size_t freeHeap, size_t largestBlock, bool updatePeaks) {
+    if (updatePeaks) {
+        if (freeHeap > heapHealthPeakFree) heapHealthPeakFree = freeHeap;
+        if (largestBlock > heapHealthPeakLargest) heapHealthPeakLargest = largestBlock;
+    }
+
+    float freeNorm = heapHealthPeakFree > 0 ? (float)freeHeap / (float)heapHealthPeakFree : 0.0f;
+    float contigNorm = heapHealthPeakLargest > 0 ? (float)largestBlock / (float)heapHealthPeakLargest : 0.0f;
+    float thresholdNorm = 1.0f;
+    if (HeapPolicy::kMinHeapForTls > 0 && HeapPolicy::kMinContigForTls > 0) {
+        float freeGate = (float)freeHeap / (float)HeapPolicy::kMinHeapForTls;
+        float contigGate = (float)largestBlock / (float)HeapPolicy::kMinContigForTls;
+        thresholdNorm = (freeGate < contigGate) ? freeGate : contigGate;
+    }
+
+    float health = freeNorm < contigNorm ? freeNorm : contigNorm;
+    if (thresholdNorm < health) health = thresholdNorm;
+
+    float fragRatio = freeHeap > 0 ? (float)largestBlock / (float)freeHeap : 0.0f;
+    float fragPenalty = fragRatio / 0.60f;  // Penalize fragmentation when largest << total free
+    if (fragPenalty < 0.0f) fragPenalty = 0.0f;
+    if (fragPenalty > 1.0f) fragPenalty = 1.0f;
+    health *= fragPenalty;
+
+    if (health < 0.0f) health = 0.0f;
+    if (health > 1.0f) health = 1.0f;
+
+    int pct = (int)(health * 100.0f + 0.5f);
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    return (uint8_t)pct;
+}
+
+static void updateHeapHealthState() {
+    uint32_t now = millis();
+    if (now - lastHeapHealthSampleMs < HEAP_HEALTH_SAMPLE_MS) {
+        return;
+    }
+    lastHeapHealthSampleMs = now;
+
+    size_t freeHeap = ESP.getFreeHeap();
+    size_t largestBlock = ESP.getMaxAllocHeap();
+    uint8_t newPct = computeHeapHealthPercent(freeHeap, largestBlock, true);
+
+    int delta = (int)newPct - (int)heapHealthPct;
+    uint8_t deltaAbs = (delta < 0) ? (uint8_t)(-delta) : (uint8_t)delta;
+    heapHealthPct = newPct;
+
+    if (delta != 0 && deltaAbs >= HEAP_HEALTH_TOAST_MIN_DELTA) {
+        if (now - lastHeapHealthToastMs >= HEAP_HEALTH_TOAST_MS) {
+            heapHealthToastDelta = deltaAbs;
+            heapHealthToastImproved = delta > 0;
+            heapHealthToastActive = true;
+            heapHealthToastStartMs = now;
+            lastHeapHealthToastMs = now;
+        }
+    }
+}
+
+static bool shouldShowHeapHealthNotification() {
+    if (!heapHealthToastActive) return false;
+    if (millis() - heapHealthToastStartMs >= HEAP_HEALTH_TOAST_MS) {
+        heapHealthToastActive = false;
+        return false;
+    }
+    return true;
+}
+
+static void drawTopBarHeapHealth(M5Canvas& topBar) {
+    topBar.fillSprite(COLOR_FG);
+    topBar.setTextColor(COLOR_BG);
+    topBar.setTextSize(1);
+    topBar.setTextDatum(top_left);
+
+    // Level and title (same as XP)
+    char levelStr[8];
+    snprintf(levelStr, sizeof(levelStr), "L%d", XP::getLevel());
+    const char* title = XP::getTitle();
+
+    const char* status = heapHealthToastImproved ? "HEALTH IMPROVED" : "HEALTH DROPPED";
+    char msgBuf[48];
+    snprintf(msgBuf, sizeof(msgBuf), "%s %c%u%%", status, heapHealthToastImproved ? '+' : '-', heapHealthToastDelta);
+
+    int levelW = topBar.textWidth(levelStr);
+    int titleX = 2 + levelW + 4;
+
+    const int heartW = 9;
+    const int heartGap = 4;
+    int heartX = DISPLAY_W - 2 - heartW;
+    int msgRightX = heartX - heartGap;
+
+    int maxTitleW = msgRightX - titleX - 6;
+    if (maxTitleW < 0) maxTitleW = 0;
+
+    int titleW = topBar.textWidth(title);
+    if (titleW <= maxTitleW) {
+        topBar.drawString(title, titleX, 3);
+    } else {
+        char titleBuf[24];
+        size_t titleLen = strlen(title);
+        if (titleLen > sizeof(titleBuf) - 3) titleLen = sizeof(titleBuf) - 3;
+        size_t len = titleLen;
+        while (len > 3) {
+            memcpy(titleBuf, title, len);
+            titleBuf[len] = '\0';
+            if (topBar.textWidth(titleBuf) + topBar.textWidth("..") <= maxTitleW) {
+                break;
+            }
+            len--;
+        }
+        if (len < titleLen) {
+            strcpy(titleBuf + len, "..");
+        }
+        topBar.drawString(titleBuf, titleX, 3);
+    }
+
+    topBar.drawString(levelStr, 2, 3);
+    topBar.setTextDatum(top_right);
+    topBar.drawString(msgBuf, msgRightX, 3);
+    drawHeartIcon(topBar, heartX, 3, COLOR_BG);
+}
 
 // Static member initialization
 M5Canvas Display::topBar(&M5.Display);
@@ -194,6 +337,9 @@ void Display::update() {
     if (hasPending) {
         setTopBarMessage(pendingMsg, pendingDuration);
     }
+
+    // Update heap health state (rate-limited)
+    updateHeapHealthState();
 
     // Check for screen dimming
     updateDimming();
@@ -420,6 +566,12 @@ void Display::drawTopBar() {
     // Check for XP notification, show for 5 sec after gain
     if (XP::shouldShowXPNotification()) {
         XP::drawTopBarXP(topBar);
+        return;
+    }
+
+    // Check for heap health notification (same style as XP)
+    if (shouldShowHeapHealthNotification()) {
+        drawTopBarHeapHealth(topBar);
         return;
     }
 
@@ -689,6 +841,7 @@ void Display::drawBottomBar() {
     char statsBuf[96];
     statsBuf[0] = '\0';
     const char* statsStr = "";
+    bool showHealthBar = false;
     
     if (mode == PorkchopMode::WARHOG_MODE) {
         // WARHOG: show unique networks, saved, distance, GPS info
@@ -837,56 +990,49 @@ void Display::drawBottomBar() {
         strncpy(statsBuf, buf, sizeof(statsBuf) - 1);
         statsBuf[sizeof(statsBuf) - 1] = '\0';
         statsStr = statsBuf;
+        showHealthBar = true;
     } else if (mode == PorkchopMode::PIGSYNC_DEVICE_SELECT) {
         // PIGSYNC_DEVICE_SELECT: control hints (state shown in terminal)
         statsStr = "ENTER=CALL UP/DN=SELECT ESC=EXIT";
     } else {
-        // Default: Networks, Handshakes
+        // Default: Networks only (HS shown in active modes)
         uint16_t netCount = porkchop.getNetworkCount();
-        uint16_t hsCount = porkchop.getHandshakeCount();
         char buf[32];
-        snprintf(buf, sizeof(buf), "N:%03d HS:%02d", netCount, hsCount);
+        snprintf(buf, sizeof(buf), "N:%03d", netCount);
         strncpy(statsBuf, buf, sizeof(statsBuf) - 1);
         statsBuf[sizeof(statsBuf) - 1] = '\0';
         statsStr = statsBuf;
+        showHealthBar = true;
     }
 
     bottomBar.drawString(statsStr ? statsStr : "", 2, 3);
 
-    // Center: Idle heap health bar
-    if (mode == PorkchopMode::IDLE) {
-        const size_t minHeap = WPASec::MIN_HEAP_FOR_TLS;
-        const size_t minContig = WPASec::MIN_CONTIGUOUS_FOR_TLS;
-        size_t freeHeap = ESP.getFreeHeap();
-        size_t largestBlock = ESP.getMaxAllocHeap();
+    // Center: Heap health bar (XP-style, inverted)
+    if (showHealthBar) {
+        int pct = heapHealthPct;
 
-        float freeNorm = minHeap > 0 ? (float)freeHeap / (float)minHeap : 0.0f;
-        float contigNorm = minContig > 0 ? (float)largestBlock / (float)minContig : 0.0f;
-        float health = (freeNorm < contigNorm) ? freeNorm : contigNorm;
-        float fragRatio = freeHeap > 0 ? (float)largestBlock / (float)freeHeap : 0.0f;
-        float fragPenalty = fragRatio / 0.60f;  // Penalize fragmentation when largest << total free
-        if (fragPenalty < 0.0f) fragPenalty = 0.0f;
-        if (fragPenalty > 1.0f) fragPenalty = 1.0f;
-        health *= fragPenalty;
-        if (health < 0.0f) health = 0.0f;
-        if (health > 1.0f) health = 1.0f;
+        const int barW = 80;
+        const int barH = 6;
+        const int barY = 4;
+        const int gap = 4;
+        int barX = (DISPLAY_W - barW) / 2;
 
-        int pct = (int)(health * 100.0f + 0.5f);
-        const int kBarSlots = 10;
-        int filled = (pct * kBarSlots + 50) / 100;
-        if (filled < 0) filled = 0;
-        if (filled > kBarSlots) filled = kBarSlots;
+        // Draw heart icon (upright, black) instead of text label
+        const int heartW = 9;
+        int heartX = barX - gap - heartW;
+        int heartY = 3;
+        drawHeartIcon(bottomBar, heartX, heartY, COLOR_BG);
 
-        char bar[kBarSlots + 1];
-        for (int i = 0; i < kBarSlots; i++) {
-            bar[i] = (i < filled) ? '|' : ' ';
+        bottomBar.drawRect(barX, barY, barW, barH, COLOR_BG);
+        int fillW = (barW - 2) * pct / 100;
+        if (fillW > 0) {
+            bottomBar.fillRect(barX + 1, barY + 1, fillW, barH - 2, COLOR_BG);
         }
-        bar[kBarSlots] = '\0';
 
-        char healthBuf[32];
-        snprintf(healthBuf, sizeof(healthBuf), "HLTH: [%s]%3d%%", bar, pct);
-        bottomBar.setTextDatum(top_center);
-        bottomBar.drawString(healthBuf, DISPLAY_W / 2, 3);
+        char pctBuf[8];
+        snprintf(pctBuf, sizeof(pctBuf), "%3d%%", pct);
+        bottomBar.setTextDatum(top_left);
+        bottomBar.drawString(pctBuf, barX + barW + gap, 3);
     }
     
     // Right: uptime or PIGSYNC channel
