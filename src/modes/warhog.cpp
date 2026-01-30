@@ -11,6 +11,7 @@
 #include "../build_info.h"
 #include "../core/config.h"
 #include "../core/wifi_utils.h"
+#include "../core/heap_policy.h"
 #include "../core/network_recon.h"
 #include "../core/wsl_bypasser.h"
 #include "../core/sdlog.h"
@@ -48,9 +49,7 @@ static_assert((CAPTURED_BLOOM_BITS & (CAPTURED_BLOOM_BITS - 1)) == 0, "CAPTURED_
 // Bounty pool (reservoir sample of seen networks)
 static const size_t BOUNTY_POOL_SIZE = 50;
 
-// Heap threshold for emergency cleanup (bytes)
-static const size_t HEAP_WARNING_THRESHOLD = 40000;
-static const size_t HEAP_CRITICAL_THRESHOLD = 25000;
+// Heap threshold for emergency cleanup (bytes) - centralized in HeapPolicy
 
 // Minimum scan interval to avoid tight-loop scanning
 static const uint32_t SCAN_INTERVAL_MIN_MS = 1000;
@@ -433,7 +432,7 @@ void WarhogMode::update() {
     if (now - lastHeapCheck >= 30000) {
         uint32_t freeHeap = ESP.getFreeHeap();
         
-        if (freeHeap < HEAP_CRITICAL_THRESHOLD) {
+        if (freeHeap < HeapPolicy::kWarhogHeapCritical) {
             Display::showToast("LOW MEMORY!");
             // Emergency: clear beacon feature cache (heap heavy)
             // Guard beacon map from promiscuous callback during clear

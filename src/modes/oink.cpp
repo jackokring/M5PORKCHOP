@@ -10,6 +10,7 @@
 #include "../core/sdlog.h"
 #include "../core/sd_layout.h"
 #include "../core/xp.h"
+#include "../core/heap_policy.h"
 #include "../ui/display.h"
 #include "../piglet/mood.h"
 #include "../piglet/avatar.h"
@@ -32,10 +33,7 @@
 // synchronization to prevent race conditions on networks/handshakes vectors
 static volatile bool oinkBusy = false;
 
-// Minimum free heap to allow network additions (30KB safety margin)
-static const size_t HEAP_MIN_THRESHOLD = 30000;
-// Minimum free heap to allow new handshake allocations (handshake struct is large)
-static const size_t HANDSHAKE_HEAP_THRESHOLD = 60000;
+// Minimum free heap thresholds (centralized in HeapPolicy)
 static const size_t HANDSHAKE_ALLOC_MIN_BLOCK = sizeof(CapturedHandshake) + 1024;
 static const size_t PMKID_ALLOC_MIN_BLOCK = sizeof(CapturedPMKID) + 256;
 
@@ -1254,7 +1252,7 @@ void OinkMode::update() {
     // Emergency heap recovery - also batched (max 3 per cycle)
     // 3 erases from front = ~620µs, safely under 1ms WiFi budget
     // PHASE 1 FIX: Preserve current target if possible
-    if (ESP.getFreeHeap() < HEAP_MIN_THRESHOLD && networks().size() > 50) {
+    if (ESP.getFreeHeap() < HeapPolicy::kMinHeapForOinkNetworkAdd && networks().size() > 50) {
         oinkBusy = true;
         NetworkRecon::enterCritical();
         
@@ -1978,7 +1976,7 @@ int OinkMode::findOrCreateHandshakeSafe(const uint8_t* bssid, const uint8_t* sta
         NetworkRecon::exitCritical();
         return -1;
     }
-    if (ESP.getFreeHeap() < HANDSHAKE_HEAP_THRESHOLD) {
+    if (ESP.getFreeHeap() < HeapPolicy::kMinHeapForHandshakeAdd) {
         NetworkRecon::exitCritical();
         return -1;
     }
@@ -3227,7 +3225,7 @@ void OinkMode::injectTestNetwork(const uint8_t* bssid, const char* ssid, uint8_t
         NetworkRecon::exitCritical();
         return;  // Cap
     }
-    if (ESP.getFreeHeap() < HEAP_MIN_THRESHOLD) {
+    if (ESP.getFreeHeap() < HeapPolicy::kMinHeapForOinkNetworkAdd) {
         NetworkRecon::exitCritical();
         return;
     }

@@ -4,6 +4,7 @@
 
 #include <Arduino.h>
 #include <map>
+#include "../core/heap_policy.h"
 
 // Upload status for tracking
 enum class WPASecUploadStatus {
@@ -69,15 +70,15 @@ public:
 
     // Minimum heap required for TLS operations
     // With setInsecure() (no cert validation), TLS needs ~32-35KB peak.
-    static constexpr size_t MIN_HEAP_FOR_TLS = 35000;
+    static constexpr size_t MIN_HEAP_FOR_TLS = HeapPolicy::kMinHeapForTls;
     
     // Minimum contiguous block needed for TLS buffer allocation
     // mbedTLS handshake peak is ~32-35KB contiguous for buffer allocations
     // Previous 22KB threshold was too low - log showed failures at 31.7KB
-    static constexpr size_t MIN_CONTIGUOUS_FOR_TLS = 35000;
+    static constexpr size_t MIN_CONTIGUOUS_FOR_TLS = HeapPolicy::kMinContigForTls;
     
     // Threshold for proactive heap conditioning (before fragmentation gets critical)
-    static constexpr size_t PROACTIVE_CONDITIONING_THRESHOLD = 45000;
+    static constexpr size_t PROACTIVE_CONDITIONING_THRESHOLD = HeapPolicy::kProactiveTlsConditioning;
     
  private:
     static bool cacheLoaded;

@@ -6,6 +6,7 @@
 #include "config.h"
 #include "wsl_bypasser.h"
 #include "wifi_utils.h"
+#include "heap_policy.h"
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <esp_heap_caps.h>
@@ -47,9 +48,6 @@ static const uint32_t STALE_TIMEOUT_MS = 60000;
 
 // Cleanup interval
 static const uint32_t CLEANUP_INTERVAL_MS = 5000;
-
-// Heap stable threshold (largest block > this = stable)
-static const size_t HEAP_STABLE_THRESHOLD = 50000;
 
 // ============================================================================
 // Thread Safety
@@ -449,7 +447,7 @@ static void processDeferredEvents() {
         // Only add if we have pre-reserved capacity (no allocation needed)
         if (hasCapacity) {
             shouldAdd = true;
-        } else if (canGrow && ESP.getFreeHeap() > 20000) {
+        } else if (canGrow && ESP.getFreeHeap() > HeapPolicy::kMinHeapForReconGrowth) {
             // Grow capacity OUTSIDE critical section to avoid heap ops while holding spinlock
             try {
                 networks.reserve(networks.capacity() + 20);
@@ -690,7 +688,7 @@ void update() {
     // Check heap stabilization
     if (!heapStabilized) {
         size_t currentLargest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-        if (currentLargest > HEAP_STABLE_THRESHOLD) {
+        if (currentLargest > HeapPolicy::kHeapStableThreshold) {
             heapStabilized = true;
             Serial.printf("[RECON] Heap stabilized in %ums: largest=%u (was %u)\n",
                           now - startTime, currentLargest, heapLargestAtStart);

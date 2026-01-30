@@ -13,6 +13,7 @@
 #include "../core/xp.h"
 #include "../core/wsl_bypasser.h"
 #include "../core/wifi_utils.h"
+#include "../core/heap_policy.h"
 #include "../ui/display.h"
 #include "../piglet/mood.h"
 #include "../piglet/avatar.h"
@@ -141,7 +142,6 @@ static struct {
 static volatile bool pendingIncompleteAdd = false;
 static IncompleteHS pendingIncomplete;
 // Minimum free heap to allow new handshake allocations (handshake struct is large)
-static const size_t DNH_HANDSHAKE_HEAP_THRESHOLD = 60000;
 static const size_t DNH_HANDSHAKE_ALLOC_MIN_BLOCK = sizeof(CapturedHandshake) + 1024;
 static const size_t DNH_PMKID_ALLOC_MIN_BLOCK = sizeof(CapturedPMKID) + 256;
 
@@ -330,14 +330,14 @@ void DoNoHamMode::update() {
             size_t capacityLimit = networks().capacity();
             bool hasCapacity = networks().size() < capacityLimit;
             bool canGrow = networks().size() < DNH_MAX_NETWORKS;
-            if ((hasCapacity || ESP.getFreeHeap() > 40000) && canGrow) {
+            if ((hasCapacity || ESP.getFreeHeap() > HeapPolicy::kMinHeapForDnhGrowth) && canGrow) {
                 // Add new (no realloc if hasCapacity)
                 if (hasCapacity) {
                     networks().push_back(pendingNetworkLocal);
                     NetworkRecon::exitCritical();
                     XP::addXP(XPEvent::DNH_NETWORK_PASSIVE);
                     NetworkRecon::enterCritical();
-                } else if (ESP.getFreeHeap() > 40000) {
+                } else if (ESP.getFreeHeap() > HeapPolicy::kMinHeapForDnhGrowth) {
                     networks().push_back(pendingNetworkLocal);
                     NetworkRecon::exitCritical();
                     XP::addXP(XPEvent::DNH_NETWORK_PASSIVE);
@@ -1270,7 +1270,7 @@ int DoNoHamMode::findOrCreateHandshake(const uint8_t* bssid, const uint8_t* stat
     }
     // Create new
     if (handshakes.size() < DNH_MAX_HANDSHAKES) {
-        if (ESP.getFreeHeap() < DNH_HANDSHAKE_HEAP_THRESHOLD) {
+        if (ESP.getFreeHeap() < HeapPolicy::kMinHeapForHandshakeAdd) {
             return -1;
         }
         if (handshakes.size() >= handshakes.capacity()) {

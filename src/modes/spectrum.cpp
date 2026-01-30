@@ -9,6 +9,7 @@
 #include "../core/stress_test.h"
 #include "../core/wsl_bypasser.h"
 #include "../core/wifi_utils.h"
+#include "../core/heap_policy.h"
 #include "../core/xp.h"
 #include "../ui/display.h"
 #include <M5Cardputer.h>
@@ -249,9 +250,33 @@ void SpectrumMode::update() {
     
     // Process deferred network add from onBeacon callback (ESP32 dual-core race fix)
     // push_back can reallocate vector, invalidating iterators in concurrent callback
+    // [BUG FIX] Technique 4 (reserve pattern) + Technique 7 (recovery) per HEAP_MANAGEMENT.txt
     if (pendingNetworkAdd) {
+        // Technique 4: Reserve capacity OUTSIDE busy region
+        bool canGrow = (networks.size() < networks.capacity());
+        
+        if (!canGrow && networks.size() < MAX_SPECTRUM_NETWORKS) {
+            // Check heap threshold (20KB) before growth operations
+            if (ESP.getFreeHeap() > HeapPolicy::kMinHeapForSpectrumGrowth) {
+                networks.reserve(networks.capacity() + 10);  // Grow by 10 slots
+                canGrow = true;
+            } else {
+                // Technique 7 Level 1: Recovery attempt - prune stale networks first
+                busy = true;
+                pruneStale();  // May free 2-20KB depending on stale count
+                busy = false;
+                
+                // Re-check heap after recovery
+                if (ESP.getFreeHeap() > HeapPolicy::kMinHeapForSpectrumGrowth) {
+                    networks.reserve(networks.capacity() + 10);
+                    canGrow = true;
+                }
+                // else: recovery failed, skip this add (better than crash)
+            }
+        }
+        
         busy = true;  // Block callback during vector modification
-        if (networks.size() < MAX_SPECTRUM_NETWORKS) {
+        if (networks.size() < MAX_SPECTRUM_NETWORKS && canGrow) {
             networks.push_back(pendingNetwork);
             // Auto-select first network
             if (selectedIndex < 0) {

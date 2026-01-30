@@ -4,6 +4,7 @@
 #include "../modes/oink.h"
 #include "../modes/donoham.h"
 #include "../ui/display.h"
+#include "heap_policy.h"
 #include <M5Cardputer.h>
 
 // Static member definitions
@@ -18,7 +19,6 @@ uint8_t StressTest::networkCounter = 0;
 uint8_t StressTest::clientCounter = 0;
 
 // Stress guardrails (keep test heavy without crashing the device)
-static const size_t STRESS_MIN_HEAP = 70000;
 static const size_t STRESS_MAX_OINK_NETWORKS = 75;
 static const size_t STRESS_MAX_DNH_NETWORKS = 60;
 
@@ -116,7 +116,7 @@ void StressTest::update() {
 }
 
 void StressTest::injectNetwork() {
-    if (ESP.getFreeHeap() < STRESS_MIN_HEAP) {
+    if (ESP.getFreeHeap() < HeapPolicy::kStressMinHeap) {
         return;
     }
 
@@ -169,7 +169,7 @@ void StressTest::updateChurn() {
 }
 
 void StressTest::injectHidden() {
-    if (ESP.getFreeHeap() < STRESS_MIN_HEAP) {
+    if (ESP.getFreeHeap() < HeapPolicy::kStressMinHeap) {
         return;
     }
 
@@ -198,7 +198,7 @@ void StressTest::injectHidden() {
 }
 
 void StressTest::updateRSSIChaos() {
-    if (ESP.getFreeHeap() < STRESS_MIN_HEAP) {
+    if (ESP.getFreeHeap() < HeapPolicy::kStressMinHeap) {
         return;
     }
 

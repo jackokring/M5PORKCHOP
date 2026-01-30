@@ -27,6 +27,7 @@
 #include "../modes/bacon.h"
 #include "../gps/gps.h"
 #include "../web/fileserver.h"
+#include "../web/wpasec.h"
 #include "menu.h"
 #include "settings_menu.h"
 #include "captures_menu.h"
@@ -828,6 +829,14 @@ void Display::drawBottomBar() {
         // BOUNTY STATUS: show selected info
         BountyStatusMenu::getSelectedInfo(statsBuf, sizeof(statsBuf));
         statsStr = statsBuf;
+    } else if (mode == PorkchopMode::IDLE) {
+        // IDLE: show Networks only (HS shown in OINK)
+        uint16_t netCount = porkchop.getNetworkCount();
+        char buf[24];
+        snprintf(buf, sizeof(buf), "N:%03d", netCount);
+        strncpy(statsBuf, buf, sizeof(statsBuf) - 1);
+        statsBuf[sizeof(statsBuf) - 1] = '\0';
+        statsStr = statsBuf;
     } else if (mode == PorkchopMode::PIGSYNC_DEVICE_SELECT) {
         // PIGSYNC_DEVICE_SELECT: control hints (state shown in terminal)
         statsStr = "ENTER=CALL UP/DN=SELECT ESC=EXIT";
@@ -843,6 +852,42 @@ void Display::drawBottomBar() {
     }
 
     bottomBar.drawString(statsStr ? statsStr : "", 2, 3);
+
+    // Center: Idle heap health bar
+    if (mode == PorkchopMode::IDLE) {
+        const size_t minHeap = WPASec::MIN_HEAP_FOR_TLS;
+        const size_t minContig = WPASec::MIN_CONTIGUOUS_FOR_TLS;
+        size_t freeHeap = ESP.getFreeHeap();
+        size_t largestBlock = ESP.getMaxAllocHeap();
+
+        float freeNorm = minHeap > 0 ? (float)freeHeap / (float)minHeap : 0.0f;
+        float contigNorm = minContig > 0 ? (float)largestBlock / (float)minContig : 0.0f;
+        float health = (freeNorm < contigNorm) ? freeNorm : contigNorm;
+        float fragRatio = freeHeap > 0 ? (float)largestBlock / (float)freeHeap : 0.0f;
+        float fragPenalty = fragRatio / 0.60f;  // Penalize fragmentation when largest << total free
+        if (fragPenalty < 0.0f) fragPenalty = 0.0f;
+        if (fragPenalty > 1.0f) fragPenalty = 1.0f;
+        health *= fragPenalty;
+        if (health < 0.0f) health = 0.0f;
+        if (health > 1.0f) health = 1.0f;
+
+        int pct = (int)(health * 100.0f + 0.5f);
+        const int kBarSlots = 10;
+        int filled = (pct * kBarSlots + 50) / 100;
+        if (filled < 0) filled = 0;
+        if (filled > kBarSlots) filled = kBarSlots;
+
+        char bar[kBarSlots + 1];
+        for (int i = 0; i < kBarSlots; i++) {
+            bar[i] = (i < filled) ? '|' : ' ';
+        }
+        bar[kBarSlots] = '\0';
+
+        char healthBuf[32];
+        snprintf(healthBuf, sizeof(healthBuf), "HLTH: [%s]%3d%%", bar, pct);
+        bottomBar.setTextDatum(top_center);
+        bottomBar.drawString(healthBuf, DISPLAY_W / 2, 3);
+    }
     
     // Right: uptime or PIGSYNC channel
     bottomBar.setTextDatum(top_right);

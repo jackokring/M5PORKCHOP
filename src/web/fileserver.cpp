@@ -11,6 +11,7 @@
 #include <vector>
 #include <atomic>
 #include "../core/wifi_utils.h"
+#include "../core/heap_policy.h"
 #include "../core/xp.h"
 #include "../ui/swine_stats.h"
 #include "../core/sd_layout.h"
@@ -3385,7 +3386,7 @@ void FileServer::startServer() {
     {
         size_t freeHeap = ESP.getFreeHeap();
         size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-        if (freeHeap < 40000 || largest < 20000) {
+        if (freeHeap < HeapPolicy::kFileServerMinHeap || largest < HeapPolicy::kFileServerMinLargest) {
             Serial.printf("[FILESERVER] Low heap for WebServer: free=%u largest=%u\n",
                           (unsigned)freeHeap, (unsigned)largest);
             strcpy(statusMessage, "Low heap");
@@ -3480,7 +3481,7 @@ void FileServer::stop() {
     // WebServer + mDNS allocations cause fragmentation; this triggers WiFi driver's
     // internal buffer reorganization which helps defragment the heap
     size_t largestBefore = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-    if (largestBefore < 50000) {  // Increased threshold from 40KB to 50KB
+    if (largestBefore < HeapPolicy::kFileServerRecoveryThreshold) {
         // Multiple brew cycles for stubborn fragmentation after heavy file serving
         Serial.printf("[FILESERVER] Heap recovery starting: largest=%u\n", (unsigned)largestBefore);
         for (int i = 0; i < 3; i++) {
