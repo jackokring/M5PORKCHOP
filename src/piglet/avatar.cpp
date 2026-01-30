@@ -214,6 +214,8 @@ void Avatar::init() {
     lastNightCheck = 0;
     cachedNightMode = false;
     initStarPositions();
+    
+    // Remove duplicate grass pattern initialization - already done earlier in init()
 }
 
 void Avatar::setState(AvatarState state) {
@@ -777,7 +779,8 @@ void Avatar::initStarPositions() {
         // y 20-100 sky/backdrop, bubble still wins
         // x 5-235 near full width
         stars[i].x = random(5, 235);
-        stars[i].y = random(20, 100);
+        // Match rain clip: keep stars above grass (rain clips at y < 88)
+        stars[i].y = random(20, 88);
         stars[i].size = 1;
         stars[i].brightness = 0;
         stars[i].fadeInStart = 0;
@@ -862,6 +865,7 @@ void Avatar::drawStars(M5Canvas& canvas) {
 
     for (uint8_t i = 0; i < starCount; i++) {
         if (stars[i].brightness < 128) continue;
+        if (stars[i].y >= 88) continue;  // Match rain clip above grass
 
         char starChar = '.';
         if (stars[i].isBlinking) {

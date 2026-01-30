@@ -7,6 +7,7 @@
 #include <WiFi.h>
 #include <NimBLEDevice.h>  // For BLE coexistence check
 #include "../core/config.h"
+#include "../core/sd_layout.h"
 #include "../audio/sfx.h"
 #include "../core/sdlog.h"
 #include "../core/xp.h"
@@ -55,9 +56,14 @@ uint32_t DoNoHamMode::lastHopTime = 0;
 uint32_t DoNoHamMode::dwellStartTime = 0;
 bool DoNoHamMode::dwellResolved = false;
 
-std::vector<DetectedNetwork> DoNoHamMode::networks;
+// networks vector moved to NetworkRecon - use networks() helper below
 std::vector<CapturedPMKID> DoNoHamMode::pmkids;
 std::vector<CapturedHandshake> DoNoHamMode::handshakes;
+
+// networks reference - now uses shared NetworkRecon vector
+static inline std::vector<DetectedNetwork>& networks() {
+    return NetworkRecon::getNetworks();
+}
 
 // Adaptive state machine
 ChannelStats DoNoHamMode::channelStats[13] = {};
@@ -73,6 +79,12 @@ static volatile bool dnhBusy = false;
 
 // Protect pending handshake payload from partial writes in callback
 static portMUX_TYPE pendingHandshakeMux = portMUX_INITIALIZER_UNLOCKED;
+// Protect other deferred slots shared with callbacks
+static portMUX_TYPE pendingNetworkMux = portMUX_INITIALIZER_UNLOCKED;
+static portMUX_TYPE pendingPMKIDMux = portMUX_INITIALIZER_UNLOCKED;
+static portMUX_TYPE pendingBeaconMux = portMUX_INITIALIZER_UNLOCKED;
+static portMUX_TYPE pendingProbeMux = portMUX_INITIALIZER_UNLOCKED;
+static portMUX_TYPE pendingIncompleteMux = portMUX_INITIALIZER_UNLOCKED;
 
 // Single-slot deferred network add (same pattern as OINK)
 static volatile bool pendingNetworkAdd = false;
@@ -116,6 +128,18 @@ static volatile bool pendingBeaconStore = false;
 static uint8_t pendingBeaconBSSID[6];
 static uint8_t pendingBeaconData[512];  // Static buffer, no malloc in callback
 static uint16_t pendingBeaconLen = 0;
+// Single-slot deferred probe response update
+static volatile bool pendingProbeResponseAdd = false;
+static struct {
+    uint8_t bssid[6];
+    char ssid[33];
+    int8_t rssi;
+    uint32_t lastSeen;
+} pendingProbeResponse;
+
+// Single-slot deferred incomplete handshake tracking
+static volatile bool pendingIncompleteAdd = false;
+static IncompleteHS pendingIncomplete;
 // Minimum free heap to allow new handshake allocations (handshake struct is large)
 static const size_t DNH_HANDSHAKE_HEAP_THRESHOLD = 60000;
 static const size_t DNH_HANDSHAKE_ALLOC_MIN_BLOCK = sizeof(CapturedHandshake) + 1024;
@@ -135,47 +159,15 @@ void DoNoHamMode::init() {
 void DoNoHamMode::start() {
     if (running) return;
     
-    // WiFi promiscuous mode + BLE = unstable on ESP32-S3 (see Espressif coexistence docs)
-    // If BLE was previously used (PigSyncMode, PiggyBlues), we need to deinit it first
-    // or the shared radio causes crashes. Try deinit first, reboot if it fails.
-    if (NimBLEDevice::isInitialized()) {
-        SDLog::log("DNH", "BLE was active - deinitializing for WiFi promisc coexistence");
-        Serial.println("[DNH] BLE detected - attempting deinit for WiFi coexistence");
-        
-        // Stop any active BLE operations first
-        NimBLEScan* pScan = NimBLEDevice::getScan();
-        if (pScan && pScan->isScanning()) {
-            pScan->stop();
-            delay(100);
-        }
-        
-        NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
-        if (pAdv && pAdv->isAdvertising()) {
-            pAdv->stop();
-            delay(100);
-        }
-        
-        // Now deinit BLE completely (clearAll=true to reset all state)
-        bool deinitOk = NimBLEDevice::deinit(true);
-        delay(200);  // Give BLE stack time to fully shut down
-        
-        if (!deinitOk || NimBLEDevice::isInitialized()) {
-            // Deinit failed - need to reboot for clean slate
-            SDLog::log("DNH", "BLE deinit failed - rebooting for clean WiFi promisc");
-            Display::showToast("BLE CLEANUP - REBOOTING...");
-            delay(2000);
-            ESP.restart();
-            return;  // Won't reach here, but good practice
-        }
-        
-        Serial.println("[DNH] BLE deinit successful - proceeding with WiFi promisc");
-    }
-    
+    Serial.println("[DNH] Starting passive mode...");
     SDLog::log("DNH", "Starting passive mode");
     
-    // Clear previous session data
-    networks.clear();
-    networks.shrink_to_fit();
+    // Ensure NetworkRecon is running (handles WiFi promiscuous mode)
+    if (!NetworkRecon::isRunning()) {
+        NetworkRecon::start();
+    }
+    
+    // Clear DNH-specific data (networks is shared via NetworkRecon)
     pmkids.clear();
     pmkids.shrink_to_fit();
     handshakes.clear();
@@ -183,18 +175,8 @@ void DoNoHamMode::start() {
     incompleteHandshakes.clear();
     incompleteHandshakes.shrink_to_fit();
 
-    // Reserve more upfront when heap allows to avoid mid-scan reallocs.
-    size_t reserveCount = 15;
-    size_t reserveBytes = DNH_MAX_NETWORKS * sizeof(DetectedNetwork);
-    if (ESP.getFreeHeap() > reserveBytes + 40000) {
-        reserveCount = DNH_MAX_NETWORKS;
-    }
+    // Reserve memory for captures
     size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-    size_t netReserveBytes = reserveCount * sizeof(DetectedNetwork);
-    if (largest >= netReserveBytes + 1024) {
-        networks.reserve(reserveCount);
-    }
-    largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
     if (largest >= (sizeof(CapturedPMKID) * 8 + 256)) {
         pmkids.reserve(8);
     }
@@ -241,72 +223,29 @@ void DoNoHamMode::start() {
     pendingHandshakeBusy = false;
     pendingHandshakeCapture = false;
     pendingBeaconStore = false;
+    pendingProbeResponseAdd = false;
+    pendingIncompleteAdd = false;
     
-    // Initialize WiFi in promiscuous mode (force restart to recover from desync)
-        delay(50);
-    WiFi.mode(WIFI_STA);
-    
-    // Randomize MAC if configured
-    if (Config::wifi().randomizeMAC) {
-        WSLBypasser::randomizeMAC();
-    }
-    
-    WiFi.disconnect();
-    delay(50);
-    
-    // Set channel
-    esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
-    
-    // Enable promiscuous mode with shared callback (OINK's callback dispatches to us)
-    esp_wifi_set_promiscuous_rx_cb(OinkMode::promiscuousCallback);
-    esp_wifi_set_promiscuous(true);
-    
+    // CRITICAL: Set running flag with memory barrier
     running = true;
+    __sync_synchronize();
+    
+    // Register our packet callback for EAPOL/PMKID capture
+    NetworkRecon::setPacketCallback(promiscuousCallback);
     
     // UI feedback
-    Display::showToast("PEACEFUL VIBES - NO TROUBLE TODAY");
-    Avatar::setState(AvatarState::NEUTRAL);  // Calm, passive state
-    Mood::onPassiveRecon(networks.size(), currentChannel);
+    Display::notify(NoticeKind::STATUS, "PEACEFUL VIBES - NO TROUBLE TODAY", 5000, NoticeChannel::TOP_BAR);
+    Avatar::setState(AvatarState::NEUTRAL);
+    Mood::onPassiveRecon(NetworkRecon::getNetworkCount(), currentChannel);
     Mood::setDialogueLock(true);
-}
-
-void DoNoHamMode::startSeamless() {
-    if (running) return;
     
-    SDLog::log("DNH", "Seamless start");
-    
-    // DON'T clear vectors - let old data age out naturally
-    // DON'T restart promiscuous mode - already running
-    // DON'T reset channel - preserve current
-    
-    // Reset state machine
-    state = DNHState::HOPPING;
-    lastHopTime = millis();
-    lastCleanupTime = millis();
-    lastSaveTime = millis();
-    lastMoodTime = millis();
-    dwellResolved = false;
-    
-    // Reset deferred flags
-    pendingNetworkAdd = false;
-    pendingPMKIDCreateReady = false;
-    pendingPMKIDCreateBusy = false;
-    pendingHandshakeAdd = false;
-    pendingHandshakeBusy = false;
-    pendingHandshakeCapture = false;
-    pendingBeaconStore = false;
-    
-    running = true;
-    
-    // UI feedback (toast already shown by D key handler in porkchop.cpp)
-    Avatar::setState(AvatarState::NEUTRAL);  // Calm, passive state
-    Mood::onPassiveRecon(networks.size(), currentChannel);
-    Mood::setDialogueLock(true);
+    Serial.printf("[DNH] Started. Networks available: %d\n", NetworkRecon::getNetworkCount());
 }
 
 void DoNoHamMode::stop() {
     if (!running) return;
     
+    Serial.println("[DNH] Stopping...");
     SDLog::log("DNH", "Stopping");
     
     running = false;
@@ -314,14 +253,14 @@ void DoNoHamMode::stop() {
     // Stop grass animation
     Avatar::setGrassMoving(false);
     
-    // Disable promiscuous mode and reset WiFi
-    WiFiUtils::shutdown();
+    // Clear our packet callback (NetworkRecon keeps running)
+    NetworkRecon::setPacketCallback(nullptr);
     
-    // Process any deferred XP saves now that WiFi is off
+    // Process any deferred XP saves
     XP::processPendingSave();
     
-    // Process deferred capture saves now that WiFi is off (SPI bus safe)
-    pendingSaveFlag = false;  // Clear flag before processing
+    // Process deferred capture saves
+    pendingSaveFlag = false;
     saveAllPMKIDs();
     saveAllHandshakes();
     
@@ -333,10 +272,8 @@ void DoNoHamMode::stop() {
         }
     }
     
-    // Clear vectors
+    // Clear DNH-specific vectors only (networks is shared via NetworkRecon)
     dnhBusy = true;
-    networks.clear();
-    networks.shrink_to_fit();
     pmkids.clear();
     pmkids.shrink_to_fit();
     handshakes.clear();
@@ -351,32 +288,9 @@ void DoNoHamMode::stop() {
     pendingHandshakeBusy = false;
     pendingHandshakeCapture = false;
     pendingBeaconStore = false;
+    pendingProbeResponseAdd = false;
+    pendingIncompleteAdd = false;
     Mood::setDialogueLock(false);
-}
-
-void DoNoHamMode::stopSeamless() {
-    if (!running) return;
-    
-    SDLog::log("DNH", "Seamless stop");
-    
-    running = false;
-    // CRITICAL: Keep dnhBusy TRUE to block callback during handoff
-    // Callback will use OinkMode's guard once it takes over
-    dnhBusy = true;
-    
-    // DON'T disable promiscuous mode - OINK will take over
-    // DON'T clear vectors - let them die naturally
-    // DON'T save to SD - promiscuous still active, SPI bus contention risk
-    // Data remains in RAM, will be saved when mode fully exits via stop()
-    pendingSaveFlag = true;  // Mark for save when WiFi eventually stops
-    
-    // Free beacon memory since OINK will recapture its own
-    for (auto& hs : handshakes) {
-        if (hs.beaconData) {
-            free(hs.beaconData);
-            hs.beaconData = nullptr;
-        }
-    }
 }
 
 void DoNoHamMode::update() {
@@ -388,69 +302,155 @@ void DoNoHamMode::update() {
     dnhBusy = true;
     
     // Process deferred network add
+    DetectedNetwork pendingNetworkLocal = {};
+    bool hasPendingNetwork = false;
+    taskENTER_CRITICAL(&pendingNetworkMux);
     if (pendingNetworkAdd) {
+        pendingNetworkLocal = pendingNetwork;
+        pendingNetworkAdd = false;
+        hasPendingNetwork = true;
+    }
+    taskEXIT_CRITICAL(&pendingNetworkMux);
+
+    if (hasPendingNetwork) {
         // Check if already exists (updates are safe even under low heap)
-        int idx = findNetwork(pendingNetwork.bssid);
-        if (idx >= 0) {
+        int idx = NetworkRecon::findNetworkIndex(pendingNetworkLocal.bssid);
+        NetworkRecon::enterCritical();
+        if (idx >= 0 && idx < (int)networks().size()) {
             // Update existing
-            networks[idx].rssi = pendingNetwork.rssi;
-            networks[idx].lastSeen = pendingNetwork.lastSeen;
-            networks[idx].beaconCount++;
+            networks()[idx].rssi = pendingNetworkLocal.rssi;
+            networks()[idx].lastSeen = pendingNetworkLocal.lastSeen;
+            networks()[idx].beaconCount++;
             // Backfill SSID if we didn't have it before (critical for PMKID save)
-            if (networks[idx].ssid[0] == 0 && pendingNetwork.ssid[0] != 0) {
-                strncpy(networks[idx].ssid, pendingNetwork.ssid, 32);
-                networks[idx].ssid[32] = 0;
+            if (networks()[idx].ssid[0] == 0 && pendingNetworkLocal.ssid[0] != 0) {
+                strncpy(networks()[idx].ssid, pendingNetworkLocal.ssid, 32);
+                networks()[idx].ssid[32] = 0;
             }
         } else {
-            size_t capacityLimit = networks.capacity();
-            bool hasCapacity = networks.size() < capacityLimit;
-            bool canGrow = networks.size() < DNH_MAX_NETWORKS;
+            size_t capacityLimit = networks().capacity();
+            bool hasCapacity = networks().size() < capacityLimit;
+            bool canGrow = networks().size() < DNH_MAX_NETWORKS;
             if ((hasCapacity || ESP.getFreeHeap() > 40000) && canGrow) {
                 // Add new (no realloc if hasCapacity)
                 if (hasCapacity) {
-                    networks.push_back(pendingNetwork);
+                    networks().push_back(pendingNetworkLocal);
+                    NetworkRecon::exitCritical();
                     XP::addXP(XPEvent::DNH_NETWORK_PASSIVE);
+                    NetworkRecon::enterCritical();
                 } else if (ESP.getFreeHeap() > 40000) {
-                    networks.push_back(pendingNetwork);
+                    networks().push_back(pendingNetworkLocal);
+                    NetworkRecon::exitCritical();
                     XP::addXP(XPEvent::DNH_NETWORK_PASSIVE);
+                    NetworkRecon::enterCritical();
                 }
-            } else if (!networks.empty()) {
+            } else if (!networks().empty()) {
                 size_t oldestIndex = 0;
-                uint32_t oldestSeen = networks[0].lastSeen;
-                for (size_t i = 1; i < networks.size(); i++) {
-                    if (networks[i].lastSeen < oldestSeen) {
-                        oldestSeen = networks[i].lastSeen;
+                uint32_t oldestSeen = networks()[0].lastSeen;
+                for (size_t i = 1; i < networks().size(); i++) {
+                    if (networks()[i].lastSeen < oldestSeen) {
+                        oldestSeen = networks()[i].lastSeen;
                         oldestIndex = i;
                     }
                 }
-                networks[oldestIndex] = pendingNetwork;
+                networks()[oldestIndex] = pendingNetworkLocal;
+                NetworkRecon::exitCritical();
                 XP::addXP(XPEvent::DNH_NETWORK_PASSIVE);
+                NetworkRecon::enterCritical();
             }
         }
-        pendingNetworkAdd = false;
+        NetworkRecon::exitCritical();
+    }
+
+    // Process deferred probe response updates
+    bool hasPendingProbe = false;
+    decltype(pendingProbeResponse) pendingProbeLocal = {};
+    taskENTER_CRITICAL(&pendingProbeMux);
+    if (pendingProbeResponseAdd) {
+        pendingProbeLocal = pendingProbeResponse;
+        pendingProbeResponseAdd = false;
+        hasPendingProbe = true;
+    }
+    taskEXIT_CRITICAL(&pendingProbeMux);
+
+    if (hasPendingProbe) {
+        bool pendingSlotMatch = false;
+        taskENTER_CRITICAL(&pendingNetworkMux);
+        if (pendingNetworkAdd && memcmp(pendingNetwork.bssid, pendingProbeLocal.bssid, 6) == 0) {
+            if (pendingNetwork.ssid[0] == 0 && pendingProbeLocal.ssid[0] != 0) {
+                strncpy(pendingNetwork.ssid, pendingProbeLocal.ssid, 32);
+                pendingNetwork.ssid[32] = 0;
+                pendingNetwork.rssi = pendingProbeLocal.rssi;
+                pendingNetwork.lastSeen = pendingProbeLocal.lastSeen;
+            }
+            pendingSlotMatch = true;
+        }
+        taskEXIT_CRITICAL(&pendingNetworkMux);
+
+        if (!pendingSlotMatch) {
+            int idx = NetworkRecon::findNetworkIndex(pendingProbeLocal.bssid);
+            NetworkRecon::enterCritical();
+            if (idx >= 0 && idx < (int)networks().size()) {
+                if (networks()[idx].ssid[0] == 0 && pendingProbeLocal.ssid[0] != 0) {
+                    strncpy(networks()[idx].ssid, pendingProbeLocal.ssid, 32);
+                    networks()[idx].ssid[32] = 0;
+                }
+                networks()[idx].rssi = pendingProbeLocal.rssi;
+                networks()[idx].lastSeen = pendingProbeLocal.lastSeen;
+            }
+            NetworkRecon::exitCritical();
+        }
     }
     
     // Process deferred beacon storage for handshakes (ESP32 dual-core race fix)
     // Callback copied beacon to static buffer, we do malloc here in main thread
+    uint8_t pendingBeaconBssidLocal[6] = {0};
+    uint8_t pendingBeaconDataLocal[512];
+    uint16_t pendingBeaconLenLocal = 0;
+    bool hasPendingBeacon = false;
+    taskENTER_CRITICAL(&pendingBeaconMux);
     if (pendingBeaconStore) {
+        memcpy(pendingBeaconBssidLocal, pendingBeaconBSSID, 6);
+        pendingBeaconLenLocal = pendingBeaconLen;
+        if (pendingBeaconLenLocal > sizeof(pendingBeaconDataLocal)) {
+            pendingBeaconLenLocal = sizeof(pendingBeaconDataLocal);
+        }
+        if (pendingBeaconLenLocal > 0) {
+            memcpy(pendingBeaconDataLocal, pendingBeaconData, pendingBeaconLenLocal);
+        }
+        pendingBeaconStore = false;
+        hasPendingBeacon = true;
+    }
+    taskEXIT_CRITICAL(&pendingBeaconMux);
+
+    if (hasPendingBeacon) {
         for (auto& hs : handshakes) {
-            if (!hs.saved && hs.beaconData == nullptr && memcmp(hs.bssid, pendingBeaconBSSID, 6) == 0) {
-                hs.beaconData = (uint8_t*)malloc(pendingBeaconLen);
+            if (!hs.saved && hs.beaconData == nullptr && memcmp(hs.bssid, pendingBeaconBssidLocal, 6) == 0) {
+                if (pendingBeaconLenLocal == 0) {
+                    break;
+                }
+                hs.beaconData = (uint8_t*)malloc(pendingBeaconLenLocal);
                 if (hs.beaconData) {
-                    memcpy(hs.beaconData, pendingBeaconData, pendingBeaconLen);
-                    hs.beaconLen = pendingBeaconLen;
+                    memcpy(hs.beaconData, pendingBeaconDataLocal, pendingBeaconLenLocal);
+                    hs.beaconLen = pendingBeaconLenLocal;
                 }
                 break;  // One beacon per handshake is enough
             }
         }
-        pendingBeaconStore = false;
     }
     
     // Process deferred PMKID create
     if (pendingPMKIDCreateReady && !pendingPMKIDCreateBusy) {
+        PendingPMKIDCreate pendingPMKIDLocal = {};
+        taskENTER_CRITICAL(&pendingPMKIDMux);
+        pendingPMKIDLocal = pendingPMKIDCreate;
+        taskEXIT_CRITICAL(&pendingPMKIDMux);
+
         // Check if dwell is complete (if we needed one)
         bool canProcess = true;
-        if (pendingPMKIDCreate.ssid[0] == 0 && state == DNHState::DWELLING) {
+        if (pendingPMKIDLocal.ssid[0] == 0 && state != DNHState::DWELLING) {
+            startDwell();
+        }
+        if (pendingPMKIDLocal.ssid[0] == 0 && state == DNHState::DWELLING) {
             // Still dwelling, wait for beacon or timeout
             if (!dwellResolved && (now - dwellStartTime < DNH_DWELL_TIME)) {
                 canProcess = false;
@@ -458,32 +458,39 @@ void DoNoHamMode::update() {
         }
         
         if (canProcess) {
-            pendingPMKIDCreateBusy = true;
+            taskENTER_CRITICAL(&pendingPMKIDMux);
+            if (pendingPMKIDCreateReady && !pendingPMKIDCreateBusy) {
+                pendingPMKIDCreateBusy = true;
+                pendingPMKIDLocal = pendingPMKIDCreate;
+            }
+            taskEXIT_CRITICAL(&pendingPMKIDMux);
             
             // Try to find SSID if we don't have it
-            if (pendingPMKIDCreate.ssid[0] == 0) {
-                int netIdx = findNetwork(pendingPMKIDCreate.bssid);
-                if (netIdx >= 0 && networks[netIdx].ssid[0] != 0) {
-                    strncpy(pendingPMKIDCreate.ssid, networks[netIdx].ssid, 32);
-                    pendingPMKIDCreate.ssid[32] = 0;
+            if (pendingPMKIDLocal.ssid[0] == 0) {
+                int netIdx = NetworkRecon::findNetworkIndex(pendingPMKIDLocal.bssid);
+                NetworkRecon::enterCritical();
+                if (netIdx >= 0 && netIdx < (int)networks().size() && networks()[netIdx].ssid[0] != 0) {
+                    strncpy(pendingPMKIDLocal.ssid, networks()[netIdx].ssid, 32);
+                    pendingPMKIDLocal.ssid[32] = 0;
                 }
+                NetworkRecon::exitCritical();
             }
             
             // Create or update PMKID entry
             if (pmkids.size() < DNH_MAX_PMKIDS) {
-                int idx = findOrCreatePMKID(pendingPMKIDCreate.bssid);
+                int idx = findOrCreatePMKID(pendingPMKIDLocal.bssid);
                 if (idx >= 0) {
-                    memcpy(pmkids[idx].pmkid, pendingPMKIDCreate.pmkid, 16);
-                    memcpy(pmkids[idx].station, pendingPMKIDCreate.station, 6);
-                    strncpy(pmkids[idx].ssid, pendingPMKIDCreate.ssid, 32);
+                    memcpy(pmkids[idx].pmkid, pendingPMKIDLocal.pmkid, 16);
+                    memcpy(pmkids[idx].station, pendingPMKIDLocal.station, 6);
+                    strncpy(pmkids[idx].ssid, pendingPMKIDLocal.ssid, 32);
                     pmkids[idx].ssid[32] = 0;
                     pmkids[idx].timestamp = now;
                     
                     // Announce capture + immediate safe save
-                    if (pendingPMKIDCreate.ssid[0] != 0) {
+                    if (pendingPMKIDLocal.ssid[0] != 0) {
                         Display::showToast("BOOMBOCLAAT! PMKID");
                         // SFX played via Mood::onPMKIDCaptured (don't double-play - causes audio driver issues)
-                        Mood::onPMKIDCaptured(pendingPMKIDCreate.ssid);
+                        Mood::onPMKIDCaptured(pendingPMKIDLocal.ssid);
                         
                         // Immediate save with brief promiscuous pause (safe SD access)
                         esp_wifi_set_promiscuous(false);
@@ -494,8 +501,10 @@ void DoNoHamMode::update() {
                 }
             }
             
+            taskENTER_CRITICAL(&pendingPMKIDMux);
             pendingPMKIDCreateReady = false;
             pendingPMKIDCreateBusy = false;
+            taskEXIT_CRITICAL(&pendingPMKIDMux);
             
             // Return to hopping if we were dwelling
             if (state == DNHState::DWELLING) {
@@ -503,6 +512,23 @@ void DoNoHamMode::update() {
                 dwellResolved = false;
             }
         }
+    }
+
+    // Process deferred incomplete handshake tracking
+    bool hasPendingIncomplete = false;
+    IncompleteHS pendingIncompleteLocal = {};
+    taskENTER_CRITICAL(&pendingIncompleteMux);
+    if (pendingIncompleteAdd) {
+        pendingIncompleteLocal = pendingIncomplete;
+        pendingIncompleteAdd = false;
+        hasPendingIncomplete = true;
+    }
+    taskEXIT_CRITICAL(&pendingIncompleteMux);
+
+    if (hasPendingIncomplete) {
+        trackIncompleteHandshake(pendingIncompleteLocal.bssid,
+                                 pendingIncompleteLocal.capturedMask,
+                                 pendingIncompleteLocal.channel);
     }
     
     // Process deferred handshake frame add (batch process all queued frames)
@@ -554,11 +580,13 @@ void DoNoHamMode::update() {
             
             // Look up SSID if missing
             if (hs.ssid[0] == 0) {
-                int netIdx = findNetwork(hs.bssid);
-                if (netIdx >= 0 && networks[netIdx].ssid[0] != 0) {
-                    strncpy(hs.ssid, networks[netIdx].ssid, 32);
+                int netIdx = NetworkRecon::findNetworkIndex(hs.bssid);
+                NetworkRecon::enterCritical();
+                if (netIdx >= 0 && netIdx < (int)networks().size() && networks()[netIdx].ssid[0] != 0) {
+                    strncpy(hs.ssid, networks()[netIdx].ssid, 32);
                     hs.ssid[32] = 0;
                 }
+                NetworkRecon::exitCritical();
             }
             
             // Check if we just completed a valid pair
@@ -585,6 +613,20 @@ void DoNoHamMode::update() {
         delay(5);  // Let SPI bus settle
         saveAllHandshakes();
         esp_wifi_set_promiscuous(true);
+    }
+    
+    // Periodic beacon data audit to prevent leaks (every 10s - Phase 3A fix)
+    static uint32_t lastBeaconAudit = 0;
+    if (now - lastBeaconAudit > 10000) {
+        for (auto& hs : handshakes) {
+            // Free beacon if handshake is saved (no longer needed in RAM)
+            if (hs.saved && hs.beaconData) {
+                free(hs.beaconData);
+                hs.beaconData = nullptr;
+                hs.beaconLen = 0;
+            }
+        }
+        lastBeaconAudit = now;
     }
     
     // Channel hopping state machine
@@ -652,9 +694,22 @@ void DoNoHamMode::update() {
     }
     
     // Periodic cleanup (every 10 seconds)
+    // NOTE: Network cleanup is now handled centrally by NetworkRecon::cleanupStaleNetworks()
+    // to avoid race conditions with shared vector. DNH only prunes its own incomplete handshakes.
     if (now - lastCleanupTime > 10000) {
-        ageOutStaleNetworks();
-        pruneIncompleteHandshakes(); // Also prune stale handshake tracking
+        pruneIncompleteHandshakes(); // Prune stale handshake tracking (DNH-specific)
+        
+        // Phase 3A: Shrink vectors after cleanup to reclaim memory
+        if (incompleteHandshakes.size() < incompleteHandshakes.capacity() / 2) {
+            incompleteHandshakes.shrink_to_fit();
+        }
+        if (handshakes.size() < handshakes.capacity() / 2) {
+            handshakes.shrink_to_fit();
+        }
+        if (pmkids.size() < pmkids.capacity() / 2) {
+            pmkids.shrink_to_fit();
+        }
+        
         lastCleanupTime = now;
     }
     
@@ -673,7 +728,7 @@ void DoNoHamMode::update() {
     
     // Mood update (every 3 seconds)
     if (now - lastMoodTime > 3000) {
-        Mood::onPassiveRecon(networks.size(), currentChannel);
+        Mood::onPassiveRecon(NetworkRecon::getNetworkCount(), currentChannel);
         lastMoodTime = now;
     }
     
@@ -810,21 +865,14 @@ void DoNoHamMode::startDwell() {
     dwellResolved = false;
 }
 
-void DoNoHamMode::ageOutStaleNetworks() {
-    uint32_t now = millis();
-    auto it = networks.begin();
-    while (it != networks.end()) {
-        if (now - it->lastSeen > DNH_STALE_TIMEOUT) {
-            it = networks.erase(it);
-        } else {
-            ++it;
-        }
-    }
-}
+// NOTE: ageOutStaleNetworks() removed - network cleanup is now handled centrally
+// by NetworkRecon::cleanupStaleNetworks() to avoid race conditions with the shared vector
 
 void DoNoHamMode::saveAllPMKIDs() {
     // Guard: Skip if no SD card available (graceful degradation)
     if (!Config::isSDAvailable()) return;
+
+    const char* handshakesDir = SDLayout::handshakesDir();
     
     // Save PMKIDs in hashcat 22000 format
     for (auto& p : pmkids) {
@@ -838,17 +886,20 @@ void DoNoHamMode::saveAllPMKIDs() {
         
         // Try to backfill SSID if missing
         if (p.ssid[0] == 0) {
-            int netIdx = findNetwork(p.bssid);
-            if (netIdx >= 0 && networks[netIdx].ssid[0] != 0) {
-                strncpy(p.ssid, networks[netIdx].ssid, 32);
+            int netIdx = NetworkRecon::findNetworkIndex(p.bssid);
+            NetworkRecon::enterCritical();
+            if (netIdx >= 0 && netIdx < (int)networks().size() && networks()[netIdx].ssid[0] != 0) {
+                strncpy(p.ssid, networks()[netIdx].ssid, 32);
                 p.ssid[32] = 0;
             }
+            NetworkRecon::exitCritical();
         }
         
         // Try to backfill SSID from companion txt file (cross-mode compatibility)
         if (p.ssid[0] == 0) {
             char txtPath[64];
-            snprintf(txtPath, sizeof(txtPath), "/handshakes/%02X%02X%02X%02X%02X%02X_pmkid.txt",
+            snprintf(txtPath, sizeof(txtPath), "%s/%02X%02X%02X%02X%02X%02X_pmkid.txt",
+                     handshakesDir,
                      p.bssid[0], p.bssid[1], p.bssid[2], p.bssid[3], p.bssid[4], p.bssid[5]);
             if (SD.exists(txtPath)) {
                 File txtFile = SD.open(txtPath, FILE_READ);
@@ -882,12 +933,13 @@ void DoNoHamMode::saveAllPMKIDs() {
         
         // Build filename: /handshakes/BSSID.22000
         char filename[64];
-        snprintf(filename, sizeof(filename), "/handshakes/%02X%02X%02X%02X%02X%02X.22000",
+        snprintf(filename, sizeof(filename), "%s/%02X%02X%02X%02X%02X%02X.22000",
+            handshakesDir,
             p.bssid[0], p.bssid[1], p.bssid[2], p.bssid[3], p.bssid[4], p.bssid[5]);
         
         // Ensure directory exists
-        if (!SD.exists("/handshakes")) {
-            SD.mkdir("/handshakes");
+        if (!SD.exists(handshakesDir)) {
+            SD.mkdir(handshakesDir);
         }
         
         File f = SD.open(filename, FILE_WRITE);
@@ -928,7 +980,8 @@ void DoNoHamMode::saveAllPMKIDs() {
         
         // Save SSID to companion txt file (matches OINK pattern)
         char txtFilename[64];
-        snprintf(txtFilename, sizeof(txtFilename), "/handshakes/%02X%02X%02X%02X%02X%02X_pmkid.txt",
+        snprintf(txtFilename, sizeof(txtFilename), "%s/%02X%02X%02X%02X%02X%02X_pmkid.txt",
+                 handshakesDir,
                  p.bssid[0], p.bssid[1], p.bssid[2], p.bssid[3], p.bssid[4], p.bssid[5]);
         // Delete existing file first to ensure clean overwrite (FILE_WRITE appends on ESP32)
         if (SD.exists(txtFilename)) {
@@ -948,6 +1001,8 @@ void DoNoHamMode::saveAllPMKIDs() {
 void DoNoHamMode::saveAllHandshakes() {
     // Guard: Skip if no SD card available (graceful degradation)
     if (!Config::isSDAvailable()) return;
+
+    const char* handshakesDir = SDLayout::handshakesDir();
     
     // Save handshakes in hashcat 22000 format (WPA*02)
     for (auto& hs : handshakes) {
@@ -962,17 +1017,20 @@ void DoNoHamMode::saveAllHandshakes() {
         
         // Try to backfill SSID if missing
         if (hs.ssid[0] == 0) {
-            int netIdx = findNetwork(hs.bssid);
-            if (netIdx >= 0 && networks[netIdx].ssid[0] != 0) {
-                strncpy(hs.ssid, networks[netIdx].ssid, 32);
+            int netIdx = NetworkRecon::findNetworkIndex(hs.bssid);
+            NetworkRecon::enterCritical();
+            if (netIdx >= 0 && netIdx < (int)networks().size() && networks()[netIdx].ssid[0] != 0) {
+                strncpy(hs.ssid, networks()[netIdx].ssid, 32);
                 hs.ssid[32] = 0;
             }
+            NetworkRecon::exitCritical();
         }
         
         // Try to backfill SSID from companion txt file (cross-mode compatibility)
         if (hs.ssid[0] == 0) {
             char txtPath[64];
-            snprintf(txtPath, sizeof(txtPath), "/handshakes/%02X%02X%02X%02X%02X%02X.txt",
+            snprintf(txtPath, sizeof(txtPath), "%s/%02X%02X%02X%02X%02X%02X.txt",
+                     handshakesDir,
                      hs.bssid[0], hs.bssid[1], hs.bssid[2], hs.bssid[3], hs.bssid[4], hs.bssid[5]);
             if (SD.exists(txtPath)) {
                 File txtFile = SD.open(txtPath, FILE_READ);
@@ -1015,12 +1073,13 @@ void DoNoHamMode::saveAllHandshakes() {
         
         // Build filename: /handshakes/BSSID_hs.22000
         char filename[64];
-        snprintf(filename, sizeof(filename), "/handshakes/%02X%02X%02X%02X%02X%02X_hs.22000",
+        snprintf(filename, sizeof(filename), "%s/%02X%02X%02X%02X%02X%02X_hs.22000",
+            handshakesDir,
             hs.bssid[0], hs.bssid[1], hs.bssid[2], hs.bssid[3], hs.bssid[4], hs.bssid[5]);
         
         // Ensure directory exists
-        if (!SD.exists("/handshakes")) {
-            SD.mkdir("/handshakes");
+        if (!SD.exists(handshakesDir)) {
+            SD.mkdir(handshakesDir);
         }
         
         File f = SD.open(filename, FILE_WRITE);
@@ -1094,8 +1153,12 @@ void DoNoHamMode::saveAllHandshakes() {
         
         // Save SSID to companion txt file (matches OINK pattern)
         char txtFilename[64];
-        snprintf(txtFilename, sizeof(txtFilename), "/handshakes/%02X%02X%02X%02X%02X%02X.txt",
+        snprintf(txtFilename, sizeof(txtFilename), "%s/%02X%02X%02X%02X%02X%02X.txt",
+                 handshakesDir,
                  hs.bssid[0], hs.bssid[1], hs.bssid[2], hs.bssid[3], hs.bssid[4], hs.bssid[5]);
+        if (SD.exists(txtFilename)) {
+            SD.remove(txtFilename);
+        }
         File txtFile = SD.open(txtFilename, FILE_WRITE);
         if (txtFile) {
             txtFile.println(hs.ssid);
@@ -1104,7 +1167,8 @@ void DoNoHamMode::saveAllHandshakes() {
         
         // Also save PCAP (for WPA-SEC upload and wireshark analysis)
         char pcapFilename[64];
-        snprintf(pcapFilename, sizeof(pcapFilename), "/handshakes/%02X%02X%02X%02X%02X%02X.pcap",
+        snprintf(pcapFilename, sizeof(pcapFilename), "%s/%02X%02X%02X%02X%02X%02X.pcap",
+            handshakesDir,
             hs.bssid[0], hs.bssid[1], hs.bssid[2], hs.bssid[3], hs.bssid[4], hs.bssid[5]);
         
         File pcapFile = SD.open(pcapFilename, FILE_WRITE);
@@ -1169,12 +1233,8 @@ void DoNoHamMode::saveAllHandshakes() {
 }
 
 int DoNoHamMode::findNetwork(const uint8_t* bssid) {
-    for (size_t i = 0; i < networks.size(); i++) {
-        if (memcmp(networks[i].bssid, bssid, 6) == 0) {
-            return i;
-        }
-    }
-    return -1;
+    // Delegate to NetworkRecon's thread-safe implementation
+    return NetworkRecon::findNetworkIndex(bssid);
 }
 
 int DoNoHamMode::findOrCreatePMKID(const uint8_t* bssid) {
@@ -1238,7 +1298,13 @@ int DoNoHamMode::findOrCreateHandshake(const uint8_t* bssid, const uint8_t* stat
 void DoNoHamMode::injectTestNetwork(const uint8_t* bssid, const char* ssid, uint8_t channel, int8_t rssi, wifi_auth_mode_t authmode, bool hasPMF) {
     if (!running) return;
     if (dnhBusy) return;  // Prevent race with update() vector operations
-    if (networks.size() >= DNH_MAX_NETWORKS) return;  // Use consistent constant
+    
+    NetworkRecon::enterCritical();
+    if (networks().size() >= DNH_MAX_NETWORKS) {
+        NetworkRecon::exitCritical();
+        return;  // Use consistent constant
+    }
+    NetworkRecon::exitCritical();
     
     // Heap protection - prevent OOM crash from stress test flooding
     // Need ~300 bytes per DetectedNetwork + vector realloc overhead (can double capacity)
@@ -1250,12 +1316,14 @@ void DoNoHamMode::injectTestNetwork(const uint8_t* bssid, const char* ssid, uint
     }
     
     // Check if already exists (update is cheap, no allocation)
-    for (auto& net : networks) {
+    NetworkRecon::enterCritical();
+    for (auto& net : networks()) {
         if (memcmp(net.bssid, bssid, 6) == 0) {
             // Update existing
             net.rssi = rssi;
             net.lastSeen = millis();
             net.beaconCount++;
+            NetworkRecon::exitCritical();
             return;
         }
     }
@@ -1280,14 +1348,44 @@ void DoNoHamMode::injectTestNetwork(const uint8_t* bssid, const char* ssid, uint
         net.isHidden = (!ssid || ssid[0] == 0);
         net.clientCount = 0;
         
-        networks.push_back(net);
+        networks().push_back(net);
     } catch (...) {
         // OOM during push_back - silently ignore
         Serial.println("[DNH] OOM in injectTestNetwork - dropping");
     }
+    NetworkRecon::exitCritical();
 }
 
-// Frame handlers - called from shared promiscuous callback
+// Packet callback - registered with NetworkRecon for EAPOL/PMKID capture
+void DoNoHamMode::promiscuousCallback(const wifi_promiscuous_pkt_t* pkt, wifi_promiscuous_pkt_type_t type) {
+    if (!pkt || !running || dnhBusy) return;
+    
+    uint16_t len = pkt->rx_ctrl.sig_len;
+    // ESP32 adds 4 ghost bytes to sig_len
+    if (len > 4) len -= 4;
+    if (len < 24) return;
+    
+    const uint8_t* payload = pkt->payload;
+    uint8_t frameSubtype = (payload[0] >> 4) & 0x0F;
+    int8_t rssi = pkt->rx_ctrl.rssi;
+    
+    switch (type) {
+        case WIFI_PKT_MGMT:
+            if (frameSubtype == 0x08) {  // Beacon
+                handleBeacon(payload, len, rssi);
+            } else if (frameSubtype == 0x05) {  // Probe Response
+                handleProbeResponse(payload, len, rssi);
+            }
+            break;
+        case WIFI_PKT_DATA:
+            handleEAPOL(payload, len, rssi);
+            break;
+        default:
+            break;
+    }
+}
+
+// Frame handlers - called from promiscuousCallback
 void DoNoHamMode::handleBeacon(const uint8_t* frame, uint16_t len, int8_t rssi) {
     if (!running) return;
     if (dnhBusy) return;  // Skip if update() is processing vectors
@@ -1297,16 +1395,16 @@ void DoNoHamMode::handleBeacon(const uint8_t* frame, uint16_t len, int8_t rssi) 
     // [22-23] Seq, [24-35] Timestamp, [36-37] Beacon Interval, [38-39] Capability
     // [40+] IEs
     
-    if (len < 40) return;
+    if (len < 40 || len > 2346) return; // Basic validation: IEEE 802.11 beacon frame limits
     
     const uint8_t* bssid = frame + 16;
     
     // Parse SSID from IE 0
     char ssid[33] = {0};
-    uint16_t offset = 36;  // Start of fixed fields after header
-    offset += 12;  // Skip timestamp(8) + beacon_interval(2) + capability(2)
+    uint16_t offset = 36;  // Start of IEs (24-byte header + 12-byte fixed params)
     
     while (offset + 2 < len) {
+        if (offset + 2 >= len) break; // Extra bounds check
         uint8_t ieType = frame[offset];
         uint8_t ieLen = frame[offset + 1];
         if (offset + 2 + ieLen > len) break;
@@ -1321,14 +1419,17 @@ void DoNoHamMode::handleBeacon(const uint8_t* frame, uint16_t len, int8_t rssi) 
     
     // Check if this resolves a pending PMKID dwell
     if (state == DNHState::DWELLING && ssid[0] != 0) {
+        taskENTER_CRITICAL(&pendingPMKIDMux);
         if (memcmp(bssid, pendingPMKIDCreate.bssid, 6) == 0) {
             strncpy(pendingPMKIDCreate.ssid, ssid, 32);
             pendingPMKIDCreate.ssid[32] = 0;
             dwellResolved = true;
         }
+        taskEXIT_CRITICAL(&pendingPMKIDMux);
     }
     
     // Queue network for deferred add
+    taskENTER_CRITICAL(&pendingNetworkMux);
     if (!pendingNetworkAdd) {
         memset(&pendingNetwork, 0, sizeof(pendingNetwork));
         memcpy(pendingNetwork.bssid, bssid, 6);
@@ -1340,12 +1441,14 @@ void DoNoHamMode::handleBeacon(const uint8_t* frame, uint16_t len, int8_t rssi) 
         pendingNetwork.beaconCount = 1;
         pendingNetworkAdd = true;
     }
+    taskEXIT_CRITICAL(&pendingNetworkMux);
     
     // Store beacon for any in-progress handshakes from this BSSID
     // (needed for PCAP export / WPA-SEC upload)
     // DEFERRED: Copy beacon to static buffer, let update() do malloc AND matching
     // (ESP32 dual-core race: iterating handshakes here can crash if update() does push_back)
     // BUG FIX: Don't iterate handshakes vector in callback - defer ALL matching to update()
+    taskENTER_CRITICAL(&pendingBeaconMux);
     if (!pendingBeaconStore) {
         // Just store the beacon data - update() will find matching handshakes
         uint16_t copyLen = (len > 512) ? 512 : len;
@@ -1354,6 +1457,7 @@ void DoNoHamMode::handleBeacon(const uint8_t* frame, uint16_t len, int8_t rssi) 
         pendingBeaconLen = copyLen;
         pendingBeaconStore = true;
     }
+    taskEXIT_CRITICAL(&pendingBeaconMux);
     
     // Track channel activity for adaptive hopping
     int idx = currentChannel - 1;
@@ -1389,25 +1493,16 @@ void DoNoHamMode::handleProbeResponse(const uint8_t* frame, uint16_t len, int8_t
     
     if (ssid[0] == 0) return;
     
-    if (pendingNetworkAdd && memcmp(pendingNetwork.bssid, bssid, 6) == 0) {
-        if (pendingNetwork.ssid[0] == 0) {
-            strncpy(pendingNetwork.ssid, ssid, 32);
-            pendingNetwork.ssid[32] = 0;
-            pendingNetwork.rssi = rssi;
-            pendingNetwork.lastSeen = millis();
-        }
-        return;
+    taskENTER_CRITICAL(&pendingProbeMux);
+    if (!pendingProbeResponseAdd) {
+        memcpy(pendingProbeResponse.bssid, bssid, 6);
+        strncpy(pendingProbeResponse.ssid, ssid, 32);
+        pendingProbeResponse.ssid[32] = 0;
+        pendingProbeResponse.rssi = rssi;
+        pendingProbeResponse.lastSeen = millis();
+        pendingProbeResponseAdd = true;
     }
-    
-    int idx = findNetwork(bssid);
-    if (idx >= 0) {
-        if (networks[idx].ssid[0] == 0) {
-            strncpy(networks[idx].ssid, ssid, 32);
-            networks[idx].ssid[32] = 0;
-        }
-        networks[idx].rssi = rssi;
-        networks[idx].lastSeen = millis();
-    }
+    taskEXIT_CRITICAL(&pendingProbeMux);
 }
 
 void DoNoHamMode::handleEAPOL(const uint8_t* frame, uint16_t len, int8_t rssi) {
@@ -1418,7 +1513,7 @@ void DoNoHamMode::handleEAPOL(const uint8_t* frame, uint16_t len, int8_t rssi) {
     // Frame: FC(2) + Duration(2) + Addr1(6) + Addr2(6) + Addr3(6) + Seq(2) = 24 bytes
     // Then QoS(2) if present, then LLC/SNAP(8), then EAPOL payload
     
-    if (len < 24) return;
+    if (len < 24 || len > 2346) return; // Basic validation: IEEE 802.11 frame limits
     
     // Check To/From DS flags
     uint8_t toDs = (frame[1] & 0x01);
@@ -1536,6 +1631,7 @@ void DoNoHamMode::handleEAPOL(const uint8_t* frame, uint16_t len, int8_t rssi) {
                         }
                         
                         // Queue PMKID for creation in main thread
+                        taskENTER_CRITICAL(&pendingPMKIDMux);
                         if (!pendingPMKIDCreateBusy && !pendingPMKIDCreateReady) {
                             memcpy(pendingPMKIDCreate.bssid, apBssid, 6);
                             memcpy(pendingPMKIDCreate.station, station, 6);
@@ -1546,12 +1642,10 @@ void DoNoHamMode::handleEAPOL(const uint8_t* frame, uint16_t len, int8_t rssi) {
                             // SSID lookup deferred to update() where it's safe
                             // Clear SSID to trigger dwell/lookup in update()
                             pendingPMKIDCreate.ssid[0] = 0;
-                            state = DNHState::DWELLING;
-                            dwellStartTime = millis();
-                            dwellResolved = false;
                             
                             pendingPMKIDCreateReady = true;
                         }
+                        taskEXIT_CRITICAL(&pendingPMKIDMux);
                         break;  // Found PMKID, stop searching
                     }
                 }
@@ -1609,7 +1703,15 @@ void DoNoHamMode::handleEAPOL(const uint8_t* frame, uint16_t len, int8_t rssi) {
         channelStats[idx].lastActivity = millis();
     }
     
-    // Track incomplete handshakes for future hunting
+    // Track incomplete handshakes for future hunting (defer to update)
     uint8_t captureMask = (1 << (messageNum - 1));
-    trackIncompleteHandshake(apBssid, captureMask, currentChannel);
+    taskENTER_CRITICAL(&pendingIncompleteMux);
+    if (!pendingIncompleteAdd) {
+        memcpy(pendingIncomplete.bssid, apBssid, 6);
+        pendingIncomplete.capturedMask = captureMask;
+        pendingIncomplete.channel = currentChannel;
+        pendingIncomplete.lastSeen = millis();
+        pendingIncompleteAdd = true;
+    }
+    taskEXIT_CRITICAL(&pendingIncompleteMux);
 }

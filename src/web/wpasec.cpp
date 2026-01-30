@@ -1,323 +1,150 @@
-// WPA-SEC distributed cracking service client implementation (lean, no HTTPClient)
+// WPA-SEC distributed cracking service client
+// https://wpa-sec.stanev.org/
 
 #include "wpasec.h"
+#include "../core/sd_layout.h"
+#include "../core/config.h"
+#include "../core/wifi_utils.h"
+#include "../core/network_recon.h"
+#include "../piglet/mood.h"
+#include <SD.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
-#include <SD.h>
+#include <ctype.h>
 #include <esp_heap_caps.h>
-#include <esp_system.h>
-#include "../core/config.h"
-#include "../core/sdlog.h"
-#include "../ui/display.h"
-#include "../core/xp.h"
-#include "../core/wifi_utils.h"
-#include "../core/scope_resume.h"
+
+// WPA-SEC API
+static const char* WPASEC_HOST = "wpa-sec.stanev.org";
+static const uint16_t WPASEC_PORT = 443;
+static const char* WPASEC_UPLOAD_PATH = "/";
+static const char* WPASEC_POTFILE_PATH = "/?api&dl=1";
 
 // Static member initialization
 bool WPASec::cacheLoaded = false;
 char WPASec::lastError[64] = "";
-char WPASec::statusMessage[64] = "READY";
 std::map<String, WPASec::CacheEntry> WPASec::crackedCache;
 std::map<String, bool> WPASec::uploadedCache;
-bool WPASec::busy = false;
-
-// Lightweight heap logger for diagnostics
-static void logHeap(const char* tag) {
-    Serial.printf("[WPASEC][HEAP] %s free=%lu largest=%lu\n",
-        tag,
-        (unsigned long)ESP.getFreeHeap(),
-        (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-}
-
-static bool shouldAwardSmokedBacon() {
-    uint8_t chance = 3;  // base 3%
-    if (XP::getClass() == PorkClass::B4C0NM4NC3R) {
-        chance += 1;  // +1% for Baconmancer
-    }
-    return (esp_random() % 100) < chance;
-}
-
-// Busy scope guard
-class BusyScope {
-public:
-    explicit BusyScope(bool& ref) : ref_(ref) { ref_ = true; }
-    ~BusyScope() { ref_ = false; }
-private:
-    bool& ref_;
-};
-
-// Read and parse HTTP status code from a client response.
-// Handles the occasional "HTTP/1.1 100 Continue" prelude.
-static int readHttpStatus(WiFiClientSecure& client) {
-    for (int guard = 0; guard < 6; ++guard) {
-        String line = client.readStringUntil('\n');
-        line.trim();
-        if (!line.startsWith("HTTP/")) {
-            continue;
-        }
-
-        // Parse: HTTP/1.1 200 OK
-        int sp1 = line.indexOf(' ');
-        if (sp1 < 0) return -1;
-        int sp2 = line.indexOf(' ', sp1 + 1);
-        String codeStr = (sp2 > sp1) ? line.substring(sp1 + 1, sp2) : line.substring(sp1 + 1);
-        int code = codeStr.toInt();
-
-        if (code == 100) {
-            // Consume remaining headers for the 100 response, then read next status.
-            while (client.connected()) {
-                String h = client.readStringUntil('\n');
-                if (h == "\r" || h.length() == 0) break;
-            }
-            continue;
-        }
-        return code;
-    }
-    return -1;
-}
-
-// Heap-safe file scan for a normalized BSSID key (upper, no separators).
-static bool fileContainsKey(const char* path, const String& normKey, size_t maxLines = 600) {
-    if (!SD.exists(path)) return false;
-    File f = SD.open(path, FILE_READ);
-    if (!f) return false;
-
-    size_t lines = 0;
-    while (f.available() && lines++ < maxLines) {
-        String line = f.readStringUntil('\n');
-        line.trim();
-        if (line.isEmpty()) continue;
-
-        // Uploaded list stores raw BSSID
-        if (line.equalsIgnoreCase(normKey)) {
-            f.close();
-            return true;
-        }
-
-        // Results store "BSSID:SSID:PASS"; match prefix before first ':'
-        int c = line.indexOf(':');
-        if (c > 0) {
-            String prefix = line.substring(0, c);
-            prefix.trim();
-            if (prefix.equalsIgnoreCase(normKey)) {
-                f.close();
-                return true;
-            }
-        }
-    }
-    f.close();
-    return false;
-}
-
-void WPASec::init() {
-    cacheLoaded = false;
-    crackedCache.clear();
-    uploadedCache.clear();
-    strcpy(lastError, "");
-    strcpy(statusMessage, "READY");
-}
-
-// ============================================================================
-// WiFi Connection (Standalone)
-// ============================================================================
-
-bool WPASec::connect() {
-    if (WiFi.status() == WL_CONNECTED) {
-        strcpy(statusMessage, "ALREADY CONNECTED");
-        return true;
-    }
-
-    String ssid = Config::wifi().otaSSID;
-    String password = Config::wifi().otaPassword;
-
-    if (ssid.isEmpty()) {
-        strcpy(lastError, "NO WIFI SSID CONFIGURED");
-        strcpy(statusMessage, "NO WIFI SSID");
-        return false;
-    }
-
-    strcpy(statusMessage, "CONNECTING...");
-    Serial.printf("[WPASEC] Connecting to %s\n", ssid.c_str());
-    logHeap("connect start");
-
-    WiFiUtils::stopPromiscuous();
-    Display::requestSuspendSprites();
-    freeCacheMemory();
-    Display::waitForSpritesSuspended(2000);
-
-    // Cardputer w/ no PSRAM: never fully power WiFi off.
-    // This avoids RX buffer allocation failures and heap fragmentation.
-    WiFiUtils::hardReset();
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(ssid.c_str(), password.c_str());
-
-    // Wait for connection with timeout
-    uint32_t startTime = millis();
-    // Slightly longer timeout helps with phone tether / crowded 2.4GHz.
-    while (WiFi.status() != WL_CONNECTED && millis() - startTime < 20000) {
-        delay(100);
-    }
-
-    if (WiFi.status() == WL_CONNECTED) {
-        snprintf(statusMessage, sizeof(statusMessage), "IP: %s", WiFi.localIP().toString().c_str());
-        Serial.printf("[WPASEC] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
-        Display::requestResumeSprites();
-        logHeap("connect ok");
-        return true;
-    }
-
-    strcpy(lastError, "CONNECTION TIMEOUT");
-    strcpy(statusMessage, "CONNECT FAILED");
-    Serial.println("[WPASEC] Connection failed");
-    WiFiUtils::shutdown();
-    Display::requestResumeSprites();
-    logHeap("connect fail");
-    return false;
-}
-
-void WPASec::disconnect() {
-    // Soft shutdown (keeps driver alive) for no-PSRAM stability.
-    WiFiUtils::shutdown();
-    strcpy(statusMessage, "DISCONNECTED");
-    Serial.println("[WPASEC] Disconnected");
-}
-
-bool WPASec::isConnected() {
-    return WiFi.status() == WL_CONNECTED;
-}
+volatile bool WPASec::busy = false;
+bool WPASec::batchMode = false;
 
 bool WPASec::isBusy() {
     return busy;
 }
 
-// ============================================================================
-// BSSID Normalization
-// ============================================================================
-
 String WPASec::normalizeBSSID(const char* bssid) {
-    // Remove colons/dashes, convert to uppercase
-    String result;
+    if (!bssid) return "";
+    String out = "";
+    out.reserve(12);
     for (int i = 0; bssid[i]; i++) {
         char c = bssid[i];
         if (c != ':' && c != '-') {
-            result += (char)toupper(c);
+            out += (char)toupper(c);
         }
     }
-    return result;
+    return out;
+}
+
+void WPASec::normalizeBSSID_Char(const char* bssid, char* output, size_t outLen) {
+    if (!bssid || !output || outLen < 1) return;
+    size_t outIdx = 0;
+    for (int i = 0; bssid[i] && outIdx < outLen - 1; i++) {
+        char c = bssid[i];
+        if (c != ':' && c != '-') {
+            output[outIdx++] = (char)toupper(c);
+        }
+    }
+    output[outIdx] = '\0';
 }
 
 // ============================================================================
-// Cache Management
+// Cache Management (disk only)
 // ============================================================================
+
+bool WPASec::loadUploadedList() {
+    uploadedCache.clear();
+    const char* uploadedPath = SDLayout::wpasecUploadedPath();
+    if (!SD.exists(uploadedPath)) return true;
+
+    File f = SD.open(uploadedPath, FILE_READ);
+    if (!f) {
+        strncpy(lastError, "CANNOT OPEN UPLOADED", sizeof(lastError) - 1);
+        lastError[sizeof(lastError) - 1] = '\0';
+        return false;
+    }
+
+    String line;
+    line.reserve(64);  // Pre-allocate to reduce heap fragmentation
+    while (f.available() && uploadedCache.size() < 500) {
+        line = f.readStringUntil('\n');  // Reuses existing capacity
+        line.trim();
+        if (!line.isEmpty()) {
+            String key = normalizeBSSID(line.c_str());
+            if (!key.isEmpty()) {
+                uploadedCache[key] = true;
+            }
+        }
+    }
+
+    f.close();
+    return true;
+}
 
 bool WPASec::loadCache() {
     if (cacheLoaded) return true;
 
     crackedCache.clear();
+    uploadedCache.clear();
 
-    if (!SD.exists(CACHE_FILE)) {
-        cacheLoaded = true;
-        return true;  // No cache yet, that's OK
+    const char* cachePath = SDLayout::wpasecResultsPath();
+    if (SD.exists(cachePath)) {
+        File f = SD.open(cachePath, FILE_READ);
+        if (!f) {
+            strncpy(lastError, "CANNOT OPEN CACHE", sizeof(lastError) - 1);
+            lastError[sizeof(lastError) - 1] = '\0';
+            return false;
+        }
+
+        // Format: AP_BSSID:CLIENT_BSSID:SSID:password (WPA-SEC potfile format)
+        // AP_BSSID is always 12 hex chars, CLIENT_BSSID is always 12 hex chars
+        // Cap at 500 entries to prevent memory exhaustion
+        String line;
+        line.reserve(128);  // Pre-allocate to reduce heap fragmentation
+        while (f.available() && crackedCache.size() < 500) {
+            line = f.readStringUntil('\n');  // Reuses existing capacity
+            line.trim();
+            if (line.isEmpty()) continue;
+
+            // WPA-SEC potfile: AP_BSSID:CLIENT_BSSID:SSID:password
+            // Both BSSIDs are exactly 12 hex chars (no colons)
+            // Password can contain colons, so we must find the THIRD colon
+            int firstColon = line.indexOf(':');
+            int secondColon = (firstColon > 0) ? line.indexOf(':', firstColon + 1) : -1;
+            int thirdColon = (secondColon > 0) ? line.indexOf(':', secondColon + 1) : -1;
+
+            // Validate: AP BSSID at pos 0-11 (colon at 12), client BSSID at pos 13-24 (colon at 25)
+            if (firstColon == 12 && secondColon == 25 && thirdColon > secondColon) {
+                String bssid = line.substring(0, firstColon);  // AP BSSID
+                String ssid = line.substring(secondColon + 1, thirdColon);  // SSID between 2nd and 3rd colon
+                String password = line.substring(thirdColon + 1);  // Everything after 3rd colon
+
+                bssid = normalizeBSSID(bssid.c_str());
+
+                CacheEntry entry;
+                entry.ssid = ssid;
+                entry.password = password;
+                crackedCache[bssid] = entry;
+            }
+        }
+
+        f.close();
     }
 
-    File f = SD.open(CACHE_FILE, FILE_READ);
-    if (!f) {
-        strcpy(lastError, "CANNOT OPEN CACHE");
+    if (!loadUploadedList()) {
         return false;
     }
 
-    // Format: BSSID:SSID:password (one per line)
-    // Cap at 500 entries to prevent memory exhaustion
-    while (f.available() && crackedCache.size() < 500) {
-        String line = f.readStringUntil('\n');
-        line.trim();
-        if (line.isEmpty()) continue;
-
-        int firstColon = line.indexOf(':');
-        int lastColon = line.lastIndexOf(':');
-
-        if (firstColon > 0 && lastColon > firstColon) {
-            String bssid = line.substring(0, firstColon);
-            String ssid = line.substring(firstColon + 1, lastColon);
-            String password = line.substring(lastColon + 1);
-
-            bssid = normalizeBSSID(bssid.c_str());
-
-            CacheEntry entry;
-            entry.ssid = ssid;
-            entry.password = password;
-            crackedCache[bssid] = entry;
-        }
-    }
-
-    f.close();
     cacheLoaded = true;
-
-    // Also load uploaded list
-    loadUploadedList();
-
-    Serial.printf("[WPASEC] Cache loaded: %d cracked, %d uploaded\n",
-                  crackedCache.size(), uploadedCache.size());
     return true;
-}
-
-bool WPASec::saveCache() {
-    File f = SD.open(CACHE_FILE, FILE_WRITE);
-    if (!f) {
-        strcpy(lastError, "CANNOT WRITE CACHE");
-        return false;
-    }
-
-    for (auto& pair : crackedCache) {
-        f.printf("%s:%s:%s\n", pair.first.c_str(),
-                 pair.second.ssid.c_str(), pair.second.password.c_str());
-    }
-
-    f.close();
-    return true;
-}
-
-bool WPASec::loadUploadedList() {
-    uploadedCache.clear();
-
-    if (!SD.exists(UPLOADED_FILE)) return true;
-
-    File f = SD.open(UPLOADED_FILE, FILE_READ);
-    if (!f) return false;
-
-    // Cap at 500 entries to prevent memory exhaustion
-    while (f.available() && uploadedCache.size() < 500) {
-        String line = f.readStringUntil('\n');
-        line.trim();
-        if (!line.isEmpty()) {
-            uploadedCache[normalizeBSSID(line.c_str())] = true;
-        }
-    }
-
-    f.close();
-    return true;
-}
-
-bool WPASec::saveUploadedList() {
-    File f = SD.open(UPLOADED_FILE, FILE_WRITE);
-    if (!f) return false;
-
-    for (auto& pair : uploadedCache) {
-        f.println(pair.first);
-    }
-
-    f.close();
-    return true;
-}
-
-void WPASec::freeCacheMemory() {
-    size_t crackedCount = crackedCache.size();
-    size_t uploadedCount = uploadedCache.size();
-    crackedCache.clear();
-    uploadedCache.clear();
-    cacheLoaded = false;
-    Serial.printf("[WPASEC] Freed cache: %u cracked, %u uploaded\n",
-                  (unsigned int)crackedCount, (unsigned int)uploadedCount);
 }
 
 // ============================================================================
@@ -358,391 +185,586 @@ uint16_t WPASec::getCrackedCount() {
 bool WPASec::isUploaded(const char* bssid) {
     loadCache();
     String key = normalizeBSSID(bssid);
-    // Cracked implies uploaded
     if (crackedCache.find(key) != crackedCache.end()) return true;
     return uploadedCache.find(key) != uploadedCache.end();
-}
-
-void WPASec::markUploaded(const char* bssid) {
-    String key = normalizeBSSID(bssid);
-
-    // Update in-memory cache only if already loaded (avoid heap spikes).
-    if (cacheLoaded) {
-        uploadedCache[key] = true;
-    }
-
-    // Persist by appending to SD (cheap, streaming, no full rewrite).
-    // Guard against duplicates.
-    if (fileContainsKey(UPLOADED_FILE, key)) return;
-
-    File f = SD.open(UPLOADED_FILE, FILE_APPEND);
-    if (f) {
-        f.println(key);
-        f.close();
-    }
-}
-
-// ============================================================================
-// API Operations (lean HTTPClient)
-// ============================================================================
-bool WPASec::fetchResults() {
-    if (!isConnected()) {
-        strcpy(lastError, "NOT CONNECTED TO WIFI");
-        return false;
-    }
-
-    String key = Config::wifi().wpaSecKey;
-    if (key.isEmpty()) {
-        strcpy(lastError, "NO WPA-SEC KEY CONFIGURED");
-        return false;
-    }
-
-    strcpy(statusMessage, "FETCHING RESULTS...");
-    Serial.println("[WPASEC] Fetching results from WPA-SEC");
-    BusyScope busyGuard(busy);
-
-    // Free caches and suspend sprites for maximum heap before TLS.
-    freeCacheMemory();
-    Display::requestSuspendSprites();
-    Display::waitForSpritesSuspended(2000);
-    ScopeResume resumeGuard;  // auto-resume on any exit
-
-    // Guard: ensure enough contiguous heap for TLS (~16KB)
-    if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < 16000) {
-        strcpy(lastError, "LOW HEAP");
-        return false;
-    }
-    logHeap("fetch pre-TLS");
-
-    // Retry once on transient TLS/connect failures (phone tether, weak RSSI)
-    WiFiClientSecure client;
-    client.setInsecure();
-    client.setNoDelay(true);
-    client.setTimeout(45000);
-
-    bool connected = false;
-    for (int attempt = 0; attempt < 2; ++attempt) {
-        if (client.connect(API_HOST, 443)) {
-            connected = true;
-            break;
-        }
-        delay(250);
-    }
-    if (!connected) {
-        strcpy(lastError, "TLS CONNECT FAIL");
-        strcpy(statusMessage, "TLS FAIL");
-        return false;
-    }
-
-    // Send manual GET
-    client.print("GET ");
-    client.print(RESULTS_PATH);
-    client.println(" HTTP/1.1");
-    client.print("Host: ");
-    client.println(API_HOST);
-    client.print("Cookie: key=");
-    client.println(key);
-    client.println("Connection: close");
-    client.println();
-
-    // Read status code (handle 100-Continue)
-    int code = readHttpStatus(client);
-    if (code != 200) {
-        snprintf(lastError, sizeof(lastError), "HTTP %d", code);
-        strcpy(statusMessage, "HTTP FAIL");
-        client.stop();
-        return false;
-    }
-
-    // Skip headers
-    while (client.connected()) {
-        String h = client.readStringUntil('\n');
-        if (h == "\r" || h.length() == 0) break;
-    }
-
-    // Stream response to SD temp file to avoid heap spikes
-    const char* TMP_FETCH_PATH = "/wpasec_fetch.tmp";
-    if (SD.exists(TMP_FETCH_PATH)) SD.remove(TMP_FETCH_PATH);
-    File tmp = SD.open(TMP_FETCH_PATH, FILE_WRITE);
-    if (!tmp) {
-        strcpy(lastError, "TMP FAIL");
-        client.stop();
-        return false;
-    }
-
-    char buf[256];
-    uint32_t lastData = millis();
-    while (client.connected() && (millis() - lastData) < 60000) {
-        size_t n = client.readBytesUntil('\n', buf, sizeof(buf) - 1);
-        if (n == 0) {
-            if (client.available()) continue;
-            delay(1);
-            continue;
-        }
-        buf[n] = '\0';
-        tmp.println(buf);
-        lastData = millis();
-    }
-    tmp.close();
-    client.stop();
-
-    // Parse temp file line-by-line
-    File parseFile = SD.open(TMP_FETCH_PATH, FILE_READ);
-    if (!parseFile) {
-        strcpy(lastError, "TMP READ FAIL");
-        return false;
-    }
-
-    // Reload existing cache so we merge, not clobber
-    loadCache();
-
-    int newCracks = 0;
-    while (parseFile.available()) {
-        String line = parseFile.readStringUntil('\n');
-        line.trim();
-        if (line.isEmpty()) continue;
-
-        int firstColon = line.indexOf(':');
-        int lastColon  = line.lastIndexOf(':');
-
-        if (firstColon > 0 && lastColon > firstColon) {
-            String bssid = normalizeBSSID(line.substring(0, firstColon).c_str());
-            String ssid  = line.substring(firstColon + 1, lastColon);
-            String pass  = line.substring(lastColon + 1);
-
-            int colonPos = ssid.indexOf(':');
-            if (colonPos >= 0) {
-                ssid = ssid.substring(colonPos + 1);
-            }
-
-            if (!pass.isEmpty() && bssid.length() >= 12) {
-                bool isNew = (crackedCache.find(bssid) == crackedCache.end());
-                if (isNew) newCracks++;
-
-                CacheEntry ce;
-                ce.ssid = ssid;
-                ce.password = pass;
-
-                crackedCache[bssid] = ce;
-                uploadedCache[bssid] = true;
-            }
-        }
-    }
-    parseFile.close();
-    SD.remove(TMP_FETCH_PATH);
-
-    // Save caches
-    saveCache();
-    saveUploadedList();
-
-    snprintf(statusMessage, sizeof(statusMessage), "%d cracked (%d new)",
-             crackedCache.size(), newCracks);
-    Serial.printf("[WPASEC] Fetched: %d total, %d new\n", crackedCache.size(), newCracks);
-    logHeap("fetch end");
-    SDLog::log("WPASEC", "Fetched: %d cracked (%d new)", (int)crackedCache.size(), newCracks);
-    return true;
-}
-
-
-bool WPASec::uploadCapture(const char* pcapPath) {
-    BusyScope busyGuard(busy);
-    if (!isConnected()) {
-        strcpy(lastError, "NOT CONNECTED TO WIFI");
-        return false;
-    }
-
-    // Get API key
-    String key = Config::wifi().wpaSecKey;
-    if (key.isEmpty()) {
-        strcpy(lastError, "NO WPA-SEC KEY CONFIGURED");
-        return false;
-    }
-
-    // Check file exists
-    if (!SD.exists(pcapPath)) {
-        snprintf(lastError, sizeof(lastError), "FILE NOT FOUND: %s", pcapPath);
-        return false;
-    }
-
-    // Open capture file
-    File pcapFile = SD.open(pcapPath, FILE_READ);
-    if (!pcapFile) {
-        strcpy(lastError, "CANNOT OPEN FILE");
-        return false;
-    }
-
-    const size_t fileSize = pcapFile.size();
-    if (fileSize == 0) {
-        pcapFile.close();
-        strcpy(lastError, "EMPTY FILE");
-        return false;
-    }
-
-    // Extract filename
-    const char* slash = strrchr(pcapPath, '/');
-    const char* fname = slash ? slash + 1 : pcapPath;
-    String filename = fname;
-
-    // Derive BSSID key from filename and prevent duplicate uploads.
-    // (Messaging parity: always show "ALREADY UPLOADED" and hard-stop.)
-    String base = filename;
-    int dot = base.indexOf('.');
-    if (dot > 0) base = base.substring(0, dot);
-    if (base.endsWith("_hs")) base = base.substring(0, base.length() - 3);
-    String normKey = normalizeBSSID(base.c_str());
-
-    if (fileContainsKey(UPLOADED_FILE, normKey) || fileContainsKey(CACHE_FILE, normKey)) {
-        pcapFile.close();
-        strcpy(statusMessage, "ALREADY UPLOADED");
-        strcpy(lastError, "ALREADY UPLOADED");
-        SDLog::log("WPASEC", "Skip re-upload: %s", normKey.c_str());
-        return false;
-    }
-
-    Serial.printf("[WPASEC] Uploading %s (%u bytes) to %s%s\n",
-                  filename.c_str(), (unsigned int)fileSize, API_HOST, SUBMIT_PATH);
-
-    // Free caches and suspend sprites for maximum heap before TLS
-    freeCacheMemory();
-    Display::requestSuspendSprites();
-    Display::waitForSpritesSuspended(2000);
-    ScopeResume resumeGuard;  // auto-resume on any exit
-
-    // Guard: ensure enough contiguous heap for TLS (~16KB)
-    if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < 16000) {
-        strcpy(lastError, "LOW HEAP");
-        return false;
-    }
-
-    // Setup TLS client (longer timeout improves reliability on slow links)
-    WiFiClientSecure client;
-    client.setInsecure();
-    client.setNoDelay(true);
-    client.setTimeout(60000);
-
-    String url = String("https://") + API_HOST + SUBMIT_PATH;
-
-    String boundary = "----WPASEC";
-    boundary += String((unsigned long)millis());
-    String bodyStart = "--" + boundary + "\r\n";
-    bodyStart += "Content-Disposition: form-data; name=\"file\"; filename=\"" + filename + "\"\r\n";
-    bodyStart += "Content-Type: application/octet-stream\r\n\r\n";
-    String bodyEnd = "\r\n--" + boundary + "--\r\n";
-    size_t contentLength = bodyStart.length() + fileSize + bodyEnd.length();
-
-    // Build request
-    String cookie = String("key=") + key;
-
-    // Send request manually over WiFiClientSecure
-    bool success = false;
-    int lastCode = -1;
-
-    for (int attempt = 0; attempt < 2 && !success; ++attempt) {
-        // Reset file cursor for retry
-        pcapFile.seek(0);
-
-        if (!client.connect(API_HOST, 443)) {
-            lastCode = -1;
-            if (attempt == 0) {
-                delay(250);
-                continue;
-            }
-            pcapFile.close();
-            strcpy(lastError, "TLS CONNECT FAIL");
-            strcpy(statusMessage, "TLS FAIL");
-            return false;
-        }
-
-        client.print("POST ");
-        client.print(SUBMIT_PATH);
-        client.println(" HTTP/1.1");
-        client.print("Host: ");
-        client.println(API_HOST);
-        client.print("Cookie: ");
-        client.println(cookie);
-        client.print("Content-Type: multipart/form-data; boundary=");
-        client.println(boundary);
-        client.print("Content-Length: ");
-        client.println((unsigned int)contentLength);
-        client.println("Connection: close");
-        client.println();
-
-        client.print(bodyStart);
-
-        // Stream file
-        uint8_t buf[1024];
-        size_t remaining = fileSize;
-        while (remaining > 0) {
-            size_t toRead = remaining > sizeof(buf) ? sizeof(buf) : remaining;
-            size_t n = pcapFile.read(buf, toRead);
-            if (n == 0) {
-                strcpy(lastError, "READ ERROR");
-                client.stop();
-                pcapFile.close();
-                return false;
-            }
-            size_t written = client.write(buf, n);
-            if (written != n) {
-                strcpy(lastError, "WRITE ERROR");
-                client.stop();
-                pcapFile.close();
-                return false;
-            }
-            remaining -= n;
-        }
-
-        client.print(bodyEnd);
-        client.flush();
-
-        // Read response status
-        lastCode = readHttpStatus(client);
-        client.stop();
-
-        if (lastCode == 200 || lastCode == 302) {
-            success = true;
-            break;
-        }
-
-        // Retry once on transient server-side throttling/timeout
-        if (attempt == 0 && (lastCode == 408 || lastCode == 429 || lastCode >= 500)) {
-            delay(400);
-            continue;
-        }
-    }
-
-    // Close capture file after attempts
-    pcapFile.close();
-
-    if (success) {
-        strcpy(statusMessage, "UPLOAD OK");
-        markUploaded(normKey.c_str());
-
-        Serial.printf("[WPASEC] Upload successful, marked %s as uploaded\n", base.c_str());
-
-        if (shouldAwardSmokedBacon()) {
-            XP::addXP(XPEvent::SMOKED_BACON);
-            char toast[32];
-            snprintf(toast, sizeof(toast), "SMOKED BACON\n+%u XP",
-                     (unsigned)XP::getLastXPGainAmount());
-            Display::requestTopBarMessage(toast, 2500);
-        }
-        logHeap("upload success");
-        SDLog::log("WPASEC", "Upload OK: %s", filename.c_str());
-        return true;
-    }
-
-    snprintf(lastError, sizeof(lastError), "UPLOAD HTTP %d", lastCode);
-    strcpy(statusMessage, "UPLOAD FAILED");
-    Serial.printf("[WPASEC] Upload failed: HTTP %d\n", lastCode);
-    logHeap("upload fail");
-    SDLog::log("WPASEC", "Upload failed: %s (HTTP %d)", filename.c_str(), lastCode);
-    return false;
 }
 
 const char* WPASec::getLastError() {
     return lastError;
 }
 
-const char* WPASec::getStatus() {
-    return statusMessage;
+void WPASec::freeCacheMemory() {
+    size_t crackedCount = crackedCache.size();
+    size_t uploadedCount = uploadedCache.size();
+    crackedCache.clear();
+    uploadedCache.clear();
+    cacheLoaded = false;
+    Serial.printf("[WPASEC] Freed cache: %u cracked, %u uploaded\n",
+                  (unsigned int)crackedCount, (unsigned int)uploadedCount);
+}
+
+bool WPASec::saveUploadedList() {
+    const char* uploadedPath = SDLayout::wpasecUploadedPath();
+    File f = SD.open(uploadedPath, FILE_WRITE);
+    if (!f) {
+        strncpy(lastError, "CANNOT WRITE UPLOADED", sizeof(lastError) - 1);
+        lastError[sizeof(lastError) - 1] = '\0';
+        return false;
+    }
+
+    for (const auto& kv : uploadedCache) {
+        f.println(kv.first);
+    }
+
+    f.close();
+    return true;
+}
+
+void WPASec::markAsUploaded(const char* bssid) {
+    loadCache();
+    String key = normalizeBSSID(bssid);
+    if (!key.isEmpty()) {
+        uploadedCache[key] = true;
+        if (!batchMode) {
+            saveUploadedList();  // Only save immediately if not in batch mode
+        }
+    }
+}
+
+void WPASec::beginBatchUpload() {
+    batchMode = true;
+}
+
+void WPASec::endBatchUpload() {
+    if (batchMode) {
+        batchMode = false;
+        saveUploadedList();  // Single save at end of batch
+        Serial.println("[WPASEC] Batch upload complete, saved uploaded list");
+    }
+}
+
+// ============================================================================
+// Network Operations
+// ============================================================================
+
+bool WPASec::hasApiKey() {
+    const char* key = Config::wifi().wpaSecKey;
+    if (!key || key[0] == '\0') return false;
+    // Key should be 32 hex characters
+    size_t len = strlen(key);
+    if (len != 32) return false;
+    for (size_t i = 0; i < len; i++) {
+        if (!isxdigit(key[i])) return false;
+    }
+    return true;
+}
+
+bool WPASec::canSync() {
+    // Free caches to maximize available heap
+    freeCacheMemory();
+    
+    size_t freeHeap = ESP.getFreeHeap();
+    size_t largestBlock = ESP.getMaxAllocHeap();
+    
+    Serial.printf("[WPASEC] canSync: %u free, %u contiguous (need %u/%u)\n", 
+                  (unsigned int)freeHeap, (unsigned int)largestBlock,
+                  (unsigned int)MIN_HEAP_FOR_TLS, (unsigned int)MIN_CONTIGUOUS_FOR_TLS);
+    
+    // Check fragmentation first (more specific error)
+    if (largestBlock < MIN_CONTIGUOUS_FOR_TLS) {
+        snprintf(lastError, sizeof(lastError), "FRAGMENTED: %uKB", 
+                 (unsigned int)(largestBlock / 1024));
+        return false;
+    }
+    
+    // Then total heap
+    if (freeHeap < MIN_HEAP_FOR_TLS) {
+        snprintf(lastError, sizeof(lastError), "LOW HEAP: %uKB", 
+                 (unsigned int)(freeHeap / 1024));
+        return false;
+    }
+    
+    return true;
+}
+
+bool WPASec::uploadSingleCapture(const char* filepath, const char* bssid) {
+    if (!filepath || !bssid) return false;
+    
+    Serial.printf("[WPASEC] Uploading: %s\n", filepath);
+    
+    // Check file exists and get size
+    File capFile = SD.open(filepath, FILE_READ);
+    if (!capFile) {
+        Serial.printf("[WPASEC] Cannot open file: %s\n", filepath);
+        return false;
+    }
+    size_t fileSize = capFile.size();
+    if (fileSize == 0 || fileSize > 100000) {  // Max 100KB
+        capFile.close();
+        Serial.printf("[WPASEC] Invalid file size: %u\n", (unsigned int)fileSize);
+        return false;
+    }
+    
+    // Extract filename from path
+    const char* filename = strrchr(filepath, '/');
+    filename = filename ? filename + 1 : filepath;
+    
+    // Create WiFiClientSecure with minimal buffers
+    WiFiClientSecure client;
+    client.setInsecure();  // Skip cert validation - saves ~10KB heap
+    
+    // Connect with timeout
+    Serial.printf("[WPASEC] Connecting to %s:%d\n", WPASEC_HOST, WPASEC_PORT);
+    if (!client.connect(WPASEC_HOST, WPASEC_PORT, 10000)) {
+        capFile.close();
+        strncpy(lastError, "TLS CONNECT FAILED", sizeof(lastError) - 1);
+        Serial.println("[WPASEC] TLS connection failed");
+        return false;
+    }
+    
+    // Build multipart boundary
+    char boundary[32];
+    snprintf(boundary, sizeof(boundary), "----WPASec%08lX", millis());
+    
+    // Calculate content length
+    // Multipart format:
+    // --boundary\r\n
+    // Content-Disposition: form-data; name="file"; filename="xxx"\r\n
+    // Content-Type: application/octet-stream\r\n\r\n
+    // <file data>
+    // \r\n--boundary--\r\n
+    char disposition[128];
+    snprintf(disposition, sizeof(disposition),
+             "Content-Disposition: form-data; name=\"file\"; filename=\"%s\"",
+             filename);
+    
+    size_t contentLength = 2 + strlen(boundary) + 2 +           // --boundary\r\n
+                           strlen(disposition) + 2 +             // disposition\r\n
+                           36 + 4 +                              // Content-Type + \r\n\r\n
+                           fileSize +                            // file data
+                           2 + 2 + strlen(boundary) + 4;         // \r\n--boundary--\r\n
+    
+    // Send HTTP headers
+    client.printf("POST %s HTTP/1.1\r\n", WPASEC_UPLOAD_PATH);
+    client.printf("Host: %s\r\n", WPASEC_HOST);
+    client.printf("Cookie: key=%s\r\n", Config::wifi().wpaSecKey);
+    client.printf("Content-Type: multipart/form-data; boundary=%s\r\n", boundary);
+    client.printf("Content-Length: %u\r\n", (unsigned int)contentLength);
+    client.print("Connection: close\r\n\r\n");
+    
+    // Send multipart body
+    client.printf("--%s\r\n", boundary);
+    client.printf("%s\r\n", disposition);
+    client.print("Content-Type: application/octet-stream\r\n\r\n");
+    
+    // Stream file in chunks (heap-safe)
+    char chunk[256];
+    size_t sent = 0;
+    while (capFile.available() && sent < fileSize) {
+        size_t toRead = min((size_t)sizeof(chunk), fileSize - sent);
+        size_t bytesRead = capFile.read((uint8_t*)chunk, toRead);
+        if (bytesRead > 0) {
+            client.write((uint8_t*)chunk, bytesRead);
+            sent += bytesRead;
+        }
+        yield();  // Let WiFi stack breathe
+    }
+    capFile.close();
+    
+    // End multipart
+    client.printf("\r\n--%s--\r\n", boundary);
+    
+    // Read response (just check status code)
+    unsigned long timeout = millis() + 10000;
+    while (client.connected() && !client.available() && millis() < timeout) {
+        delay(10);
+        yield();  // Prevent WDT during response wait
+    }
+    
+    bool success = false;
+    if (client.available()) {
+        char response[64];
+        size_t len = client.readBytesUntil('\n', response, sizeof(response) - 1);
+        response[len] = '\0';
+        Serial.printf("[WPASEC] Response: %s\n", response);
+        
+        // HTTP/1.1 200 OK or similar success
+        if (strstr(response, "200") || strstr(response, "201")) {
+            success = true;
+        } else if (strstr(response, "409")) {
+            // Already uploaded - treat as success
+            success = true;
+            Serial.println("[WPASEC] Already uploaded (409)");
+        }
+    }
+    
+    client.stop();
+    
+    if (success) {
+        // NOTE: Don't mark uploaded here - caller handles marking after all TLS operations
+        // This avoids reloading cache during TLS when heap is tight
+        Serial.printf("[WPASEC] Upload success: %s\n", bssid);
+    } else {
+        strncpy(lastError, "UPLOAD REJECTED", sizeof(lastError) - 1);
+    }
+    
+    return success;
+}
+
+bool WPASec::downloadPotfile(uint16_t& newCracks) {
+    newCracks = 0;
+    
+    Serial.println("[WPASEC] Downloading potfile...");
+    
+    // Create WiFiClientSecure with minimal buffers
+    WiFiClientSecure client;
+    client.setInsecure();
+    
+    if (!client.connect(WPASEC_HOST, WPASEC_PORT, 10000)) {
+        strncpy(lastError, "POTFILE TLS FAILED", sizeof(lastError) - 1);
+        Serial.println("[WPASEC] Potfile TLS connection failed");
+        return false;
+    }
+    
+    // Send GET request
+    client.printf("GET %s HTTP/1.1\r\n", WPASEC_POTFILE_PATH);
+    client.printf("Host: %s\r\n", WPASEC_HOST);
+    client.printf("Cookie: key=%s\r\n", Config::wifi().wpaSecKey);
+    client.print("Connection: close\r\n\r\n");
+    
+    // Wait for response
+    unsigned long timeout = millis() + 15000;
+    while (client.connected() && !client.available() && millis() < timeout) {
+        delay(10);
+        yield();  // Prevent WDT during response wait
+    }
+    
+    if (!client.available()) {
+        client.stop();
+        strncpy(lastError, "POTFILE TIMEOUT", sizeof(lastError) - 1);
+        return false;
+    }
+    
+    // Skip HTTP headers
+    bool headersEnded = false;
+    char headerLine[128];
+    while (client.connected() && client.available() && !headersEnded) {
+        size_t len = client.readBytesUntil('\n', headerLine, sizeof(headerLine) - 1);
+        headerLine[len] = '\0';
+        // Empty line marks end of headers
+        if (len <= 1 || (len == 1 && headerLine[0] == '\r')) {
+            headersEnded = true;
+        }
+    }
+    
+    if (!headersEnded) {
+        client.stop();
+        strncpy(lastError, "POTFILE BAD RESPONSE", sizeof(lastError) - 1);
+        return false;
+    }
+    
+    // Open cache file for writing (overwrite)
+    const char* cachePath = SDLayout::wpasecResultsPath();
+    File cacheFile = SD.open(cachePath, FILE_WRITE);
+    if (!cacheFile) {
+        client.stop();
+        strncpy(lastError, "CANNOT WRITE CACHE", sizeof(lastError) - 1);
+        return false;
+    }
+    
+    // Stream potfile line-by-line directly to SD
+    // Format: BSSID:SSID:password (hashcat potfile format)
+    char lineBuf[160];  // Should be enough for BSSID:SSID:password
+    uint16_t lineCount = 0;
+    
+    while (client.connected() || client.available()) {
+        if (client.available()) {
+            size_t len = client.readBytesUntil('\n', lineBuf, sizeof(lineBuf) - 1);
+            if (len > 0) {
+                lineBuf[len] = '\0';
+                // Trim \r if present
+                if (len > 0 && lineBuf[len - 1] == '\r') {
+                    lineBuf[len - 1] = '\0';
+                }
+                
+                // Validate line has at least 2 colons (BSSID:SSID:password)
+                int colonCount = 0;
+                for (size_t i = 0; lineBuf[i]; i++) {
+                    if (lineBuf[i] == ':') colonCount++;
+                }
+                
+                if (colonCount >= 2 && strlen(lineBuf) > 10) {
+                    cacheFile.println(lineBuf);
+                    lineCount++;
+                }
+            }
+        } else {
+            delay(10);
+        }
+        
+        // Safety timeout
+        if (millis() > timeout + 30000) {
+            Serial.println("[WPASEC] Potfile download timeout");
+            break;
+        }
+        
+        yield();
+    }
+    
+    cacheFile.close();
+    client.stop();
+    
+    Serial.printf("[WPASEC] Potfile downloaded: %u entries\n", (unsigned int)lineCount);
+    newCracks = lineCount;
+    
+    return true;
+}
+
+WPASecSyncResult WPASec::syncCaptures(WPASecProgressCallback cb) {
+    WPASecSyncResult result = {};
+    result.success = false;
+    result.error[0] = '\0';
+    
+    busy = true;
+    
+    // Pause NetworkRecon - TLS operations conflict with promiscuous mode
+    // conditionHeapForTLS() overrides promiscuous callbacks, breaking NetworkRecon state
+    bool wasReconRunning = NetworkRecon::isRunning();
+    if (wasReconRunning) {
+        Serial.println("[WPASEC] Pausing NetworkRecon for TLS operations");
+        NetworkRecon::pause();
+    }
+    
+    // Pre-flight checks
+    if (!hasApiKey()) {
+        strncpy(result.error, "NO WPA-SEC KEY", sizeof(result.error) - 1);
+        if (wasReconRunning) NetworkRecon::resume();
+        busy = false;
+        return result;
+    }
+    
+    if (WiFi.status() != WL_CONNECTED) {
+        strncpy(result.error, "WIFI NOT CONNECTED", sizeof(result.error) - 1);
+        if (wasReconRunning) NetworkRecon::resume();
+        busy = false;
+        return result;
+    }
+    
+    // Proactive heap conditioning - condition early when heap is marginal
+    // This prevents fragmentation from getting critical before TLS attempts
+    size_t largestBlock = ESP.getMaxAllocHeap();
+    if (largestBlock < PROACTIVE_CONDITIONING_THRESHOLD && largestBlock >= MIN_CONTIGUOUS_FOR_TLS) {
+        if (cb) {
+            cb("OPTIMIZING HEAP", 0, 0);
+        }
+        Serial.printf("[WPASEC] Proactive conditioning: %u < %u threshold\n",
+                      (unsigned int)largestBlock, (unsigned int)PROACTIVE_CONDITIONING_THRESHOLD);
+        WiFiUtils::conditionHeapForTLS();
+    }
+    
+    // Check if heap is sufficient for TLS operations
+    if (!canSync()) {
+        // Heap insufficient - try "OINK bounce" conditioning
+        // This reclaims BLE memory and coalesces fragmented heap blocks
+        if (cb) {
+            cb("CONDITIONING HEAP", 0, 0);
+        }
+        Serial.println("[WPASEC] Heap insufficient, attempting conditioning...");
+        
+        size_t largestAfter = WiFiUtils::conditionHeapForTLS();
+        
+        // Check again after conditioning
+        if (!canSync()) {
+            // Still insufficient - notify user via speech balloon
+            Mood::setStatusMessage("HEAP TIGHT - TRY OINK");
+            snprintf(result.error, sizeof(result.error), 
+                     "%s (TRY OINK)", lastError);
+            if (wasReconRunning) NetworkRecon::resume();
+            busy = false;
+            return result;
+        }
+        
+        Serial.printf("[WPASEC] Conditioning successful: largest=%u\n", 
+                      (unsigned int)largestAfter);
+    }
+    
+    // Collect files to upload from handshakes directory
+    const char* hsDir = SDLayout::handshakesDir();
+    if (!SD.exists(hsDir)) {
+        strncpy(result.error, "NO HANDSHAKES DIR", sizeof(result.error) - 1);
+        if (wasReconRunning) NetworkRecon::resume();
+        busy = false;
+        return result;
+    }
+    
+    // First pass: count files and check which need upload
+    // We need to reload cache for this check
+    loadCache();
+    
+    // Collect pending uploads (store paths temporarily)
+    struct PendingUpload {
+        char path[80];
+        char bssid[13];
+    };
+    static PendingUpload pendingUploads[50];  // Max 50 per sync
+    uint8_t pendingCount = 0;
+    
+    File dir = SD.open(hsDir);
+    if (dir && dir.isDirectory()) {
+        File file = dir.openNextFile();
+        uint8_t filesScanned = 0;
+        while (file && pendingCount < 50) {
+            // Yield every 10 files to prevent WDT on large directories
+            if (++filesScanned >= 10) {
+                filesScanned = 0;
+                yield();
+            }
+            
+            const char* fname = file.name();
+            size_t fnameLen = strlen(fname);
+            
+            // Check extension without String allocation
+            bool isPCAP = (fnameLen > 5 && strcmp(fname + fnameLen - 5, ".pcap") == 0);
+            bool is22000 = (fnameLen > 6 && strcmp(fname + fnameLen - 6, ".22000") == 0);
+            
+            if (isPCAP || is22000) {
+                // Extract BSSID from filename (first 12 chars before extension)
+                // Find the dot position
+                const char* dot = strrchr(fname, '.');
+                size_t baseLen = dot ? (size_t)(dot - fname) : fnameLen;
+                
+                // Check for _hs suffix
+                if (baseLen > 3 && strncmp(fname + baseLen - 3, "_hs", 3) == 0) {
+                    baseLen -= 3;
+                }
+                
+                if (baseLen >= 12) {
+                    char bssid[13];
+                    memcpy(bssid, fname, 12);
+                    bssid[12] = '\0';
+                    
+                    // Check if already uploaded or cracked
+                    if (!isUploaded(bssid)) {
+                        snprintf(pendingUploads[pendingCount].path, 
+                                sizeof(pendingUploads[pendingCount].path),
+                                "%s/%s", hsDir, fname);
+                        memcpy(pendingUploads[pendingCount].bssid, bssid, 13);
+                        pendingCount++;
+                    } else {
+                        result.skipped++;
+                    }
+                }
+            }
+            file.close();
+            file = dir.openNextFile();
+        }
+        dir.close();
+    }
+    
+    Serial.printf("[WPASEC] Found %u files to upload, %u skipped\n", 
+                  (unsigned int)pendingCount, (unsigned int)result.skipped);
+    
+    // Free cache before TLS operations - keeps heap clear for WiFiClientSecure
+    freeCacheMemory();
+    
+    // Track successful uploads with bitmask - avoids reloading cache during TLS
+    // We mark uploaded AFTER all TLS operations complete to keep heap clear
+    uint8_t successMask[50] = {0};
+    
+    // Upload each pending file
+    for (uint8_t i = 0; i < pendingCount; i++) {
+        if (cb) {
+            char status[32];
+            snprintf(status, sizeof(status), "UPLOAD %u/%u", i + 1, pendingCount);
+            cb(status, i + 1, pendingCount);
+        }
+        
+        Serial.printf("[WPASEC] Heap before upload %u: %u\n", 
+                      i, (unsigned int)ESP.getFreeHeap());
+        
+        if (uploadSingleCapture(pendingUploads[i].path, pendingUploads[i].bssid)) {
+            result.uploaded++;
+            successMask[i] = 1;  // Track for deferred marking
+        } else {
+            result.failed++;
+            Serial.printf("[WPASEC] Failed: %s\n", pendingUploads[i].path);
+        }
+        
+        // Small delay between uploads to let heap settle
+        delay(100);
+        yield();
+    }
+    
+    // Mark successful uploads AFTER all TLS operations complete
+    // This avoids cache reload during TLS when heap is tight
+    if (result.uploaded > 0) {
+        loadCache();
+        for (uint8_t i = 0; i < pendingCount; i++) {
+            if (successMask[i]) {
+                String key = normalizeBSSID(pendingUploads[i].bssid);
+                uploadedCache[key] = true;
+            }
+        }
+        saveUploadedList();
+        Serial.printf("[WPASEC] Marked %u uploads after TLS complete\n", result.uploaded);
+    }
+    
+    // Download potfile
+    if (cb) {
+        cb("DOWNLOADING POTFILE", 0, 0);
+    }
+    
+    // Free any residual memory before potfile TLS
+    // NOTE: We do NOT recondition heap mid-sync - that causes more fragmentation!
+    // If heap was good enough to start sync, trust it. Graceful degradation if not.
+    freeCacheMemory();
+    delay(100);
+    
+    Serial.printf("[WPASEC] Heap before potfile: %u largest=%u\n", 
+                  (unsigned int)ESP.getFreeHeap(),
+                  (unsigned int)ESP.getMaxAllocHeap());
+    
+    uint16_t newCracks = 0;
+    bool potfileOk = false;
+    
+    // Attempt potfile if heap is sufficient - no reconditioning, graceful skip if low
+    if (ESP.getMaxAllocHeap() >= MIN_CONTIGUOUS_FOR_TLS) {
+        potfileOk = downloadPotfile(newCracks);
+        if (potfileOk) {
+            result.newCracked = newCracks;
+            // Reload cache to get cracked count
+            loadCache();
+            result.cracked = crackedCache.size();
+        }
+    } else {
+        Serial.printf("[WPASEC] Skipping potfile: insufficient heap (%u < %u)\n",
+                      (unsigned int)ESP.getMaxAllocHeap(),
+                      (unsigned int)MIN_CONTIGUOUS_FOR_TLS);
+        snprintf(lastError, sizeof(lastError), "POTFILE SKIP: LOW HEAP");
+    }
+    
+    // Graceful degradation: partial success if uploads worked but potfile failed
+    if (!potfileOk && result.uploaded > 0) {
+        // Uploads succeeded, potfile failed - still report partial success
+        snprintf(result.error, sizeof(result.error), "POTFILE: %s", lastError);
+        result.success = true;  // Partial success - uploads worked
+    } else if (!potfileOk) {
+        strncpy(result.error, lastError, sizeof(result.error) - 1);
+        result.success = (result.failed == 0);
+    } else {
+        result.success = (result.failed == 0);
+    }
+    
+    // Resume NetworkRecon after sync operations complete
+    if (wasReconRunning) {
+        Serial.println("[WPASEC] Resuming NetworkRecon after TLS operations");
+        NetworkRecon::resume();
+    }
+    
+    busy = false;
+    Serial.printf("[WPASEC] Sync complete: uploaded=%u failed=%u cracked=%u\n",
+                  (unsigned int)result.uploaded, (unsigned int)result.failed,
+                  (unsigned int)result.cracked);
+    
+    return result;
 }

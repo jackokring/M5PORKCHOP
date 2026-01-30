@@ -43,7 +43,8 @@ void BountyStatusMenu::show() {
 
 void BountyStatusMenu::hide() {
     active = false;
-    cachedBounties.clear();  // Free memory when menu closes
+    cachedBounties.clear();
+    cachedBounties.shrink_to_fit();  // FIX: Return capacity to heap, avoid fragmentation
 }
 
 void BountyStatusMenu::getSelectedInfo(char* out, size_t len) {

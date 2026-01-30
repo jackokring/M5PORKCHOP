@@ -12,18 +12,23 @@ enum class WPASecUploadStatus {
     CRACKED
 };
 
+// Sync operation result
+struct WPASecSyncResult {
+    bool success;
+    uint8_t uploaded;
+    uint8_t failed;
+    uint8_t skipped;     // Already uploaded
+    uint16_t cracked;    // Total cracked after potfile download
+    uint16_t newCracked; // New cracks found this sync
+    char error[48];
+};
+
+// Sync progress callback for UI updates
+typedef void (*WPASecProgressCallback)(const char* status, uint8_t progress, uint8_t total);
+
 class WPASec {
 public:
-    static void init();
-    
-    // WiFi connection (standalone, uses otaSSID/otaPassword from config)
-    static bool connect();
-    static void disconnect();
-    static bool isConnected();
-    
-    // API operations (require WiFi connection)
-    static bool fetchResults();                      // GET cracked passwords, cache to SD
-    static bool uploadCapture(const char* pcapPath); // POST pcap file to WPA-SEC
+    // Sync status
     static bool isBusy();
     
     // Local cache queries (no WiFi needed)
@@ -32,22 +37,23 @@ public:
     static String getPassword(const char* bssid);    // Get password for BSSID
     static String getSSID(const char* bssid);        // Get SSID for BSSID (from cache)
     static uint16_t getCrackedCount();               // Total cracked in cache
+    static void normalizeBSSID_Char(const char* bssid, char* output, size_t outLen);  // Char-based version
     
     // Upload tracking
     static bool isUploaded(const char* bssid);       // Check if already uploaded
-    /**
-     * Mark a BSSID as uploaded.  This function does not reload the
-     * entire cache (which would allocate a large amount of heap).  It
-     * updates the in-memory uploaded map only if the cache is already
-     * loaded, and then appends the entry to the uploaded list file on
-     * SD.  This ensures that uploads are remembered across sessions
-     * without requiring the full cache to be present in memory.
-     */
-    static void markUploaded(const char* bssid);
+    static void markAsUploaded(const char* bssid);   // Mark BSSID as uploaded
+    
+    // Batch upload mode (reduces SD writes from N to 1)
+    static void beginBatchUpload();                  // Start batch mode
+    static void endBatchUpload();                    // End batch mode and save
+    
+    // Network operations (require WiFi + sufficient heap)
+    static bool hasApiKey();                         // Check if WPA-SEC key configured
+    static bool canSync();                           // Check heap requirements (~38KB)
+    static WPASecSyncResult syncCaptures(WPASecProgressCallback cb = nullptr);  // Full sync
     
     // Status
     static const char* getLastError();
-    static const char* getStatus();
 
     /**
      * @brief Free cached WPA‑SEC results from memory.
@@ -58,11 +64,26 @@ public:
      */
     static void freeCacheMemory();
     
-private:
+    // Async cache loading support
+    static bool isCacheLoaded() { return cacheLoaded; }
+
+    // Minimum heap required for TLS operations
+    // With setInsecure() (no cert validation), TLS needs ~32-35KB peak.
+    static constexpr size_t MIN_HEAP_FOR_TLS = 35000;
+    
+    // Minimum contiguous block needed for TLS buffer allocation
+    // mbedTLS handshake peak is ~32-35KB contiguous for buffer allocations
+    // Previous 22KB threshold was too low - log showed failures at 31.7KB
+    static constexpr size_t MIN_CONTIGUOUS_FOR_TLS = 35000;
+    
+    // Threshold for proactive heap conditioning (before fragmentation gets critical)
+    static constexpr size_t PROACTIVE_CONDITIONING_THRESHOLD = 45000;
+    
+ private:
     static bool cacheLoaded;
     static char lastError[64];
-    static char statusMessage[64];
-    static bool busy;
+    static volatile bool busy;
+    static bool batchMode;  // Batch upload mode flag
     
     // Cache: BSSID (no colons, uppercase) -> {ssid, password}
     struct CacheEntry {
@@ -72,20 +93,12 @@ private:
     static std::map<String, CacheEntry> crackedCache;
     static std::map<String, bool> uploadedCache;
     
-    // File paths
-    static constexpr const char* CACHE_FILE = "/wpasec_results.txt";
-    static constexpr const char* UPLOADED_FILE = "/wpasec_uploaded.txt";
-    
-    // API endpoints
-    static constexpr const char* API_HOST = "wpa-sec.stanev.org";
-    static constexpr const char* RESULTS_PATH = "/?api&dl=1";  // Download potfile
-    // Uploads are accepted at the root path. Some clients use /?submit,
-    // but / is the most compatible and avoids redirect edge cases.
-    static constexpr const char* SUBMIT_PATH = "/";
-    
     // Helpers
     static String normalizeBSSID(const char* bssid);  // Remove colons, uppercase
-    static bool saveCache();
     static bool loadUploadedList();
     static bool saveUploadedList();
+    
+    // Network helpers (internal)
+    static bool uploadSingleCapture(const char* filepath, const char* bssid);
+    static bool downloadPotfile(uint16_t& newCracks);
 };

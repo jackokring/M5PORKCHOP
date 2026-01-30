@@ -256,6 +256,7 @@ public:
     static bool hasAchievement(PorkAchievement ach);
     static uint64_t getAchievements();
     static uint8_t getUnlockedCount();  // Count of unlocked achievements
+    static uint8_t getAchievementCount();  // Total achievement count
     static const char* getAchievementName(PorkAchievement ach);
     
     // Unlockables (v0.1.8) - secret challenges

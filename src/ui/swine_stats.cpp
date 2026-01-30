@@ -5,6 +5,7 @@
 #include "../core/xp.h"
 #include "../core/config.h"
 #include "../piglet/mood.h"
+#include "../web/wigle.h"
 #include <M5Cardputer.h>
 
 // Static member initialization
@@ -21,7 +22,7 @@ static const char* BUFF_NAMES[] = {
     "NE0N H1GH",    // happiness >80: faster sweep, faster decay
     "SNOUT$HARP",   // happiness >50: global XP boost
     "H0TSTR3AK",    // 2+ captures: capture XP boost
-    "C0LD F0CU5"    // happiness 60–75: balanced focus
+    "C0LD F0CU5"    // happiness 60â€“75: balanced focus
 };
 
 static const char* BUFF_DESCS[] = {
@@ -133,13 +134,35 @@ void SwineStats::handleInput() {
     if (keyWasPressed) return;
     keyWasPressed = true;
     
-    // Tab switching with , (left) and / (right)
+    // Tab cycling: ',' cycles left, '/' cycles right
     if (M5Cardputer.Keyboard.isKeyPressed(',')) {
-        currentTab = StatsTab::STATS;
+        // Cycle left: STATS -> WIGLE -> BOOSTS -> STATS
+        switch (currentTab) {
+            case StatsTab::STATS:
+                currentTab = StatsTab::WIGLE;
+                break;
+            case StatsTab::BOOSTS:
+                currentTab = StatsTab::STATS;
+                break;
+            case StatsTab::WIGLE:
+                currentTab = StatsTab::BOOSTS;
+                break;
+        }
         return;
     }
     if (M5Cardputer.Keyboard.isKeyPressed('/')) {
-        currentTab = StatsTab::BOOSTS;
+        // Cycle right: STATS -> BOOSTS -> WIGLE -> STATS
+        switch (currentTab) {
+            case StatsTab::STATS:
+                currentTab = StatsTab::BOOSTS;
+                break;
+            case StatsTab::BOOSTS:
+                currentTab = StatsTab::WIGLE;
+                break;
+            case StatsTab::WIGLE:
+                currentTab = StatsTab::STATS;
+                break;
+        }
         return;
     }
     
@@ -534,8 +557,10 @@ void SwineStats::draw(M5Canvas& canvas) {
     // Draw content based on current tab
     if (currentTab == StatsTab::STATS) {
         drawStatsTab(canvas);
-    } else {
+    } else if (currentTab == StatsTab::BOOSTS) {
         drawBuffsTab(canvas);
+    } else if (currentTab == StatsTab::WIGLE) {
+        drawWigleTab(canvas);
     }
     
 
@@ -547,27 +572,41 @@ void SwineStats::drawTabBar(M5Canvas& canvas) {
     const int tabH = 12;
     const int tabTextY = 6;  // Add 1px top padding to match bottom margin
 
-    // Tab 1: ST4TS
-    if (currentTab == StatsTab::STATS) {
-        canvas.fillRect(2, tabY, 60, tabH, COLOR_FG);
-        canvas.setTextColor(COLOR_BG);
-    } else {
-        canvas.drawRect(2, tabY, 60, tabH, COLOR_FG);
-        canvas.setTextColor(COLOR_FG);
-    }
+    // Calculate dynamic widths for three tabs. Distribute any remainder pixels
+    // across the first tabs so that the tabs fill the available space evenly.
+    const int totalTabs = 3;
+    const int margin = 2;
+    const int spacing = 3;
+    const int availableW = DISPLAY_W - margin * 2 - spacing * (totalTabs - 1);
+    const int baseW = availableW / totalTabs;
+    const int remainder = availableW % totalTabs;
+
     canvas.setTextDatum(middle_center);
-    canvas.drawString("ST4TS", 32, tabTextY);
-    
-    // Tab 2: B00STS
-    if (currentTab == StatsTab::BOOSTS) {
-        canvas.fillRect(65, tabY, 60, tabH, COLOR_FG);
-        canvas.setTextColor(COLOR_BG);
-    } else {
-        canvas.drawRect(65, tabY, 60, tabH, COLOR_FG);
-        canvas.setTextColor(COLOR_FG);
+    int x = margin;
+    for (int i = 0; i < totalTabs; i++) {
+        int w = baseW + (i < remainder ? 1 : 0);
+        bool isActive;
+        const char* label;
+        if (i == 0) {
+            isActive = (currentTab == StatsTab::STATS);
+            label = "ST4TS";
+        } else if (i == 1) {
+            isActive = (currentTab == StatsTab::BOOSTS);
+            label = "B00STS";
+        } else {
+            isActive = (currentTab == StatsTab::WIGLE);
+            label = "W1GL3";
+        }
+        if (isActive) {
+            canvas.fillRect(x, tabY, w, tabH, COLOR_FG);
+            canvas.setTextColor(COLOR_BG);
+        } else {
+            canvas.drawRect(x, tabY, w, tabH, COLOR_FG);
+            canvas.setTextColor(COLOR_FG);
+        }
+        canvas.drawString(label, x + w / 2, tabTextY);
+        x += w + spacing;
     }
-    canvas.drawString("B00STS", 95, tabTextY);
-    
     // Reset text color
     canvas.setTextColor(COLOR_FG);
 }
@@ -756,4 +795,46 @@ void SwineStats::drawStats(M5Canvas& canvas) {
     canvas.drawString("JST R0UL3T:", col1, y);
     snprintf(buf, sizeof(buf), "%lu", (unsigned long)data.rouletteWins);
     canvas.drawString(buf, col2, y);
+}
+
+// Draw the WiGLE statistics tab. This function reads the cached
+// statistics from the WiGLE service and displays them in a simple
+// key/value format. If no cache is available, a placeholder message
+// instructs the user to refresh the WiGLE menu.
+void SwineStats::drawWigleTab(M5Canvas& canvas) {
+    canvas.setTextSize(1);
+    canvas.setTextDatum(top_left);
+    int y = 14;
+    // Header
+    canvas.drawString("W1GL3 ST4TS", 5, y);
+    y += 12;
+    // Fetch cached stats
+    WiGLE::WigleUserStats stats = WiGLE::getUserStats();
+    if (!stats.valid) {
+        canvas.drawString("N0 W1GL3 D4TA", 5, y);
+        y += 10;
+        canvas.drawString("PR3SS R 1N W1GL3", 5, y);
+        return;
+    }
+    // Display rank and counts
+    char buf[32];
+    // Rank
+    canvas.drawString("R4NK:", 5, y);
+    snprintf(buf, sizeof(buf), "%lld", (long long)stats.rank);
+    canvas.drawString(buf, 80, y);
+    y += 10;
+    // WiFi
+    canvas.drawString("W1F1:", 5, y);
+    snprintf(buf, sizeof(buf), "%llu", (unsigned long long)stats.wifi);
+    canvas.drawString(buf, 80, y);
+    y += 10;
+    // Cell
+    canvas.drawString("C3LL:", 5, y);
+    snprintf(buf, sizeof(buf), "%llu", (unsigned long long)stats.cell);
+    canvas.drawString(buf, 80, y);
+    y += 10;
+    // Bluetooth
+    canvas.drawString("BL3:", 5, y);
+    snprintf(buf, sizeof(buf), "%llu", (unsigned long long)stats.bt);
+    canvas.drawString(buf, 80, y);
 }

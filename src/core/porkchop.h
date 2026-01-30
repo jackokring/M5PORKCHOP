@@ -28,7 +28,8 @@ enum class PorkchopMode : uint8_t {
     BOUNTY_STATUS,  // View active bounties
     PIGSYNC_DEVICE_SELECT, // PigSync device selection
     PIGSYNC_CALL, // PigSync active call
-    MARCO_MODE      // Hide and seek beacon broadcaster
+    BACON_MODE,     // Hide and seek beacon broadcaster
+    SD_FORMAT       // SD card format utility
 };
 
 // Events for async callbacks
@@ -78,8 +79,14 @@ private:
     uint16_t handshakeCount;
     uint16_t networkCount;
     uint16_t deauthCount;
+
+    // Boot mode auto-entry
+    bool bootModePending = false;
+    PorkchopMode bootModeTarget = PorkchopMode::IDLE;
+    uint32_t bootModeStartMs = 0;
     
-    // Event queue
+    // Event queue with max capacity to prevent memory exhaustion
+    static constexpr size_t MAX_EVENT_QUEUE_SIZE = 32;  // Prevent runaway allocations
     struct EventItem {
         PorkchopEvent event;
         void* data;

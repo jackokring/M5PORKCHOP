@@ -6,6 +6,8 @@
 #include "../ui/display.h"
 #include "../audio/sfx.h"
 #include <M5Unified.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/portmacro.h>
 
 // porkchop global instance lives in main.cpp
 extern Porkchop porkchop;
@@ -14,6 +16,12 @@ extern Porkchop porkchop;
 ActiveChallenge Challenges::challenges[3] = {};
 uint8_t Challenges::activeCount = 0;
 bool Challenges::sessionDeauthed = false;
+
+static portMUX_TYPE challengesMux = portMUX_INITIALIZER_UNLOCKED;
+
+static uint16_t clampToU16(uint32_t value) {
+    return value > 0xFFFF ? 0xFFFF : static_cast<uint16_t>(value);
+}
 
 // ============================================================
 // CHALLENGE TEMPLATE POOL
@@ -77,8 +85,6 @@ bool Challenges::isPigAwake() {
 void Challenges::generate() {
     // reset state from previous session
     reset();
-    activeCount = 3;
-    sessionDeauthed = false;
     
     bool gpsEnabled = Config::gps().enabled;
     
@@ -126,6 +132,22 @@ void Challenges::generate() {
             
             attempts++;
         } while (!valid && attempts < maxAttempts);
+
+        if (!valid) {
+            // Fallback: pick any GPS-compatible template if the uniqueness rules fail
+            for (uint8_t j = 0; j < POOL_SIZE; j++) {
+                const ChallengeTemplate& candidate = CHALLENGE_POOL[j];
+                if (candidate.requiresGPS && !gpsEnabled) continue;
+                idx = j;
+                valid = true;
+                break;
+            }
+        }
+
+        if (!valid) {
+            // Final fallback if pool is empty (should never happen)
+            idx = 0;
+        }
         
         picked[i] = idx;
         pickedTypes[i] = CHALLENGE_POOL[idx].type;
@@ -137,9 +159,9 @@ void Challenges::generate() {
         // calculate target based on difficulty
         uint16_t target = tmpl.easyTarget;
         if (diff == ChallengeDifficulty::MEDIUM) {
-            target *= tmpl.mediumMult;
+            target = clampToU16(static_cast<uint32_t>(target) * tmpl.mediumMult);
         } else if (diff == ChallengeDifficulty::HARD) {
-            target *= tmpl.hardMult;
+            target = clampToU16(static_cast<uint32_t>(target) * tmpl.hardMult);
         }
         
         // ============ LEVEL SCALING ============
@@ -147,33 +169,34 @@ void Challenges::generate() {
         // L1-10: 1.0x, L11-20: 1.5x, L21-30: 2.0x, L31-40: 3.0x
         uint8_t level = XP::getLevel();
         if (level >= 31) {
-            target = (target * 3);          // 3.0x
+            target = clampToU16(static_cast<uint32_t>(target) * 3);          // 3.0x
         } else if (level >= 21) {
-            target = (target * 2);          // 2.0x
+            target = clampToU16(static_cast<uint32_t>(target) * 2);          // 2.0x
         } else if (level >= 11) {
-            target = (target * 3) / 2;      // 1.5x
+            target = clampToU16((static_cast<uint32_t>(target) * 3) / 2);      // 1.5x
         }
         // L1-10 stays at 1.0x (no change)
         
         // calculate XP reward: EASY=base, MEDIUM=2x, HARD=4x
         uint16_t reward = tmpl.xpRewardBase;
         if (diff == ChallengeDifficulty::MEDIUM) {
-            reward *= 2;
+            reward = clampToU16(static_cast<uint32_t>(reward) * 2);
         } else if (diff == ChallengeDifficulty::HARD) {
-            reward *= 4;
+            reward = clampToU16(static_cast<uint32_t>(reward) * 4);
         }
         
         // ============ REWARD SCALING ============
         // pig rewards scale with pig demands (same multipliers)
         if (level >= 31) {
-            reward = (reward * 3);          // 3.0x
+            reward = clampToU16(static_cast<uint32_t>(reward) * 3);          // 3.0x
         } else if (level >= 21) {
-            reward = (reward * 2);          // 2.0x
+            reward = clampToU16(static_cast<uint32_t>(reward) * 2);          // 2.0x
         } else if (level >= 11) {
-            reward = (reward * 3) / 2;      // 1.5x
+            reward = clampToU16((static_cast<uint32_t>(reward) * 3) / 2);      // 1.5x
         }
         
         // format the challenge name with target value
+        portENTER_CRITICAL(&challengesMux);
         ActiveChallenge& ch = challenges[i];
         ch.type = tmpl.type;
         ch.difficulty = diff;
@@ -183,7 +206,13 @@ void Challenges::generate() {
         ch.completed = false;
         ch.failed = false;
         snprintf(ch.name, sizeof(ch.name), tmpl.nameFormat, target);
+        portEXIT_CRITICAL(&challengesMux);
     }
+
+    portENTER_CRITICAL(&challengesMux);
+    activeCount = 3;
+    sessionDeauthed = false;
+    portEXIT_CRITICAL(&challengesMux);
     
     // pig's demands generated in silence
     // curious users can invoke printToSerial() to see them
@@ -195,7 +224,12 @@ void Challenges::generate() {
 // ============================================================
 
 void Challenges::printToSerial() {
-    if (activeCount == 0) {
+    uint8_t localActive = 0;
+    portENTER_CRITICAL(&challengesMux);
+    localActive = activeCount;
+    portEXIT_CRITICAL(&challengesMux);
+
+    if (localActive == 0) {
         Serial.println("\n[PIG] no demands. pig sleeps.");
         return;
     }
@@ -205,8 +239,11 @@ void Challenges::printToSerial() {
     Serial.println("|     PIG WAKES. PIG DEMANDS ACTION.       |");
     Serial.println("+------------------------------------------+");
     
-    for (int i = 0; i < activeCount; i++) {
-        const ActiveChallenge& ch = challenges[i];
+    for (int i = 0; i < localActive; i++) {
+        ActiveChallenge ch = {};
+        if (!getSnapshot(i, ch)) {
+            continue;
+        }
         const char* diffStr = (i == 0) ? "EASY  " : (i == 1) ? "MEDIUM" : "HARD  ";
         const char* status = ch.completed ? "[*]" : ch.failed ? "[X]" : "[ ]";
         
@@ -223,7 +260,7 @@ void Challenges::printToSerial() {
     
     Serial.println("+------------------------------------------+");
     char summary[64];
-    snprintf(summary, sizeof(summary), "           completed: %d / %d", getCompletedCount(), activeCount);
+    snprintf(summary, sizeof(summary), "           completed: %d / %d", getCompletedCount(), localActive);
     Serial.printf("|%-42s|\n", summary);
     Serial.println("+------------------------------------------+");
     Serial.println();
@@ -235,65 +272,110 @@ void Challenges::printToSerial() {
 // ============================================================
 
 void Challenges::updateProgress(ChallengeType type, uint16_t delta) {
-    for (int i = 0; i < activeCount; i++) {
+    struct CompletionNotice {
+        ChallengeDifficulty difficulty;
+        uint16_t xpReward;
+        char name[sizeof(ActiveChallenge::name)];
+    };
+
+    CompletionNotice notices[3] = {};
+    uint8_t noticeCount = 0;
+    bool sweepNow = false;
+
+    portENTER_CRITICAL(&challengesMux);
+    uint8_t localActive = activeCount;
+    for (int i = 0; i < localActive; i++) {
         ActiveChallenge& ch = challenges[i];
-        
+
         // skip if wrong type, already done, or failed
         if (ch.type != type || ch.completed || ch.failed) continue;
-        
-        ch.progress += delta;
-        
+
+        uint32_t nextProgress = ch.progress;
+        nextProgress = (nextProgress + delta > 0xFFFF) ? 0xFFFF : (nextProgress + delta);
+        ch.progress = static_cast<uint16_t>(nextProgress);
+
         // the pig judges completion
         if (ch.progress >= ch.target) {
             ch.completed = true;
             ch.progress = ch.target;  // cap at target for display
-            
-            // reward the peasant (silent add - challenge toast/sound is the celebration)
-            XP::addXPSilent(ch.xpReward);
-            
-            // pig is pleased. announce it.
-            char toast[48];
-            // difficulty-specific toast messages
-            const char* toastMsg;
-            switch (ch.difficulty) {
-                case ChallengeDifficulty::EASY:   toastMsg = "FIRST BLOOD. PIG STIRS."; break;
-                case ChallengeDifficulty::MEDIUM: toastMsg = "PROGRESS NOTED. PIG LISTENS."; break;
-                case ChallengeDifficulty::HARD:   toastMsg = "BRUTAL. PIG RESPECTS."; break;
-                default:                          toastMsg = "PIG APPROVES."; break;
-            }
-            Display::showToast(toastMsg);
-            
-            // Rising tones for challenge complete - non-blocking
-            SFX::play(SFX::CHALLENGE_COMPLETE);
-            
-            Serial.printf("[CHALLENGES] pig pleased. '%s' complete. +%d XP.\\n",
-                          ch.name, ch.xpReward);
-            
-            // Check for full sweep bonus (all 3 completed)
-            if (allCompleted()) {
-                // TRIPLE THREAT BONUS - pig respects dedication
-                const uint16_t BONUS_XP = 100;
-                XP::addXPSilent(BONUS_XP);  // Silent add - sweep fanfare is the celebration
-                
-                Display::showToast("WORTHY. 115200 REMEMBERS.");
-                
-                // Victory fanfare - non-blocking (priority sound, interrupts CHALLENGE_COMPLETE)
-                SFX::play(SFX::CHALLENGE_SWEEP);
-                
-                Serial.println("[CHALLENGES] *** FULL SWEEP! +100 BONUS XP ***");
+
+            if (noticeCount < 3) {
+                notices[noticeCount].difficulty = ch.difficulty;
+                notices[noticeCount].xpReward = ch.xpReward;
+                snprintf(notices[noticeCount].name, sizeof(notices[noticeCount].name), "%s", ch.name);
+                noticeCount++;
             }
         }
+    }
+
+    if (noticeCount > 0 && localActive > 0) {
+        sweepNow = true;
+        for (int i = 0; i < localActive; i++) {
+            if (!challenges[i].completed) {
+                sweepNow = false;
+                break;
+            }
+        }
+    }
+    portEXIT_CRITICAL(&challengesMux);
+
+    for (uint8_t i = 0; i < noticeCount; i++) {
+        // reward the peasant (silent add - challenge toast/sound is the celebration)
+        XP::addXPSilent(notices[i].xpReward);
+
+        // difficulty-specific toast messages
+        const char* toastMsg;
+        switch (notices[i].difficulty) {
+            case ChallengeDifficulty::EASY:   toastMsg = "FIRST BLOOD. PIG STIRS."; break;
+            case ChallengeDifficulty::MEDIUM: toastMsg = "PROGRESS NOTED. PIG LISTENS."; break;
+            case ChallengeDifficulty::HARD:   toastMsg = "BRUTAL. PIG RESPECTS."; break;
+            default:                          toastMsg = "PIG APPROVES."; break;
+        }
+        Display::showToast(toastMsg);
+
+        // Rising tones for challenge complete - non-blocking
+        SFX::play(SFX::CHALLENGE_COMPLETE);
+
+        Serial.printf("[CHALLENGES] pig pleased. '%s' complete. +%d XP.\\n",
+                      notices[i].name, notices[i].xpReward);
+    }
+
+    // Check for full sweep bonus (all 3 completed)
+    if (sweepNow) {
+        // TRIPLE THREAT BONUS - pig respects dedication
+        const uint16_t BONUS_XP = 100;
+        XP::addXPSilent(BONUS_XP);  // Silent add - sweep fanfare is the celebration
+
+        Display::showToast("WORTHY. 115200 REMEMBERS.");
+
+        // Victory fanfare - non-blocking (priority sound, interrupts CHALLENGE_COMPLETE)
+        SFX::play(SFX::CHALLENGE_SWEEP);
+
+        Serial.println("[CHALLENGES] *** FULL SWEEP! +100 BONUS XP ***");
     }
 }
 
 void Challenges::failConditional(ChallengeType type) {
     // deauth sent? peace-lover challenges fail
-    for (int i = 0; i < activeCount; i++) {
+    char failedName[sizeof(ActiveChallenge::name)] = {};
+    bool failedLogged = false;
+
+    portENTER_CRITICAL(&challengesMux);
+    uint8_t localActive = activeCount;
+    for (int i = 0; i < localActive; i++) {
         ActiveChallenge& ch = challenges[i];
         if (ch.type == type && !ch.completed && !ch.failed) {
             ch.failed = true;
-            Serial.printf("[CHALLENGES] '%s' failed. violence detected.\n", ch.name);
+            if (!failedLogged) {
+                snprintf(failedName, sizeof(failedName), "%s", ch.name);
+                failedLogged = true;
+            }
         }
+    }
+    portEXIT_CRITICAL(&challengesMux);
+
+    if (failedLogged) {
+        Serial.printf("[CHALLENGES] '%s' failed. violence detected.\n", failedName);
     }
 }
 
@@ -305,16 +387,23 @@ void Challenges::failConditional(ChallengeType type) {
 void Challenges::onXPEvent(XPEvent event) {
     // pig sleeps? pig doesn't care about your progress
     if (!isPigAwake()) return;
-    
+
+    bool deauthedSnapshot = false;
+    uint8_t localActive = 0;
+    portENTER_CRITICAL(&challengesMux);
+    localActive = activeCount;
+    deauthedSnapshot = sessionDeauthed;
+    portEXIT_CRITICAL(&challengesMux);
+
     // no challenges generated yet? nothing to track
-    if (activeCount == 0) return;
+    if (localActive == 0) return;
     
     // map XP events to challenge progress
     switch (event) {
         // network discovery events
         case XPEvent::NETWORK_FOUND:
             updateProgress(ChallengeType::NETWORKS_FOUND, 1);
-            if (!sessionDeauthed) {
+            if (!deauthedSnapshot) {
                 updateProgress(ChallengeType::NO_DEAUTH_STREAK, 1);
             }
             break;
@@ -322,7 +411,7 @@ void Challenges::onXPEvent(XPEvent event) {
         case XPEvent::NETWORK_HIDDEN:
             updateProgress(ChallengeType::NETWORKS_FOUND, 1);
             updateProgress(ChallengeType::HIDDEN_FOUND, 1);
-            if (!sessionDeauthed) {
+            if (!deauthedSnapshot) {
                 updateProgress(ChallengeType::NO_DEAUTH_STREAK, 1);
             }
             break;
@@ -330,7 +419,7 @@ void Challenges::onXPEvent(XPEvent event) {
         case XPEvent::NETWORK_WPA3:
             updateProgress(ChallengeType::NETWORKS_FOUND, 1);
             updateProgress(ChallengeType::WPA3_FOUND, 1);
-            if (!sessionDeauthed) {
+            if (!deauthedSnapshot) {
                 updateProgress(ChallengeType::NO_DEAUTH_STREAK, 1);
             }
             break;
@@ -338,14 +427,14 @@ void Challenges::onXPEvent(XPEvent event) {
         case XPEvent::NETWORK_OPEN:
             updateProgress(ChallengeType::NETWORKS_FOUND, 1);
             updateProgress(ChallengeType::OPEN_FOUND, 1);
-            if (!sessionDeauthed) {
+            if (!deauthedSnapshot) {
                 updateProgress(ChallengeType::NO_DEAUTH_STREAK, 1);
             }
             break;
             
         case XPEvent::NETWORK_WEP:
             updateProgress(ChallengeType::NETWORKS_FOUND, 1);
-            if (!sessionDeauthed) {
+            if (!deauthedSnapshot) {
                 updateProgress(ChallengeType::NO_DEAUTH_STREAK, 1);
             }
             break;
@@ -366,9 +455,17 @@ void Challenges::onXPEvent(XPEvent event) {
         // deauth events - the violence counter
         case XPEvent::DEAUTH_SUCCESS:
             updateProgress(ChallengeType::DEAUTHS, 1);
-            if (!sessionDeauthed) {
-                sessionDeauthed = true;
+            if (!deauthedSnapshot) {
+                bool shouldFail = false;
+                portENTER_CRITICAL(&challengesMux);
+                if (!sessionDeauthed) {
+                    sessionDeauthed = true;
+                    shouldFail = true;
+                }
+                portEXIT_CRITICAL(&challengesMux);
+                if (shouldFail) {
                 failConditional(ChallengeType::NO_DEAUTH_STREAK);
+                }
             }
             break;
             
@@ -395,7 +492,7 @@ void Challenges::onXPEvent(XPEvent event) {
         case XPEvent::DNH_NETWORK_PASSIVE:
             updateProgress(ChallengeType::PASSIVE_NETWORKS, 1);
             updateProgress(ChallengeType::NETWORKS_FOUND, 1);
-            if (!sessionDeauthed) {
+            if (!deauthedSnapshot) {
                 updateProgress(ChallengeType::NO_DEAUTH_STREAK, 1);
             }
             break;
@@ -411,34 +508,58 @@ void Challenges::onXPEvent(XPEvent event) {
 // ============================================================
 
 void Challenges::reset() {
+    portENTER_CRITICAL(&challengesMux);
     for (int i = 0; i < 3; i++) {
         challenges[i] = {};
     }
     activeCount = 0;
     sessionDeauthed = false;
+    portEXIT_CRITICAL(&challengesMux);
 }
 
-const ActiveChallenge& Challenges::get(uint8_t idx) {
+bool Challenges::getSnapshot(uint8_t idx, ActiveChallenge& out) {
     if (idx >= 3) idx = 0;
-    return challenges[idx];
+    portENTER_CRITICAL(&challengesMux);
+    if (idx >= activeCount) {
+        portEXIT_CRITICAL(&challengesMux);
+        return false;
+    }
+    out = challenges[idx];
+    portEXIT_CRITICAL(&challengesMux);
+    return true;
 }
 
 uint8_t Challenges::getActiveCount() {
-    return activeCount;
+    portENTER_CRITICAL(&challengesMux);
+    uint8_t count = activeCount;
+    portEXIT_CRITICAL(&challengesMux);
+    return count;
 }
 
 uint8_t Challenges::getCompletedCount() {
     uint8_t count = 0;
-    for (int i = 0; i < activeCount; i++) {
+    portENTER_CRITICAL(&challengesMux);
+    uint8_t localActive = activeCount;
+    for (int i = 0; i < localActive; i++) {
         if (challenges[i].completed) count++;
     }
+    portEXIT_CRITICAL(&challengesMux);
     return count;
 }
 
 bool Challenges::allCompleted() {
-    if (activeCount == 0) return false;
-    for (int i = 0; i < activeCount; i++) {
-        if (!challenges[i].completed) return false;
+    portENTER_CRITICAL(&challengesMux);
+    if (activeCount == 0) {
+        portEXIT_CRITICAL(&challengesMux);
+        return false;
     }
+    uint8_t localActive = activeCount;
+    for (int i = 0; i < localActive; i++) {
+        if (!challenges[i].completed) {
+            portEXIT_CRITICAL(&challengesMux);
+            return false;
+        }
+    }
+    portEXIT_CRITICAL(&challengesMux);
     return true;
 }

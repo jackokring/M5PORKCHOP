@@ -4,6 +4,8 @@
 #include <Arduino.h>
 #include <M5Unified.h>
 #include <vector>
+#include <atomic>
+#include <esp_wifi.h>
 #include <esp_wifi_types.h>
 
 // Client monitoring constants
@@ -31,6 +33,7 @@ struct SpectrumNetwork {
     bool hasPMF;             // Protected Management Frames (immune to deauth)
     bool isHidden;           // Hidden SSID (beacon had empty SSID)
     bool wasRevealed;        // SSID was revealed via probe response
+    float displayFreqMHz;    // Smoothed frequency for rendering (prevents left/right jitter)
     // Client tracking (only populated when monitoring THIS network)
     SpectrumClient clients[MAX_SPECTRUM_CLIENTS];
     uint8_t clientCount;
@@ -72,7 +75,7 @@ public:
     
 private:
     static bool running;
-    static volatile bool busy;       // Guard against callback race
+    static std::atomic<bool> busy;   // Guard against callback race (atomic for cross-core visibility)
     static std::vector<SpectrumNetwork> networks;
     static float viewCenterMHz;      // Center of visible spectrum
     static float viewWidthMHz;       // Visible bandwidth
@@ -170,6 +173,6 @@ private:
     static bool detectPMF(const uint8_t* payload, uint16_t len);
     static bool matchesFilter(const SpectrumNetwork& net);  // Check if network passes filter
     
-    // Promiscuous mode
-    static void promiscuousCallback(void* buf, wifi_promiscuous_pkt_type_t type);
+    // Packet callback for visualization (called by NetworkRecon)
+    static void promiscuousCallback(const wifi_promiscuous_pkt_t* pkt, wifi_promiscuous_pkt_type_t type);
 };

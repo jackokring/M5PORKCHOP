@@ -1,0 +1,645 @@
+// SD card layout + migration implementation
+
+#include "sd_layout.h"
+#include <SD.h>
+#include <time.h>
+#include <vector>
+#include <string.h>
+
+namespace {
+static constexpr const char* kNewRoot = "/m5porkchop";
+static constexpr const char* kMarker = "/m5porkchop/meta/.migrated_v1";
+
+static constexpr const char* kLegacyHandshakes = "/handshakes";
+static constexpr const char* kLegacyWardriving = "/wardriving";
+static constexpr const char* kLegacyMLData = "/mldata";
+static constexpr const char* kLegacyModels = "/models";
+static constexpr const char* kLegacyLogs = "/logs";
+static constexpr const char* kLegacyCrash = "/crash";
+static constexpr const char* kLegacyScreenshots = "/screenshots";
+
+static constexpr const char* kNewHandshakes = "/m5porkchop/handshakes";
+static constexpr const char* kNewWardriving = "/m5porkchop/wardriving";
+static constexpr const char* kNewMLData = "/m5porkchop/mldata";
+static constexpr const char* kNewModels = "/m5porkchop/models";
+static constexpr const char* kNewLogs = "/m5porkchop/logs";
+static constexpr const char* kNewCrash = "/m5porkchop/crash";
+static constexpr const char* kNewScreenshots = "/m5porkchop/screenshots";
+static constexpr const char* kNewDiagnostics = "/m5porkchop/diagnostics";
+static constexpr const char* kNewWpaSec = "/m5porkchop/wpa-sec";
+static constexpr const char* kNewWigle = "/m5porkchop/wigle";
+static constexpr const char* kNewXp = "/m5porkchop/xp";
+static constexpr const char* kNewMisc = "/m5porkchop/misc";
+static constexpr const char* kNewConfig = "/m5porkchop/config";
+static constexpr const char* kNewMeta = "/m5porkchop/meta";
+
+static constexpr const char* kLegacyConfig = "/porkchop.conf";
+static constexpr const char* kLegacyPersonality = "/personality.json";
+static constexpr const char* kLegacyWpasecResults = "/wpasec_results.txt";
+static constexpr const char* kLegacyWpasecUploaded = "/wpasec_uploaded.txt";
+static constexpr const char* kLegacyWpasecSent = "/wpasec_sent.txt";
+static constexpr const char* kLegacyWigleUploaded = "/wigle_uploaded.txt";
+static constexpr const char* kLegacyWigleStats = "/wigle_stats.json";
+static constexpr const char* kLegacyXpBackup = "/xp_backup.bin";
+static constexpr const char* kLegacyXpAwardedWpa = "/xp_awarded_wpa.txt";
+static constexpr const char* kLegacyXpAwardedWigle = "/xp_awarded_wigle.txt";
+static constexpr const char* kLegacyBoarBros = "/boar_bros.txt";
+static constexpr const char* kLegacyHeapLog = "/heap_log.txt";
+static constexpr const char* kLegacyWpasecKey = "/wpasec_key.txt";
+static constexpr const char* kLegacyWigleKey = "/wigle_key.txt";
+
+static constexpr const char* kNewConfigPath = "/m5porkchop/config/porkchop.conf";
+static constexpr const char* kNewPersonalityPath = "/m5porkchop/config/personality.json";
+static constexpr const char* kNewWpasecResults = "/m5porkchop/wpa-sec/wpasec_results.txt";
+static constexpr const char* kNewWpasecUploaded = "/m5porkchop/wpa-sec/wpasec_uploaded.txt";
+static constexpr const char* kNewWpasecSent = "/m5porkchop/wpa-sec/wpasec_sent.txt";
+static constexpr const char* kNewWigleUploaded = "/m5porkchop/wigle/wigle_uploaded.txt";
+static constexpr const char* kNewWigleStats = "/m5porkchop/wigle/wigle_stats.json";
+static constexpr const char* kNewXpBackup = "/m5porkchop/xp/xp_backup.bin";
+static constexpr const char* kNewXpAwardedWpa = "/m5porkchop/xp/xp_awarded_wpa.txt";
+static constexpr const char* kNewXpAwardedWigle = "/m5porkchop/xp/xp_awarded_wigle.txt";
+static constexpr const char* kNewBoarBros = "/m5porkchop/misc/boar_bros.txt";
+static constexpr const char* kNewHeapLog = "/m5porkchop/diagnostics/heap_log.txt";
+static constexpr const char* kNewWpasecKey = "/m5porkchop/wpa-sec/wpasec_key.txt";
+static constexpr const char* kNewWigleKey = "/m5porkchop/wigle/wigle_key.txt";
+
+// Use mutex to protect shared state
+static portMUX_TYPE layoutMutex = portMUX_INITIALIZER_UNLOCKED;
+static bool g_useNewLayout = false;
+
+struct MoveOp {
+    String from;
+    String to;
+};
+
+static const char* basenameFromPath(const char* path) {
+    if (!path) return "";
+    const char* last = strrchr(path, '/');
+    if (!last) return path;
+    if (*(last + 1) == '\0') return path;
+    return last + 1;
+}
+
+static bool isDirEmpty(const char* path) {
+    File dir = SD.open(path);
+    if (!dir || !dir.isDirectory()) {
+        if (dir) dir.close();
+        return true;
+    }
+    File entry = dir.openNextFile();
+    while (entry) {
+        entry.close();
+        dir.close();
+        return false;
+    }
+    dir.close();
+    return true;
+}
+
+static bool ensureDir(const char* path) {
+    if (SD.exists(path)) return true;
+    return SD.mkdir(path);
+}
+
+static uint64_t calcPathSize(const char* path) {
+    File f = SD.open(path);
+    if (!f) return 0;
+    
+    if (!f.isDirectory()) {
+        uint64_t size = f.size();
+        f.close();
+        return size;
+    }
+
+    uint64_t total = 0;
+    File entry = f.openNextFile();
+    int fileCount = 0;  // Prevent infinite loops on corrupted filesystems
+    
+    while (entry) {
+        const char* name = basenameFromPath(entry.name());
+        String child = path;
+        if (!child.endsWith("/")) child += "/";
+        child += name;
+        entry.close();
+        total += calcPathSize(child.c_str());
+        entry = f.openNextFile();
+        fileCount++;
+        
+        // Yield periodically to prevent WDT resets
+        if (fileCount % 10 == 0) {
+            yield();
+        }
+    }
+    f.close();
+    return total;
+}
+
+static bool copyFile(const char* src, const char* dst) {
+    File in = SD.open(src, FILE_READ);
+    if (!in) return false;
+
+    File out = SD.open(dst, FILE_WRITE);
+    if (!out) {
+        in.close();
+        return false;
+    }
+
+    // Use a reasonable buffer size for constrained devices
+    static uint8_t buf[2048]; // Reduced from 4096 to save memory
+    size_t bytesRead = 0;
+    const size_t maxBytes = 10 * 1024 * 1024; // Limit file copy to 10MB to prevent overflow
+    
+    while (in.available() && bytesRead < maxBytes) {
+        size_t toRead = sizeof(buf);
+        if (toRead > in.available()) {
+            toRead = in.available();
+        }
+        size_t readBytes = in.read(buf, toRead);
+        if (readBytes == 0) break;
+        if (out.write(buf, readBytes) != readBytes) {
+            out.close();
+            in.close();
+            return false;
+        }
+        bytesRead += readBytes;
+        // Yield periodically during file copy to prevent WDT resets
+        if (bytesRead % (1024 * 4) == 0) { // Yield every 4KB
+            yield();
+        }
+    }
+
+    out.close();
+    in.close();
+    return true;
+}
+
+static bool copyPathRecursive(const char* src, const char* dst) {
+    File f = SD.open(src);
+    if (!f) return false;
+    bool isDir = f.isDirectory();
+    f.close();
+
+    if (!isDir) {
+        return copyFile(src, dst);
+    }
+
+    if (!SD.exists(dst) && !SD.mkdir(dst)) {
+        return false;
+    }
+
+    File dir = SD.open(src);
+    if (!dir) return false;
+    
+    File entry = dir.openNextFile();
+    int fileCount = 0; // Prevent infinite loops on corrupted filesystems
+    
+    while (entry) {
+        const char* name = basenameFromPath(entry.name());
+        String childSrc = src;
+        if (!childSrc.endsWith("/")) childSrc += "/";
+        childSrc += name;
+        String childDst = dst;
+        if (!childDst.endsWith("/")) childDst += "/";
+        childDst += name;
+        entry.close();
+        if (!copyPathRecursive(childSrc.c_str(), childDst.c_str())) {
+            dir.close();
+            return false;
+        }
+        entry = dir.openNextFile();
+        fileCount++;
+        // Yield periodically to prevent WDT resets
+        if (fileCount % 10 == 0) {
+            yield();
+        }
+    }
+    dir.close();
+    return true;
+}
+
+static bool isDiagFile(const char* name) {
+    if (!name) return false;
+    String nameStr(name);
+    return nameStr.startsWith("diag_") && nameStr.endsWith(".txt");
+}
+
+static void collectDiagFiles(std::vector<String>& out) {
+    File root = SD.open("/");
+    if (!root || !root.isDirectory()) {
+        if (root) root.close();
+        return;
+    }
+    File entry = root.openNextFile();
+    int fileCount = 0; // Prevent infinite loops on corrupted filesystems
+    
+    while (entry) {
+        const char* name = basenameFromPath(entry.name());
+        bool isFile = !entry.isDirectory();
+        entry.close();
+        if (isFile && isDiagFile(name)) {
+            out.push_back(String("/") + String(name));
+        }
+        entry = root.openNextFile();
+        fileCount++;
+        // Yield periodically to prevent WDT resets
+        if (fileCount % 10 == 0) {
+            yield();
+        }
+    }
+    root.close();
+}
+
+static bool hasLegacyData() {
+    if (SD.exists(kLegacyHandshakes)) return true;
+    if (SD.exists(kLegacyWardriving)) return true;
+    if (SD.exists(kLegacyMLData)) return true;
+    if (SD.exists(kLegacyModels)) return true;
+    if (SD.exists(kLegacyLogs)) return true;
+    if (SD.exists(kLegacyCrash)) return true;
+    if (SD.exists(kLegacyScreenshots)) return true;
+    if (SD.exists(kLegacyConfig)) return true;
+    if (SD.exists(kLegacyPersonality)) return true;
+    if (SD.exists(kLegacyWpasecResults)) return true;
+    if (SD.exists(kLegacyWpasecUploaded)) return true;
+    if (SD.exists(kLegacyWpasecSent)) return true;
+    if (SD.exists(kLegacyWigleUploaded)) return true;
+    if (SD.exists(kLegacyWigleStats)) return true;
+    if (SD.exists(kLegacyXpBackup)) return true;
+    if (SD.exists(kLegacyXpAwardedWpa)) return true;
+    if (SD.exists(kLegacyXpAwardedWigle)) return true;
+    if (SD.exists(kLegacyBoarBros)) return true;
+    if (SD.exists(kLegacyHeapLog)) return true;
+    if (SD.exists(kLegacyWpasecKey)) return true;
+    if (SD.exists(kLegacyWigleKey)) return true;
+
+    std::vector<String> diag;
+    // Reserve space to reduce allocations
+    diag.reserve(10);
+    collectDiagFiles(diag);
+    bool result = !diag.empty();
+    return result;
+}
+
+static bool backupLegacy(const char* backupRoot) {
+    const char* legacyDirs[] = {
+        kLegacyHandshakes,
+        kLegacyWardriving,
+        kLegacyMLData,
+        kLegacyModels,
+        kLegacyLogs,
+        kLegacyCrash,
+        kLegacyScreenshots
+    };
+    const int numDirs = sizeof(legacyDirs) / sizeof(legacyDirs[0]);
+    
+    const char* legacyFiles[] = {
+        kLegacyConfig,
+        kLegacyPersonality,
+        kLegacyWpasecResults,
+        kLegacyWpasecUploaded,
+        kLegacyWpasecSent,
+        kLegacyWigleUploaded,
+        kLegacyWigleStats,
+        kLegacyXpBackup,
+        kLegacyXpAwardedWpa,
+        kLegacyXpAwardedWigle,
+        kLegacyBoarBros,
+        kLegacyHeapLog,
+        kLegacyWpasecKey,
+        kLegacyWigleKey
+    };
+    const int numFiles = sizeof(legacyFiles) / sizeof(legacyFiles[0]);
+
+    for (int i = 0; i < numDirs; i++) {
+        const char* dir = legacyDirs[i];
+        if (!SD.exists(dir)) continue;
+        String dst = String(backupRoot) + String(dir);
+        if (!copyPathRecursive(dir, dst.c_str())) {
+            Serial.printf("[MIGRATE] Backup failed for dir: %s\n", dir);
+            return false;
+        }
+        yield(); // Yield between operations
+    }
+
+    for (int i = 0; i < numFiles; i++) {
+        const char* file = legacyFiles[i];
+        if (!SD.exists(file)) continue;
+        String dst = String(backupRoot) + String(file);
+        if (!copyFile(file, dst.c_str())) {
+            Serial.printf("[MIGRATE] Backup failed for file: %s\n", file);
+            return false;
+        }
+        yield(); // Yield between operations
+    }
+
+    std::vector<String> diag;
+    diag.reserve(10);
+    collectDiagFiles(diag);
+    for (const String& path : diag) {
+        String dst = String(backupRoot) + path;
+        if (!copyFile(path.c_str(), dst.c_str())) {
+            Serial.printf("[MIGRATE] Backup failed for diag: %s\n", path.c_str());
+            return false;
+        }
+        yield(); // Yield between operations
+    }
+
+    return true;
+}
+
+static bool movePath(const char* src, const char* dst, std::vector<MoveOp>& moved) {
+    if (!SD.exists(src)) return true;
+    if (SD.exists(dst)) {
+        Serial.printf("[MIGRATE] Destination exists: %s\n", dst);
+        return false;
+    }
+    if (!SD.rename(src, dst)) {
+        Serial.printf("[MIGRATE] Rename failed: %s -> %s\n", src, dst);
+        return false;
+    }
+    // Limit vector growth to prevent memory exhaustion
+    if (moved.size() < 100) {
+        moved.push_back({String(src), String(dst)});
+    }
+    return true;
+}
+
+static void rollbackMoves(const std::vector<MoveOp>& moved) {
+    for (auto it = moved.rbegin(); it != moved.rend(); ++it) {
+        SD.rename(it->to.c_str(), it->from.c_str());
+    }
+}
+
+} // namespace
+
+namespace SDLayout {
+
+bool usingNewLayout() {
+    bool result;
+    portENTER_CRITICAL(&layoutMutex);
+    result = g_useNewLayout;
+    portEXIT_CRITICAL(&layoutMutex);
+    return result;
+}
+
+void setUseNewLayout(bool enable) {
+    portENTER_CRITICAL(&layoutMutex);
+    g_useNewLayout = enable;
+    portEXIT_CRITICAL(&layoutMutex);
+}
+
+const char* newRoot() { return kNewRoot; }
+const char* migrationMarkerPath() { return kMarker; }
+
+const char* handshakesDir() { return usingNewLayout() ? kNewHandshakes : kLegacyHandshakes; }
+const char* wardrivingDir() { return usingNewLayout() ? kNewWardriving : kLegacyWardriving; }
+const char* mldataDir() { return usingNewLayout() ? kNewMLData : kLegacyMLData; }
+const char* modelsDir() { return usingNewLayout() ? kNewModels : kLegacyModels; }
+const char* logsDir() { return usingNewLayout() ? kNewLogs : kLegacyLogs; }
+const char* crashDir() { return usingNewLayout() ? kNewCrash : kLegacyCrash; }
+const char* screenshotsDir() { return usingNewLayout() ? kNewScreenshots : kLegacyScreenshots; }
+const char* diagnosticsDir() { return usingNewLayout() ? kNewDiagnostics : "/"; }
+const char* wpaSecDir() { return usingNewLayout() ? kNewWpaSec : "/"; }
+const char* wigleDir() { return usingNewLayout() ? kNewWigle : "/"; }
+const char* xpDir() { return usingNewLayout() ? kNewXp : "/"; }
+const char* miscDir() { return usingNewLayout() ? kNewMisc : "/"; }
+const char* configDir() { return usingNewLayout() ? kNewConfig : "/"; }
+const char* metaDir() { return usingNewLayout() ? kNewMeta : "/"; }
+
+const char* configPathSD() { return usingNewLayout() ? kNewConfigPath : kLegacyConfig; }
+const char* personalityPathSD() { return usingNewLayout() ? kNewPersonalityPath : kLegacyPersonality; }
+const char* wpasecResultsPath() { return usingNewLayout() ? kNewWpasecResults : kLegacyWpasecResults; }
+const char* wpasecUploadedPath() { return usingNewLayout() ? kNewWpasecUploaded : kLegacyWpasecUploaded; }
+const char* wpasecSentPath() { return usingNewLayout() ? kNewWpasecSent : kLegacyWpasecSent; }
+const char* wigleUploadedPath() { return usingNewLayout() ? kNewWigleUploaded : kLegacyWigleUploaded; }
+const char* wigleStatsPath() { return usingNewLayout() ? kNewWigleStats : kLegacyWigleStats; }
+const char* xpBackupPath() { return usingNewLayout() ? kNewXpBackup : kLegacyXpBackup; }
+const char* xpAwardedWpaPath() { return usingNewLayout() ? kNewXpAwardedWpa : kLegacyXpAwardedWpa; }
+const char* xpAwardedWiglePath() { return usingNewLayout() ? kNewXpAwardedWigle : kLegacyXpAwardedWigle; }
+const char* boarBrosPath() { return usingNewLayout() ? kNewBoarBros : kLegacyBoarBros; }
+const char* heapLogPath() { return usingNewLayout() ? kNewHeapLog : kLegacyHeapLog; }
+const char* wpasecKeyPath() { return usingNewLayout() ? kNewWpasecKey : kLegacyWpasecKey; }
+const char* wigleKeyPath() { return usingNewLayout() ? kNewWigleKey : kLegacyWigleKey; }
+
+const char* legacyConfigPath() { return kLegacyConfig; }
+const char* legacyPersonalityPath() { return kLegacyPersonality; }
+const char* legacyWpasecKeyPath() { return kLegacyWpasecKey; }
+const char* legacyWigleKeyPath() { return kLegacyWigleKey; }
+
+void ensureDirs() {
+    bool useNew = usingNewLayout();
+    if (!useNew) {
+        if (!SD.exists(kLegacyHandshakes)) SD.mkdir(kLegacyHandshakes);
+        if (!SD.exists(kLegacyWardriving)) SD.mkdir(kLegacyWardriving);
+        if (!SD.exists(kLegacyMLData)) SD.mkdir(kLegacyMLData);
+        if (!SD.exists(kLegacyModels)) SD.mkdir(kLegacyModels);
+        if (!SD.exists(kLegacyLogs)) SD.mkdir(kLegacyLogs);
+        return;
+    }
+
+    ensureDir(kNewRoot);
+    ensureDir(kNewHandshakes);
+    ensureDir(kNewWardriving);
+    ensureDir(kNewMLData);
+    ensureDir(kNewModels);
+    ensureDir(kNewLogs);
+    ensureDir(kNewCrash);
+    ensureDir(kNewScreenshots);
+    ensureDir(kNewDiagnostics);
+    ensureDir(kNewWpaSec);
+    ensureDir(kNewWigle);
+    ensureDir(kNewXp);
+    ensureDir(kNewMisc);
+    ensureDir(kNewConfig);
+    ensureDir(kNewMeta);
+}
+
+bool migrateIfNeeded() {
+    if (!SD.exists("/")) {
+        setUseNewLayout(false);
+        return false;
+    }
+
+    if (SD.exists(kMarker)) {
+        setUseNewLayout(true);
+        return true;
+    }
+
+    if (SD.exists(kNewRoot) && !isDirEmpty(kNewRoot)) {
+        Serial.println("[MIGRATE] /m5porkchop exists without marker; skipping migration");
+        setUseNewLayout(false);
+        return false;
+    }
+
+    if (!hasLegacyData()) {
+        ensureDir(kNewRoot);
+        ensureDir(kNewMeta);
+        File marker = SD.open(kMarker, FILE_WRITE);
+        if (marker) {
+            marker.println("v1");
+            marker.close();
+        }
+        setUseNewLayout(true);
+        return true;
+    }
+
+    uint64_t totalSize = 0;
+    const char* legacyDirs[] = {
+        kLegacyHandshakes,
+        kLegacyWardriving,
+        kLegacyMLData,
+        kLegacyModels,
+        kLegacyLogs,
+        kLegacyCrash,
+        kLegacyScreenshots
+    };
+    const int numDirs = sizeof(legacyDirs) / sizeof(legacyDirs[0]);
+    
+    const char* legacyFiles[] = {
+        kLegacyConfig,
+        kLegacyPersonality,
+        kLegacyWpasecResults,
+        kLegacyWpasecUploaded,
+        kLegacyWpasecSent,
+        kLegacyWigleUploaded,
+        kLegacyWigleStats,
+        kLegacyXpBackup,
+        kLegacyXpAwardedWpa,
+        kLegacyXpAwardedWigle,
+        kLegacyBoarBros,
+        kLegacyHeapLog,
+        kLegacyWpasecKey,
+        kLegacyWigleKey
+    };
+    const int numFiles = sizeof(legacyFiles) / sizeof(legacyFiles[0]);
+
+    for (int i = 0; i < numDirs; i++) {
+        const char* dir = legacyDirs[i];
+        if (SD.exists(dir)) {
+            totalSize += calcPathSize(dir);
+        }
+        yield(); // Yield between operations
+    }
+    for (int i = 0; i < numFiles; i++) {
+        const char* file = legacyFiles[i];
+        if (SD.exists(file)) {
+            File f = SD.open(file, FILE_READ);
+            if (f) {
+                totalSize += f.size();
+                f.close();
+            }
+        }
+        yield(); // Yield between operations
+    }
+    std::vector<String> diag;
+    diag.reserve(10);
+    collectDiagFiles(diag);
+    for (const String& path : diag) {
+        File f = SD.open(path, FILE_READ);
+        if (f) {
+            totalSize += f.size();
+            f.close();
+        }
+        yield(); // Yield between operations
+    }
+
+    uint64_t freeBytes = SD.totalBytes() - SD.usedBytes();
+    const uint64_t headroom = 64ULL * 1024ULL;
+    if (freeBytes < (totalSize + headroom)) {
+        Serial.printf("[MIGRATE] Not enough space for backup. Need %llu, free %llu\n",
+                      (unsigned long long)(totalSize + headroom),
+                      (unsigned long long)freeBytes);
+        setUseNewLayout(false);
+        return false;
+    }
+
+    if (!ensureDir("/backup")) {
+        Serial.println("[MIGRATE] Failed to create /backup");
+        setUseNewLayout(false);
+        return false;
+    }
+
+    String backupDir;
+    time_t now = time(nullptr);
+    struct tm* t = localtime(&now);
+    if (t && t->tm_year >= 120) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "/backup/porkchop_%04d%02d%02d_%02d%02d%02d",
+                 t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
+                 t->tm_hour, t->tm_min, t->tm_sec);
+        backupDir = buf;
+    } else {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "/backup/porkchop_boot_%lu", (unsigned long)millis());
+        backupDir = buf;
+    }
+
+    if (!ensureDir(backupDir.c_str())) {
+        Serial.println("[MIGRATE] Failed to create backup dir");
+        setUseNewLayout(false);
+        return false;
+    }
+
+    Serial.printf("[MIGRATE] Backup to %s (size %llu)\n", backupDir.c_str(), (unsigned long long)totalSize);
+    if (!backupLegacy(backupDir.c_str())) {
+        Serial.println("[MIGRATE] Backup failed, aborting migration");
+        setUseNewLayout(false);
+        return false;
+    }
+
+    ensureDir(kNewRoot);
+    ensureDir(kNewConfig);
+    ensureDir(kNewWpaSec);
+    ensureDir(kNewWigle);
+    ensureDir(kNewXp);
+    ensureDir(kNewMisc);
+    ensureDir(kNewDiagnostics);
+    ensureDir(kNewMeta);
+
+    std::vector<MoveOp> moved;
+    moved.reserve(25); // Pre-allocate expected number of moves to reduce allocations
+
+    if (!movePath(kLegacyHandshakes, kNewHandshakes, moved)) { rollbackMoves(moved); setUseNewLayout(false); return false; }
+    if (!movePath(kLegacyWardriving, kNewWardriving, moved)) { rollbackMoves(moved); setUseNewLayout(false); return false; }
+    if (!movePath(kLegacyMLData, kNewMLData, moved)) { rollbackMoves(moved); setUseNewLayout(false); return false; }
+    if (!movePath(kLegacyModels, kNewModels, moved)) { rollbackMoves(moved); setUseNewLayout(false); return false; }
+    if (!movePath(kLegacyLogs, kNewLogs, moved)) { rollbackMoves(moved); setUseNewLayout(false); return false; }
+    if (!movePath(kLegacyCrash, kNewCrash, moved)) { rollbackMoves(moved); setUseNewLayout(false); return false; }
+    if (!movePath(kLegacyScreenshots, kNewScreenshots, moved)) { rollbackMoves(moved); setUseNewLayout(false); return false; }
+
+    if (!movePath(kLegacyConfig, kNewConfigPath, moved)) { rollbackMoves(moved); setUseNewLayout(false); return false; }
+    if (!movePath(kLegacyPersonality, kNewPersonalityPath, moved)) { rollbackMoves(moved); setUseNewLayout(false); return false; }
+    if (!movePath(kLegacyWpasecResults, kNewWpasecResults, moved)) { rollbackMoves(moved); setUseNewLayout(false); return false; }
+    if (!movePath(kLegacyWpasecUploaded, kNewWpasecUploaded, moved)) { rollbackMoves(moved); setUseNewLayout(false); return false; }
+    if (!movePath(kLegacyWpasecSent, kNewWpasecSent, moved)) { rollbackMoves(moved); setUseNewLayout(false); return false; }
+    if (!movePath(kLegacyWigleUploaded, kNewWigleUploaded, moved)) { rollbackMoves(moved); setUseNewLayout(false); return false; }
+    if (!movePath(kLegacyWigleStats, kNewWigleStats, moved)) { rollbackMoves(moved); setUseNewLayout(false); return false; }
+    if (!movePath(kLegacyXpBackup, kNewXpBackup, moved)) { rollbackMoves(moved); setUseNewLayout(false); return false; }
+    if (!movePath(kLegacyXpAwardedWpa, kNewXpAwardedWpa, moved)) { rollbackMoves(moved); setUseNewLayout(false); return false; }
+    if (!movePath(kLegacyXpAwardedWigle, kNewXpAwardedWigle, moved)) { rollbackMoves(moved); setUseNewLayout(false); return false; }
+    if (!movePath(kLegacyBoarBros, kNewBoarBros, moved)) { rollbackMoves(moved); setUseNewLayout(false); return false; }
+    if (!movePath(kLegacyHeapLog, kNewHeapLog, moved)) { rollbackMoves(moved); setUseNewLayout(false); return false; }
+    if (!movePath(kLegacyWpasecKey, kNewWpasecKey, moved)) { rollbackMoves(moved); setUseNewLayout(false); return false; }
+    if (!movePath(kLegacyWigleKey, kNewWigleKey, moved)) { rollbackMoves(moved); setUseNewLayout(false); return false; }
+
+    std::vector<String> diag2;
+    diag2.reserve(10);
+    collectDiagFiles(diag2);
+    for (const String& path : diag2) {
+        String name = path;
+        if (name.startsWith("/")) name = name.substring(1);
+        String dest = String(kNewDiagnostics) + "/" + name;
+        if (!movePath(path.c_str(), dest.c_str(), moved)) { rollbackMoves(moved); setUseNewLayout(false); return false; }
+    }
+
+    File marker = SD.open(kMarker, FILE_WRITE);
+    if (marker) {
+        marker.println("v1");
+        marker.close();
+    }
+
+    setUseNewLayout(true);
+    return true;
+}
+
+} // namespace SDLayout

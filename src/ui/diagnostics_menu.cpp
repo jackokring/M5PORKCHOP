@@ -4,10 +4,12 @@
 #include <M5Cardputer.h>
 #include <SD.h>
 #include <time.h>
+#include <string.h>
 #include "display.h"
 #include "../core/config.h"
 #include "../web/wpasec.h"
 #include "../web/wigle.h"
+#include "../core/sd_layout.h"
 #include <WiFi.h>
 #include <esp_heap_caps.h>
 #include <esp_wifi.h>
@@ -72,7 +74,7 @@ void DiagnosticsMenu::update() {
     // G key - free caches / pseudo GC
     if (M5Cardputer.Keyboard.isKeyPressed('g') || M5Cardputer.Keyboard.isKeyPressed('G')) {
         collectGarbage();
-        Display::setTopBarMessage("CACHE GC DONE", 3000);
+        Display::setTopBarMessage("CACHE CLEARED", 3000);
         return;
     }
 
@@ -90,7 +92,7 @@ void DiagnosticsMenu::update() {
 void DiagnosticsMenu::saveSnapshot() {
     // Create a diagnostic snapshot with system information
     if (!SD.exists("/")) {
-        Display::notify(NoticeKind::WARNING, "NO SD");
+        Display::notify(NoticeKind::WARNING, "NO SD CARD");
         return;
     }
 
@@ -98,13 +100,20 @@ void DiagnosticsMenu::saveSnapshot() {
     time_t now = time(nullptr);
     struct tm* timeinfo = localtime(&now);
     char filename[64];
-    snprintf(filename, sizeof(filename), "/diag_%04d%02d%02d_%02d%02d%02d.txt",
+    const char* diagDir = SDLayout::diagnosticsDir();
+    const bool hasDiagDir = (strcmp(diagDir, "/") != 0);
+    if (hasDiagDir && !SD.exists(diagDir)) {
+        SD.mkdir(diagDir);
+    }
+    const char* sep = hasDiagDir ? "/" : "";
+    snprintf(filename, sizeof(filename), "%s%sdiag_%04d%02d%02d_%02d%02d%02d.txt",
+             diagDir, sep,
              timeinfo->tm_year + 1900, timeinfo->tm_mon + 1, timeinfo->tm_mday,
              timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
 
     File file = SD.open(filename, FILE_WRITE);
     if (!file) {
-        Display::notify(NoticeKind::WARNING, "SAVE FAIL");
+        Display::notify(NoticeKind::WARNING, "SAVE FAILED");
         return;
     }
 
@@ -165,12 +174,17 @@ void DiagnosticsMenu::resetWiFi() {
 
 void DiagnosticsMenu::logHeapSnapshot() {
     if (!Config::isSDAvailable()) {
-        Display::setTopBarMessage("NO SD", 2000);
+        Display::setTopBarMessage("NO SD CARD", 2000);
         return;
     }
-    File f = SD.open("/heap_log.txt", FILE_APPEND);
+    const char* heapPath = SDLayout::heapLogPath();
+    const char* diagDir = SDLayout::diagnosticsDir();
+    if (strcmp(diagDir, "/") != 0 && !SD.exists(diagDir)) {
+        SD.mkdir(diagDir);
+    }
+    File f = SD.open(heapPath, FILE_APPEND);
     if (!f) {
-        Display::setTopBarMessage("LOG FAIL", 2000);
+        Display::setTopBarMessage("LOG FAILED", 2000);
         return;
     }
     time_t now = time(nullptr);
@@ -192,6 +206,8 @@ void DiagnosticsMenu::collectGarbage() {
     // Free optional caches to claw back heap
     WPASec::freeCacheMemory();
     WiGLE::freeUploadedListMemory();
+    delay(200);
+    yield();
 }
 
 void DiagnosticsMenu::refreshStats() {

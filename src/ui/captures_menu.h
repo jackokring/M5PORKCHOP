@@ -4,10 +4,8 @@
 #include <Arduino.h>
 #include <M5Unified.h>
 #include <vector>
-
-// FreeRTOS task helpers (ESP32)
-#include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
+#include <FS.h>
+#include <SD.h>
 
 // WPA-SEC status for display
 enum class CaptureStatus {
@@ -27,6 +25,17 @@ struct CaptureInfo {
     String password;      // Cracked password (if status == CRACKED)
 };
 
+// Sync state machine for WPA-SEC operations
+enum class SyncState {
+    IDLE,
+    CONNECTING_WIFI,
+    FREEING_MEMORY,
+    UPLOADING,
+    DOWNLOADING_POTFILE,
+    COMPLETE,
+    ERROR
+};
+
 class CapturesMenu {
 public:
     static void init();
@@ -34,6 +43,9 @@ public:
     static void hide();
     static void update();
     static void draw(M5Canvas& canvas);
+    
+    // Emergency cleanup for low heap situations
+    static void emergencyCleanup();
     static bool isActive() { return active; }
     static const char* getSelectedBSSID();
     static size_t getCount() { return captures.size(); }
@@ -46,26 +58,6 @@ private:
     static bool keyWasPressed;
     static bool nukeConfirmActive;  // Nuke confirmation modal
     static bool detailViewActive;   // Password detail view
-    static bool connectingWiFi;     // WiFi connection in progress
-    static bool uploadingFile;      // Upload in progress
-    static bool refreshingResults;  // Fetching WPA-SEC results
-
-    // WPA‑SEC worker task (runs TLS off the Arduino loopTask stack)
-    enum class WpaTaskAction : uint8_t { NONE = 0, UPLOAD, REFRESH };
-    static TaskHandle_t wpaTaskHandle;
-    static volatile bool wpaTaskDone;
-    static volatile bool wpaTaskSuccess;
-    static volatile WpaTaskAction wpaTaskAction;
-    static uint8_t wpaTaskIndex;  // which capture was uploaded
-    static char wpaTaskResultMsg[64];
-
-    struct WpaTaskCtx {
-        WpaTaskAction action;
-        char pcapPath[128];
-        uint8_t index;
-    };
-
-    static void wpaTaskFn(void* pv);
     
     static const uint8_t VISIBLE_ITEMS = 5;
     
@@ -73,11 +65,54 @@ private:
     static void handleInput();
     static void drawNukeConfirm(M5Canvas& canvas);
     static void drawDetailView(M5Canvas& canvas);
-    static void drawConnecting(M5Canvas& canvas);
     static void nukeLoot();
     static void updateWPASecStatus();
-    static void uploadSelected();
-    static void refreshResults();
     static void formatTime(char* out, size_t len, time_t t);
     static const size_t MAX_CAPTURES = 200;
+    
+    // Async scan state
+    static bool scanInProgress;
+    static unsigned long lastScanTime;
+    static const unsigned long SCAN_DELAY = 50; // ms between scan chunks
+    static File scanDir;
+    static File currentFile;
+    static bool scanComplete;
+    static size_t scanProgress;
+    static const size_t SCAN_CHUNK_SIZE = 5; // files to process per chunk
+    
+    // Async scan processing
+    static void processAsyncScan();
+    
+    // Async WPA-SEC status update state
+    static bool wpasecUpdateInProgress;
+    static unsigned long lastWpasecUpdateTime;
+    static size_t wpasecUpdateProgress;
+    static const unsigned long WPASEC_UPDATE_DELAY = 25; // ms between updates
+    static const size_t WPASEC_UPDATE_CHUNK_SIZE = 3; // captures to process per chunk
+    
+    // Async WPA-SEC status update processing
+    static void processAsyncWPASecUpdate();
+    
+    // WPA-SEC Sync modal state
+    static bool syncModalActive;
+    static SyncState syncState;
+    static char syncStatusText[48];
+    static uint8_t syncProgress;
+    static uint8_t syncTotal;
+    static unsigned long syncStartTime;
+    static uint8_t syncUploaded;
+    static uint8_t syncFailed;
+    static uint16_t syncCracked;
+    static char syncError[48];
+    
+    // Sync operations
+    static void startSync();
+    static void processSyncState();
+    static void drawSyncModal(M5Canvas& canvas);
+    static void cancelSync();
+    static bool connectToWiFi();
+    static void disconnectWiFi();
+    
+    // Sync progress callback (static for C-style callback)
+    static void onSyncProgress(const char* status, uint8_t progress, uint8_t total);
 };

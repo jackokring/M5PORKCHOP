@@ -34,8 +34,4 @@ void drawClouds(M5Canvas& canvas, uint16_t colorFG);
 bool isThunderFlashing();
 bool isRaining();
 
-// === WIND SYSTEM ===
-// Periodic wind gusts with particle effects
-void setWindActive(bool active);
-
 }  // namespace Weather

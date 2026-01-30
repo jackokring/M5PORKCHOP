@@ -1,4 +1,4 @@
-// GPS AT6668 implementation
+// GPS AT668 implementation
 
 #include "gps.h"
 #include "../core/config.h"
@@ -14,21 +14,30 @@ GPSData GPS::currentData = {0};
 uint32_t GPS::fixCount = 0;
 uint32_t GPS::lastFixTime = 0;
 uint32_t GPS::lastUpdateTime = 0;
+SemaphoreHandle_t GPS::mutex = nullptr;
 
 void GPS::init(uint8_t rxPin, uint8_t txPin, uint32_t baud) {
     // GPS source now auto-configured via GPSSource enum in config
     // Pin selection happens in Config::load() based on gpsSource setting
     Serial.printf("[GPS] Init: RX=%d, TX=%d, baud=%lu\n", rxPin, txPin, baud);
     
+    // Create mutex for thread safety
+    if (mutex == nullptr) {
+        mutex = xSemaphoreCreateMutex();
+    }
+    
     // Use Serial2 for GPS (UART2)
     Serial2.begin(baud, SERIAL_8N1, rxPin, txPin);
     serial = &Serial2;
     active = true;
     
-    // Clear initial data
-    memset(&currentData, 0, sizeof(GPSData));
-    currentData.valid = false;
-    currentData.fix = false;
+    // Clear initial data - safe to use portMAX_DELAY during init (not a hot path, mutex just created)
+    if (mutex && xSemaphoreTake(mutex, portMAX_DELAY)) {
+        memset(&currentData, 0, sizeof(GPSData));
+        currentData.valid = false;
+        currentData.fix = false;
+        xSemaphoreGive(mutex);
+    }
 }
 
 void GPS::reinit(uint8_t rxPin, uint8_t txPin, uint32_t baud) {
@@ -47,10 +56,13 @@ void GPS::reinit(uint8_t rxPin, uint8_t txPin, uint32_t baud) {
     serial = &Serial2;
     active = true;
     
-    // Reset GPS state
-    memset(&currentData, 0, sizeof(GPSData));
-    currentData.valid = false;
-    currentData.fix = false;
+    // Reset GPS state - safe to use portMAX_DELAY during reinit (configuration path, not hot path)
+    if (mutex && xSemaphoreTake(mutex, portMAX_DELAY)) {
+        memset(&currentData, 0, sizeof(GPSData));
+        currentData.valid = false;
+        currentData.fix = false;
+        xSemaphoreGive(mutex);
+    }
     
     // GPS logs silenced - pig prefers stealth
     // Serial.printf("[GPS] Re-initialized on pins RX:%d TX:%d @ %d baud\n", rxPin, txPin, baud);
@@ -74,58 +86,84 @@ void GPS::processSerial() {
     if (!serial) return;  // Safety check
     
     static uint32_t lastDebugTime = 0;
-    static uint32_t bytesReceived = 0;
+    static uint32_t bytesProcessed = 0;
+    uint32_t processedThisCall = 0;
+    const uint32_t maxBytesPerCall = 128; // Limit processing per call to prevent WDT
     
-    while (serial->available() > 0) {
+    while (serial->available() > 0 && processedThisCall < maxBytesPerCall) {
         char c = serial->read();
-        gps.encode(c);
-        bytesReceived++;
+        if (c != -1) { // Valid byte read
+            gps.encode(c);
+            bytesProcessed++;
+            processedThisCall++;
+        }
+    }
+    
+    // Yield occasionally during heavy processing to prevent WDT
+    if (processedThisCall > 0 && processedThisCall % 32 == 0) {
+        yield(); // Allow other tasks to run
     }
     
     // GPS debug logs silenced - pig prefers stealth
     // Uncomment for debugging:
     // uint32_t now = millis();
     // if (now - lastDebugTime >= 5000) {
-    //     Serial.printf("[GPS] Bytes: %lu, Sats: %d, Valid: %s\n", bytesReceived, gps.satellites.value(), gps.location.isValid() ? "Y" : "N");
+    //     Serial.printf("[GPS] Bytes: %lu, Sats: %d, Valid: %s\n", bytesProcessed, gps.satellites.value(), gps.location.isValid() ? "Y" : "N");
     //     lastDebugTime = now;
     // }
 }
 
 void GPS::updateData() {
-    bool hadFix = currentData.fix;
+    if (mutex == nullptr) return;  // FIX: Prevent crash if GPS not initialized
     
-    currentData.latitude = gps.location.lat();
-    currentData.longitude = gps.location.lng();
-    currentData.altitude = gps.altitude.meters();
-    currentData.speed = gps.speed.kmph();
-    currentData.course = gps.course.deg();
-    currentData.satellites = gps.satellites.value();
-    currentData.hdop = gps.hdop.value();
+    // Get current GPS data safely
+    bool valid = gps.location.isValid();
+    double latitude = gps.location.lat();
+    double longitude = gps.location.lng();
+    double altitude = gps.altitude.meters();
+    float speed = gps.speed.kmph();
+    float course = gps.course.deg();
+    uint8_t satellites = gps.satellites.value();
+    uint16_t hdop = gps.hdop.value();
+    uint32_t date = gps.date.isValid() ? gps.date.value() : 0;
+    uint32_t time = gps.time.isValid() ? gps.time.value() : 0;
+    uint32_t age = gps.location.age();
+    bool fix = valid && (age < 30000);
     
-    // Date and time
-    if (gps.date.isValid()) {
-        currentData.date = gps.date.value();  // DDMMYY
+    // Update shared data atomically and check for fix changes - use timeout to prevent WDT
+    bool hadFix = false;
+    if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100))) {
+        hadFix = currentData.fix;
+        
+        currentData.latitude = latitude;
+        currentData.longitude = longitude;
+        currentData.altitude = altitude;
+        currentData.speed = speed;
+        currentData.course = course;
+        currentData.satellites = satellites;
+        currentData.hdop = hdop;
+        currentData.date = date;
+        currentData.time = time;
+        currentData.valid = valid;
+        currentData.age = age;
+        currentData.fix = fix;
+        
+        xSemaphoreGive(mutex);
     }
-    if (gps.time.isValid()) {
-        currentData.time = gps.time.value();  // HHMMSSCC
-    }
     
-    // Fix status
-    currentData.valid = gps.location.isValid();
-    currentData.age = gps.location.age();
-    // Relaxed age check: 30 seconds for wardriving (GPS may not update every sentence)
-    // Also accept if we have valid coords even with stale age (indoor/tunnel resume)
-    currentData.fix = currentData.valid && (currentData.age < 30000);
-    
-    // Track fix changes
-    if (currentData.fix && !hadFix) {
-        fixCount++;
-        lastFixTime = millis();
+    // Process fix changes outside the mutex to avoid blocking
+    if (fix && !hadFix) {
+        // Increment fix count safely - use timeout to prevent WDT
+        if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100))) {
+            fixCount++;
+            lastFixTime = millis();
+            xSemaphoreGive(mutex);
+        }
         Mood::onGPSFix();
         Display::setGPSStatus(true);
         Serial.println("[GPS] Fix acquired!");
-        SDLog::log("GPS", "Fix acquired (sats: %d)", currentData.satellites);
-    } else if (!currentData.fix && hadFix) {
+        SDLog::log("GPS", "Fix acquired (sats: %d)", satellites);
+    } else if (!fix && hadFix) {
         Mood::onGPSLost();
         Display::setGPSStatus(false);
         Serial.println("[GPS] Fix lost");
@@ -170,6 +208,26 @@ void GPS::wake() {
     Serial.println("[GPS] Waking up");
 }
 
+void GPS::ensureContinuousMode() {
+    if (!serial) return;  // Safety check
+    
+    // Always send continuous mode command regardless of software state
+    // Ensures GPS hardware is in correct mode even if previous sleep command
+    // failed or was ignored by the hardware
+    // FIX: Addresses issue where GPS doesn't show until mode restart
+    uint8_t cmd[] = {
+        0xB5, 0x62,  // Sync
+        0x06, 0x11,  // CFG-RXM
+        0x02, 0x00,  // Length
+        0x08, 0x00,  // reserved, Continuous Mode
+        0x21, 0x91   // Checksum
+    };
+    
+    serial->write(cmd, sizeof(cmd));
+    active = true;  // Ensure software flag matches hardware intent
+    Serial.println("[GPS] Continuous mode enforced");
+}
+
 void GPS::setPowerMode(bool isActive) {
     if (isActive) {
         wake();
@@ -183,44 +241,108 @@ bool GPS::isActive() {
 }
 
 bool GPS::hasFix() {
-    return currentData.fix;
+    if (mutex == nullptr) return false;  // FIX: Prevent crash if GPS not initialized
+    if (xSemaphoreTake(mutex, 10 / portTICK_PERIOD_MS)) {
+        bool result = currentData.fix;
+        xSemaphoreGive(mutex);
+        return result;
+    }
+    return false; // Return safe value if mutex unavailable
 }
 
 GPSData GPS::getData() {
-    return currentData;
+    GPSData data = {};
+    if (mutex == nullptr) return data;  // FIX: Prevent crash if GPS not initialized
+    if (xSemaphoreTake(mutex, 10 / portTICK_PERIOD_MS)) {
+        data = currentData;
+        xSemaphoreGive(mutex);
+    }
+    return data;
 }
 
 String GPS::getLocationString() {
-    if (!currentData.fix) {
+    char buf[64]; // Larger buffer to accommodate coordinates safely
+    if (getLocationString(buf, sizeof(buf))) {
+        return String(buf);
+    } else {
         return "No fix";
     }
-    
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%.6f,%.6f", 
-             currentData.latitude, currentData.longitude);
-    return String(buf);
+}
+
+bool GPS::getLocationString(char* out, size_t len) {
+    if (!out || len == 0) return false;
+    if (mutex == nullptr) {  // FIX: Prevent crash if GPS not initialized
+        strncpy(out, "No GPS", len - 1);
+        out[len - 1] = '\0';
+        return false;
+    }
+    if (xSemaphoreTake(mutex, 10 / portTICK_PERIOD_MS)) {
+        if (currentData.fix) {
+            int written = snprintf(out, len, "%.6f,%.6f", 
+                                   currentData.latitude, currentData.longitude);
+            xSemaphoreGive(mutex);
+            return (written > 0 && written < (int)len);
+        } else {
+            strncpy(out, "No fix", len - 1);
+            out[len - 1] = '\0';
+            xSemaphoreGive(mutex);
+            return true;
+        }
+    } else {
+        strncpy(out, "Error", len - 1);
+        out[len - 1] = '\0';
+        return false;
+    }
 }
 
 String GPS::getTimeString() {
-    char buf[8];
+    char buf[16]; // Increased buffer size for time string
     getTimeString(buf, sizeof(buf));
     return String(buf);
 }
 
 void GPS::getTimeString(char* out, size_t len) {
     if (!out || len == 0) return;
-    if (!gps.time.isValid()) {
+    if (mutex == nullptr) {  // FIX: Prevent crash if GPS not initialized
         snprintf(out, len, "--:--");
         return;
     }
-    
-    // Apply timezone offset from config
-    int8_t tzOffset = Config::gps().timezoneOffset;
-    int hour = gps.time.hour() + tzOffset;
-    
-    // Handle day wrap
-    if (hour >= 24) hour -= 24;
-    if (hour < 0) hour += 24;
-    
-    snprintf(out, len, "%02d:%02d", hour, gps.time.minute());
+    if (xSemaphoreTake(mutex, 10 / portTICK_PERIOD_MS)) {
+        if (gps.time.isValid()) {
+            // Apply timezone offset from config
+            int8_t tzOffset = Config::gps().timezoneOffset;
+            int hour = gps.time.hour() + tzOffset;
+            
+            // Handle day wrap
+            if (hour >= 24) hour -= 24;
+            if (hour < 0) hour += 24;
+            
+            snprintf(out, len, "%02d:%02d", hour, gps.time.minute());
+        } else {
+            snprintf(out, len, "--:--");
+        }
+        xSemaphoreGive(mutex);
+    } else {
+        snprintf(out, len, "ERR");
+    }
+}
+
+uint32_t GPS::getFixCount() {
+    if (mutex == nullptr) return 0;  // FIX: Prevent crash if GPS not initialized
+    if (xSemaphoreTake(mutex, 10 / portTICK_PERIOD_MS)) {
+        uint32_t count = fixCount;
+        xSemaphoreGive(mutex);
+        return count;
+    }
+    return 0; // Return safe value if mutex unavailable
+}
+
+uint32_t GPS::getLastFixTime() {
+    if (mutex == nullptr) return 0;  // FIX: Prevent crash if GPS not initialized
+    if (xSemaphoreTake(mutex, 10 / portTICK_PERIOD_MS)) {
+        uint32_t time = lastFixTime;
+        xSemaphoreGive(mutex);
+        return time;
+    }
+    return 0; // Return safe value if mutex unavailable
 }

@@ -4,8 +4,8 @@
 
 #include <Arduino.h>
 #include <map>
-#include <set>
 #include <vector>
+#include <atomic>
 #include <esp_wifi.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -21,7 +21,7 @@ inline uint64_t bssidToKey(const uint8_t* bssid) {
 
 class WarhogMode {
 public:
-    static constexpr uint8_t MAX_BOUNTIES = 15;  // Max bounty targets to send
+    static constexpr uint8_t MAX_BOUNTIES = 15;  // Max bounty targets to send per payload
 
     static void init();
     static void start();
@@ -52,7 +52,10 @@ public:
     // === BOUNTY SYSTEM (Phase 5) ===
     static void markCaptured(const uint8_t* bssid);                   // Track captures to exclude from bounties
     static void buildBountyList(uint8_t* buffer, uint8_t* count);     // Populate bounty payload buffer (max 15)
-    static std::vector<uint64_t> getUnclaimedBSSIDs();                // Seen but not captured
+    static std::vector<uint64_t> getUnclaimedBSSIDs();                // Random sample of seen, excluding captured
+
+    // Internal helpers
+    static void clearBeaconFeatures();
     
 private:
     static bool running;
@@ -60,8 +63,6 @@ private:
     static uint32_t scanInterval;
     static bool scanInProgress;
     static uint32_t scanStartTime;
-    
-    static std::set<uint64_t> seenBSSIDs;  // Duplicate tracking for session
     
     // Statistics
     static uint32_t totalNetworks;   // All unique networks seen
@@ -77,10 +78,8 @@ private:
     // Enhanced ML mode - beacon capture
     static bool enhancedMode;
     static std::map<uint64_t, WiFiFeatures> beaconFeatures;
-    static uint32_t beaconCount;
+    static std::atomic<uint32_t> beaconCount;  // Atomic for thread-safe access from callback + main
     static volatile bool beaconMapBusy;
-    static std::set<uint64_t> capturedBSSIDs; // Networks captured in Oink (exclude from bounties)
-    
     // Background scan task
     static TaskHandle_t scanTaskHandle;
     static volatile int scanResult;

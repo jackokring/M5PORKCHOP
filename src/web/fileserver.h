@@ -31,6 +31,9 @@ public:
     static uint32_t getSessionUploadCount() { return sessionUploadCount; }
     static uint32_t getSessionDownloadCount() { return sessionDownloadCount; }
     
+    // File operation helpers (shared with SD formatting)
+    static bool deletePathRecursive(const String& path);
+    
 private:
     static WebServer* server;
     static FileServerState state;
@@ -51,6 +54,9 @@ private:
     
     // HTTP handlers
     static void handleRoot();
+    static void handleStyle();
+    static void handleScript();
+    static void handleSwine();
     static void handleFileList();
     static void handleDownload();
     static void handleUpload();
@@ -65,9 +71,8 @@ private:
     static void handleNotFound();
     
     // File operation helpers
-    static bool deletePathRecursive(const String& path);
     static bool copyFileChunked(const String& srcPath, const String& dstPath);
-    static bool copyPathRecursive(const String& srcPath, const String& dstPath);
+    static bool copyPathRecursive(const String& srcPath, const String& dstPath, uint8_t depth = 0);
     
     // HTML template
     static const char* getHTML();

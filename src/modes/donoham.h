@@ -6,6 +6,7 @@
 #include <esp_wifi.h>
 #include <vector>
 #include "oink.h"  // Reuse DetectedNetwork, CapturedPMKID, CapturedHandshake
+#include "../core/network_recon.h"
 
 // DNH-specific constants
 static const size_t DNH_MAX_NETWORKS = 100;
@@ -63,19 +64,19 @@ public:
     static void update();
     static bool isRunning() { return running; }
     
-    // Seamless switching (preserves WiFi state)
-    static void startSeamless();
-    static void stopSeamless();
     
     // Channel info for display
     static uint8_t getCurrentChannel() { return currentChannel; }
     
     // Stats for display
-    static size_t getNetworkCount() { return networks.size(); }
+    static size_t getNetworkCount() { return NetworkRecon::getNetworkCount(); }
     static size_t getPMKIDCount() { return pmkids.size(); }
     static size_t getHandshakeCount() { return handshakes.size(); }
     
-    // Frame handlers (called from shared callback)
+    // Packet callback for NetworkRecon
+    static void promiscuousCallback(const wifi_promiscuous_pkt_t* pkt, wifi_promiscuous_pkt_type_t type);
+    
+    // Frame handlers (called from promiscuousCallback)
     static void handleBeacon(const uint8_t* frame, uint16_t len, int8_t rssi);
     static void handleProbeResponse(const uint8_t* frame, uint16_t len, int8_t rssi);
     static void handleEAPOL(const uint8_t* frame, uint16_t len, int8_t rssi);
@@ -92,8 +93,8 @@ private:
     static uint32_t dwellStartTime;
     static bool dwellResolved;
     
-    // Data storage (separate from OINK)
-    static std::vector<DetectedNetwork> networks;
+    // Data storage (uses shared networks from NetworkRecon)
+    // networks vector is now in NetworkRecon
     static std::vector<CapturedPMKID> pmkids;
     static std::vector<CapturedHandshake> handshakes;
     
@@ -117,8 +118,7 @@ private:
     static void trackIncompleteHandshake(const uint8_t* bssid, uint8_t mask, uint8_t ch);
     static void pruneIncompleteHandshakes();
     
-    // Cleanup
-    static void ageOutStaleNetworks();
+    // Cleanup (network cleanup handled by NetworkRecon)
     static void saveAllPMKIDs();
     static void saveAllHandshakes();
     

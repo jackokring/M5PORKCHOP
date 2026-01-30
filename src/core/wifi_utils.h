@@ -1,9 +1,76 @@
 #pragma once
 
 #include <WiFi.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 namespace WiFiUtils {
+    /**
+     * @brief Performs a hard reset of the WiFi subsystem
+     * @note Does not power off WiFi driver to prevent RX buffer allocation failures
+     */
     void hardReset();
+    
+    /**
+     * @brief Performs a soft shutdown of the WiFi subsystem
+     * @note Does not power off WiFi driver to prevent RX buffer allocation failures
+     */
     void shutdown();
+    
+    /**
+     * @brief Stops promiscuous mode if currently active
+     */
     void stopPromiscuous();
+    
+    /**
+     * @brief Locks the TLS mutex with timeout to prevent WDT resets
+     * @note Returns early if lock cannot be acquired within 100ms
+     */
+    void lockTls();
+    
+    /**
+     * @brief Unlocks the TLS mutex
+     */
+    void unlockTls();
+    
+    /**
+     * @brief Ensures TLS memory reserve of specified size is available
+     * @param bytes Size of the memory reserve to ensure
+     * @return true if successful, false otherwise
+     */
+    bool ensureTlsReserve(size_t bytes);
+    
+    /**
+     * @brief Acquires the TLS memory reserve for use
+     * @return true if successful, false otherwise
+     */
+    bool acquireTlsReserve();
+    
+    /**
+     * @brief Restores the TLS memory reserve after use
+     * @return true if successful, false otherwise
+     */
+    bool restoreTlsReserve();
+    
+    /**
+     * @brief Ensures system time is synchronized via NTP
+     * @param timeoutMs Maximum time to wait for sync (default 6000ms)
+     * @param force Force resync even if time appears valid (default false)
+     * @return true if time is valid, false if sync failed within timeout
+     */
+    bool ensureTimeSynced(uint32_t timeoutMs = 6000, bool force = false);
+    
+    /**
+     * @brief Conditions heap for TLS operations by releasing fragmented memory
+     * 
+     * This mimics the "OINK bounce" effect where entering/exiting OINK mode
+     * reclaims ~20-30KB of memory by:
+     * 1. Deinitializing BLE if active (biggest win - ~20KB)
+     * 2. Allocation/deallocation pattern to coalesce heap fragments
+     * 
+     * Call before TLS operations (WPA-SEC, WiGLE) when contiguous heap is low.
+     * 
+     * @return Size of largest contiguous block after conditioning
+     */
+    size_t conditionHeapForTLS();
 }

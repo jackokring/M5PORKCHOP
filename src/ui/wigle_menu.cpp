@@ -1,15 +1,14 @@
-// WiGLE Menu - View and upload wardriving files to wigle.net
+// WiGLE Menu - View wardriving files with sync support
 
 #include "wigle_menu.h"
 #include <M5Cardputer.h>
 #include <SD.h>
+#include <WiFi.h>
 #include <string.h>
 #include "display.h"
 #include "../web/wigle.h"
 #include "../core/config.h"
-
-// For heap statistics logging
-#include <esp_heap_caps.h>
+#include "../core/sd_layout.h"
 
 // Static member initialization
 std::vector<WigleFileInfo> WigleMenu::files;
@@ -19,14 +18,25 @@ bool WigleMenu::active = false;
 bool WigleMenu::keyWasPressed = false;
 bool WigleMenu::detailViewActive = false;
 bool WigleMenu::nukeConfirmActive = false;
-bool WigleMenu::connectingWiFi = false;
-bool WigleMenu::uploadingFile = false;
+bool WigleMenu::scanInProgress = false;
+unsigned long WigleMenu::lastScanTime = 0;
+File WigleMenu::scanDir;
+File WigleMenu::currentFile;
+bool WigleMenu::scanComplete = false;
+size_t WigleMenu::scanProgress = 0;
 
-TaskHandle_t WigleMenu::uploadTaskHandle = nullptr;
-volatile bool WigleMenu::uploadTaskDone = false;
-volatile bool WigleMenu::uploadTaskSuccess = false;
-uint8_t WigleMenu::uploadTaskIndex = 0;
-char WigleMenu::uploadTaskResultMsg[64] = {0};
+// Sync state
+bool WigleMenu::syncModalActive = false;
+WigleSyncState WigleMenu::syncState = WigleSyncState::IDLE;
+char WigleMenu::syncStatusText[48] = "";
+uint8_t WigleMenu::syncProgress = 0;
+uint8_t WigleMenu::syncTotal = 0;
+unsigned long WigleMenu::syncStartTime = 0;
+uint8_t WigleMenu::syncUploaded = 0;
+uint8_t WigleMenu::syncFailed = 0;
+uint8_t WigleMenu::syncSkipped = 0;
+bool WigleMenu::syncStatsFetched = false;
+char WigleMenu::syncError[48] = "";
 
 static void formatDisplayName(const String& filename, char* out, size_t len, size_t maxChars,
                               const char* ellipsis, bool stripDecorators) {
@@ -72,52 +82,6 @@ static void formatDisplayName(const String& filename, char* out, size_t len, siz
     }
 }
 
-void WigleMenu::uploadTaskFn(void* pv) {
-    UploadTaskCtx* ctx = reinterpret_cast<UploadTaskCtx*>(pv);
-
-    // Run WiFi + TLS from a dedicated task with a large stack.
-    // This avoids stack canary panics from mbedTLS handshake inside loopTask.
-
-    bool weConnected = false;
-    if (!WiGLE::isConnected()) {
-        connectingWiFi = true;
-        if (!WiGLE::connect()) {
-            strncpy(uploadTaskResultMsg, WiGLE::getLastError(), sizeof(uploadTaskResultMsg) - 1);
-            uploadTaskResultMsg[sizeof(uploadTaskResultMsg) - 1] = '\0';
-            uploadTaskSuccess = false;
-            uploadTaskDone = true;
-            connectingWiFi = false;
-            delete ctx;
-            vTaskDelete(nullptr);
-            return;
-        }
-        weConnected = true;
-        connectingWiFi = false;
-    }
-
-    uploadingFile = true;
-    bool ok = WiGLE::uploadFile(ctx->fullPath);
-    uploadingFile = false;
-
-    if (weConnected) {
-        WiGLE::disconnect();
-    }
-
-    uploadTaskIndex = ctx->index;
-    uploadTaskSuccess = ok;
-    if (ok) {
-        strncpy(uploadTaskResultMsg, "UPLOAD OK!", sizeof(uploadTaskResultMsg) - 1);
-    } else {
-        strncpy(uploadTaskResultMsg, WiGLE::getLastError(), sizeof(uploadTaskResultMsg) - 1);
-    }
-    uploadTaskResultMsg[sizeof(uploadTaskResultMsg) - 1] = '\0';
-
-    uploadTaskDone = true;
-
-    delete ctx;
-    vTaskDelete(nullptr);
-}
-
 void WigleMenu::init() {
     files.clear();
     selectedIndex = 0;
@@ -130,8 +94,8 @@ void WigleMenu::show() {
     scrollOffset = 0;
     detailViewActive = false;
     nukeConfirmActive = false;
-    connectingWiFi = false;
-    uploadingFile = false;
+    syncModalActive = false;
+    syncState = WigleSyncState::IDLE;
     keyWasPressed = true;  // Ignore enter that brought us here
     scanFiles();
 }
@@ -139,34 +103,82 @@ void WigleMenu::show() {
 void WigleMenu::hide() {
     active = false;
     detailViewActive = false;
+    syncModalActive = false;
     files.clear();  // Release memory when not in menu
     files.shrink_to_fit();
+    WiGLE::freeUploadedListMemory();
 }
 
 void WigleMenu::scanFiles() {
+    // Initialize async scan
     files.clear();
+    files.reserve(50);
     
     if (!Config::isSDAvailable()) {
         Serial.println("[WIGLE_MENU] SD card not available");
+        scanComplete = true;
+        scanInProgress = false;
         return;
     }
     
-    // Scan /wardriving/ directory for .wigle.csv files
-    File dir = SD.open("/wardriving");
-    if (!dir || !dir.isDirectory()) {
-        Serial.println("[WIGLE_MENU] /wardriving directory not found");
+    const char* wigleDir = SDLayout::wardrivingDir();
+    scanDir = SD.open(wigleDir);
+    if (!scanDir || !scanDir.isDirectory()) {
+        Serial.println("[WIGLE_MENU] Wardriving directory not found");
+        scanComplete = true;
+        scanInProgress = false;
+        scanDir.close();
         return;
     }
     
-    while (File entry = dir.openNextFile()) {
-        if (!entry.isDirectory()) {
-            String name = entry.name();
+    scanInProgress = true;
+    scanComplete = false;
+    scanProgress = 0;
+    lastScanTime = millis();
+}
+
+void WigleMenu::processAsyncScan() {
+    if (!scanInProgress || scanComplete) {
+        return;
+    }
+    
+    // Throttle the scan to avoid blocking the UI
+    if (millis() - lastScanTime < SCAN_DELAY) {
+        return;
+    }
+    
+    lastScanTime = millis();
+    
+    // Process a chunk of files
+    size_t processed = 0;
+    while (processed < SCAN_CHUNK_SIZE && !scanComplete) {
+        currentFile = scanDir.openNextFile();
+        
+        if (!currentFile) {
+            // No more files, we're done
+            scanComplete = true;
+            scanInProgress = false;
+            scanDir.close();
+            
+            // Sort by filename (newest first - filenames include timestamp)
+            std::sort(files.begin(), files.end(), [](const WigleFileInfo& a, const WigleFileInfo& b) {
+                return a.filename > b.filename;
+            });
+            
+            Serial.printf("[WIGLE_MENU] Async scan complete. Found %d WiGLE files\n", files.size());
+            break;
+        }
+        
+        if (!currentFile.isDirectory()) {
+            String name = currentFile.name();
             // Only show WiGLE format files (*.wigle.csv)
             if (name.endsWith(".wigle.csv")) {
                 WigleFileInfo info;
-                info.filename = name;
-                info.fullPath = String("/wardriving/") + name;
-                info.fileSize = entry.size();
+                int slash = name.lastIndexOf('/');
+                String base = (slash >= 0) ? name.substring(slash + 1) : name;
+                info.filename = base;
+                info.fullPath = String(SDLayout::wardrivingDir()) + "/" + base;
+                info.fileSize = currentFile.size();
                 // Estimate network count: ~150 bytes per line after header
                 info.networkCount = info.fileSize > 300 ? (info.fileSize - 300) / 150 : 0;
                 
@@ -177,19 +189,26 @@ void WigleMenu::scanFiles() {
                 files.push_back(info);
                 
                 // Cap at 50 files to prevent memory issues
-                if (files.size() >= 50) break;
+                if (files.size() >= 50) {
+                    scanComplete = true;
+                    scanInProgress = false;
+                    currentFile.close();
+                    scanDir.close();
+                    break;
+                }
             }
         }
-        entry.close();
+        
+        currentFile.close();
+        processed++;
+        scanProgress++;
+        
+        // Yield periodically to allow other tasks to run
+        if (processed >= SCAN_CHUNK_SIZE) {
+            // Still more to do, but yield control back to other tasks
+            break;
+        }
     }
-    dir.close();
-    
-    // Sort by filename (newest first - filenames include timestamp)
-    std::sort(files.begin(), files.end(), [](const WigleFileInfo& a, const WigleFileInfo& b) {
-        return a.filename > b.filename;
-    });
-    
-    Serial.printf("[WIGLE_MENU] Found %d WiGLE files\n", files.size());
 }
 
 void WigleMenu::handleInput() {
@@ -205,15 +224,26 @@ void WigleMenu::handleInput() {
     
     auto keys = M5Cardputer.Keyboard.keysState();
     
-    // Handle detail view input - U uploads, any other key closes
-    if (detailViewActive) {
-        if (M5Cardputer.Keyboard.isKeyPressed('u') || M5Cardputer.Keyboard.isKeyPressed('U')) {
-            detailViewActive = false;
-            if (!files.empty() && selectedIndex < files.size()) {
-                uploadSelected();
+    // Handle sync modal
+    if (syncModalActive) {
+        if (syncState == WigleSyncState::ERROR || syncState == WigleSyncState::COMPLETE) {
+            // Enter closes the modal after completion/error
+            if (keys.enter || M5Cardputer.Keyboard.isKeyPressed(KEY_BACKSPACE)) {
+                syncModalActive = false;
+                syncState = WigleSyncState::IDLE;
+                scanFiles();  // Rescan files after sync
             }
-            return;
+        } else {
+            // ESC cancels during sync
+            if (M5Cardputer.Keyboard.isKeyPressed(KEY_BACKSPACE)) {
+                cancelSync();
+            }
         }
+        return;  // Block other inputs during sync
+    }
+    
+    // Handle detail view input - any key closes
+    if (detailViewActive) {
         detailViewActive = false;
         return;
     }
@@ -233,11 +263,6 @@ void WigleMenu::handleInput() {
             return;
         }
         return;  // Ignore other keys when modal active
-    }
-    
-    // Handle connecting/uploading states - ignore input
-    if (connectingWiFi || uploadingFile) {
-        return;
     }
     
     // Backspace - go back
@@ -270,15 +295,9 @@ void WigleMenu::handleInput() {
         detailViewActive = true;
     }
     
-    // U key - upload selected file
-    if ((M5Cardputer.Keyboard.isKeyPressed('u') || M5Cardputer.Keyboard.isKeyPressed('U')) && !files.empty()) {
-        uploadSelected();
-    }
-    
-    // R key - refresh list
-    if (M5Cardputer.Keyboard.isKeyPressed('r') || M5Cardputer.Keyboard.isKeyPressed('R')) {
-        scanFiles();
-        Display::setTopBarMessage("WIGLE REFRESHED", 3000);
+    // S key triggers WiGLE sync
+    if (M5Cardputer.Keyboard.isKeyPressed('s') || M5Cardputer.Keyboard.isKeyPressed('S')) {
+        startSync();
     }
     
     // D key - nuke selected track
@@ -287,67 +306,6 @@ void WigleMenu::handleInput() {
             nukeConfirmActive = true;
             Display::setBottomOverlay("PERMANENT | NO UNDO");
         }
-    }
-}
-
-void WigleMenu::uploadSelected() {
-    if (files.empty() || selectedIndex >= files.size()) return;
-
-    // Prevent starting multiple parallel uploads
-    if (uploadTaskHandle != nullptr) {
-        Display::setTopBarMessage("WIGLE BUSY", 3000);
-        return;
-    }
-    // Guard: ensure enough contiguous heap for task stack (~8 KB)
-    if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < 12000) {
-        Display::setTopBarMessage("LOW HEAP FOR WIGLE", 3000);
-        return;
-    }
-    
-    WigleFileInfo file = files[selectedIndex];
-    
-    // Check if already uploaded
-    if (file.status == WigleFileStatus::UPLOADED) {
-        Display::setTopBarMessage("ALREADY UPLOADED", 3000);
-        return;
-    }
-
-    // Check for credentials
-    if (!WiGLE::hasCredentials()) {
-        Display::setTopBarMessage("NO WIGLE API KEY", 4000);
-        return;
-    }
-    
-    // Kick off upload in a dedicated FreeRTOS task with a larger stack.
-    // TLS handshakes can easily overflow Arduino's loopTask stack.
-    uploadTaskDone = false;
-    uploadTaskSuccess = false;
-    uploadTaskIndex = selectedIndex;
-    uploadTaskResultMsg[0] = '\0';
-
-    UploadTaskCtx* ctx = new UploadTaskCtx();
-    strncpy(ctx->fullPath, file.fullPath.c_str(), sizeof(ctx->fullPath) - 1);
-    ctx->fullPath[sizeof(ctx->fullPath) - 1] = '\0';
-    ctx->index = selectedIndex;
-
-    uploadingFile = true;
-    Display::setTopBarMessage("WIGLE UP...", 0);
-
-    // Pin to core 0 to keep Arduino loopTask responsive (loopTask usually runs on core 1).
-    BaseType_t ok = xTaskCreatePinnedToCore(
-        uploadTaskFn,
-        "wigle_upload",
-        6144,            // smaller stack to reduce heap use
-        ctx,
-        1,
-        &uploadTaskHandle,
-        0
-    );
-    if (ok != pdPASS) {
-        uploadTaskHandle = nullptr;
-        uploadingFile = false;
-        delete ctx;
-        Display::setTopBarMessage("WIGLE TASK FAIL", 4000);
     }
 }
 
@@ -364,42 +322,23 @@ void WigleMenu::formatSize(char* out, size_t len, uint32_t bytes) {
 
 void WigleMenu::getSelectedInfo(char* out, size_t len) {
     if (!out || len == 0) return;
-    if (files.empty() || selectedIndex >= files.size()) {
-        snprintf(out, len, "D0PAM1N3 SH0P: [U] [R] [D]");
-        return;
-    }
-    const WigleFileInfo& file = files[selectedIndex];
-    const char* status = (file.status == WigleFileStatus::UPLOADED) ? "[OK]" : "[--]";
-    char sizeBuf[12];
-    formatSize(sizeBuf, sizeof(sizeBuf), file.fileSize);
-    snprintf(out, len, "~%uNETS %s %s", (unsigned)file.networkCount, sizeBuf, status);
+    snprintf(out, len, "ENT=DET S=SYNC D=NUKE");
 }
 
 void WigleMenu::update() {
     if (!active) return;
-
-    // Handle completion of background upload task
-    if (uploadTaskHandle != nullptr && uploadTaskDone) {
-        // Task self-deletes; clear handle and report result in the UI thread.
-        uploadTaskHandle = nullptr;
-        uploadingFile = false;
-        connectingWiFi = false;
-
-        if (uploadTaskSuccess) {
-            if (!files.empty() && uploadTaskIndex < files.size()) {
-                files[uploadTaskIndex].status = WigleFileStatus::UPLOADED;
-            }
-            Display::setTopBarMessage(uploadTaskResultMsg[0] ? uploadTaskResultMsg : "WIGLE UPLOAD OK", 4000);
-        } else {
-            Display::setTopBarMessage(uploadTaskResultMsg[0] ? uploadTaskResultMsg : "WIGLE UPLOAD FAIL", 4000);
-        }
-
-        // Refresh the list to reflect new status
-        scanFiles();
-
-        uploadTaskDone = false;
+    
+    // Process sync state machine if active
+    if (syncModalActive && syncState != WigleSyncState::IDLE && 
+        syncState != WigleSyncState::COMPLETE && syncState != WigleSyncState::ERROR) {
+        processSyncState();
     }
-
+    
+    // Process async file scanning if in progress (not during sync)
+    if (!syncModalActive) {
+        processAsyncScan();
+    }
+    
     handleInput();
 }
 
@@ -410,20 +349,60 @@ void WigleMenu::draw(M5Canvas& canvas) {
     canvas.setTextColor(COLOR_FG);
     canvas.setTextSize(1);
     
-    // Empty state
-    if (files.empty()) {
-        canvas.setCursor(4, 35);
-        canvas.print("No WiGLE files found");
-        canvas.setCursor(4, 50);
-        canvas.print("Go wardriving first!");
-        canvas.setCursor(4, 65);
-        canvas.print("[W] for WARHOG mode.");
+    // Check if SD card is not available
+    if (!Config::isSDAvailable()) {
+        canvas.setCursor(4, 40);
+        canvas.print("NO SD CARD");
+        canvas.setCursor(4, 55);
+        canvas.print("INSERT AND RESTART");
         return;
     }
     
+    // Draw sync modal FIRST - takes precedence over empty files message
+    if (syncModalActive) {
+        drawSyncModal(canvas);
+        return;
+    }
+    
+    // Empty state
+    if (files.empty()) {
+        canvas.setCursor(4, 36);
+        canvas.print("NO WIGLE FILES");
+        canvas.setCursor(4, 52);
+        canvas.print("PRESS [W] FOR WARHOG");
+        canvas.setCursor(4, 68);
+        canvas.print("[S] TO SYNC");
+        return;
+    }
+    
+    // Summary line
+    uint16_t total = files.size();
+    uint16_t uploaded = 0;
+    uint32_t netSum = 0;
+    for (const auto& file : files) {
+        if (file.status == WigleFileStatus::UPLOADED) uploaded++;
+        netSum += file.networkCount;
+    }
+    uint16_t local = total - uploaded;
+    char summary[64];
+    snprintf(summary, sizeof(summary), "WIGLE %u UP %u LOC %u NETS~%lu",
+             (unsigned)total, (unsigned)uploaded, (unsigned)local, (unsigned long)netSum);
+    canvas.setCursor(4, 2);
+    canvas.print(summary);
+
+    // Header row
+    canvas.setCursor(4, 12);
+    canvas.print("FILE");
+    canvas.setCursor(105, 12);
+    canvas.print("ST");
+    canvas.setCursor(135, 12);
+    canvas.print("NETS");
+    canvas.setCursor(210, 12);
+    canvas.print("SIZE");
+    
     // File list (always drawn, modals overlay on top)
-    int y = 2;
-    int lineHeight = 18;
+    int y = 22;
+    int lineHeight = 16;
     
     for (uint8_t i = scrollOffset; i < files.size() && i < scrollOffset + VISIBLE_ITEMS; i++) {
         const WigleFileInfo& file = files[i];
@@ -451,22 +430,25 @@ void WigleMenu::draw(M5Canvas& canvas) {
         }
         
         // Network count and size
-        canvas.setCursor(140, y);
+        canvas.setCursor(135, y);
         char sizeBuf[12];
         formatSize(sizeBuf, sizeof(sizeBuf), file.fileSize);
-        canvas.printf("~%u %s", (unsigned)file.networkCount, sizeBuf);
+        canvas.printf("~%u", (unsigned)file.networkCount);
+        
+        canvas.setCursor(210, y);
+        canvas.print(sizeBuf);
         
         y += lineHeight;
     }
     
     // Scroll indicators
     if (scrollOffset > 0) {
-        canvas.setCursor(canvas.width() - 10, 2);
+        canvas.setCursor(canvas.width() - 10, 22);
         canvas.setTextColor(COLOR_FG);
         canvas.print("^");
     }
     if (scrollOffset + VISIBLE_ITEMS < files.size()) {
-        canvas.setCursor(canvas.width() - 10, 2 + (VISIBLE_ITEMS - 1) * lineHeight);
+        canvas.setCursor(canvas.width() - 10, 22 + (VISIBLE_ITEMS - 1) * lineHeight);
         canvas.setTextColor(COLOR_FG);
         canvas.print("v");
     }
@@ -480,9 +462,14 @@ void WigleMenu::draw(M5Canvas& canvas) {
         drawDetailView(canvas);
     }
     
+    if (syncModalActive) {
+        drawSyncModal(canvas);
+    }
 }
 
 void WigleMenu::drawDetailView(M5Canvas& canvas) {
+    if (files.empty() || selectedIndex >= files.size()) return;
+
     const WigleFileInfo& file = files[selectedIndex];
     
     // Modal box dimensions - matches other confirmation dialogs
@@ -516,30 +503,7 @@ void WigleMenu::drawDetailView(M5Canvas& canvas) {
     canvas.drawString(statusText, boxX + boxW / 2, boxY + 40);
     
     // Action hint
-    canvas.drawString("[U]PLOAD  [ANY]CLOSE", boxX + boxW / 2, boxY + 56);
-    
-    canvas.setTextDatum(top_left);
-}
-
-void WigleMenu::drawConnecting(M5Canvas& canvas) {
-    const int boxW = 160;
-    const int boxH = 50;
-    const int boxX = (canvas.width() - boxW) / 2;
-    const int boxY = (canvas.height() - boxH) / 2 - 5;
-    
-    canvas.fillRoundRect(boxX - 2, boxY - 2, boxW + 4, boxH + 4, 8, COLOR_BG);
-    canvas.fillRoundRect(boxX, boxY, boxW, boxH, 8, COLOR_FG);
-    
-    canvas.setTextColor(COLOR_BG, COLOR_FG);
-    canvas.setTextDatum(top_center);
-    
-    if (connectingWiFi) {
-        canvas.drawString("CONNECTING...", boxX + boxW / 2, boxY + 12);
-    } else if (uploadingFile) {
-        canvas.drawString("UPLOADING...", boxX + boxW / 2, boxY + 12);
-    }
-    
-    canvas.drawString(WiGLE::getStatus(), boxX + boxW / 2, boxY + 30);
+    canvas.drawString("PRESS [S] TO SYNC", boxX + boxW / 2, boxY + 56);
     
     canvas.setTextDatum(top_left);
 }
@@ -608,10 +572,251 @@ void WigleMenu::nukeTrack() {
     scanFiles();
     
     // Adjust selection if needed
-    if (selectedIndex >= files.size() && selectedIndex > 0) {
+    if (files.empty()) {
+        selectedIndex = 0;
+        scrollOffset = 0;
+    } else if (selectedIndex >= files.size()) {
         selectedIndex = files.size() - 1;
     }
     if (scrollOffset > selectedIndex) {
         scrollOffset = selectedIndex;
     }
+}
+
+// ============================================================================
+// WiGLE Sync Operations
+// ============================================================================
+
+void WigleMenu::onSyncProgress(const char* status, uint8_t progress, uint8_t total) {
+    // Update sync state for UI
+    strncpy(syncStatusText, status, sizeof(syncStatusText) - 1);
+    syncStatusText[sizeof(syncStatusText) - 1] = '\0';
+    syncProgress = progress;
+    syncTotal = total;
+}
+
+bool WigleMenu::connectToWiFi() {
+    const char* ssid = Config::wifi().otaSSID;
+    const char* password = Config::wifi().otaPassword;
+    
+    if (!ssid || ssid[0] == '\0') {
+        strncpy(syncError, "NO WIFI SSID CONFIG", sizeof(syncError) - 1);
+        return false;
+    }
+    
+    Serial.printf("[WIGLE_MENU] Connecting to WiFi: %s\n", ssid);
+    strncpy(syncStatusText, "CONNECTING WIFI...", sizeof(syncStatusText) - 1);
+    
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, password);
+    
+    unsigned long startTime = millis();
+    const unsigned long timeout = 15000;  // 15 second timeout
+    
+    while (WiFi.status() != WL_CONNECTED && (millis() - startTime) < timeout) {
+        delay(100);
+        yield();
+    }
+    
+    if (WiFi.status() != WL_CONNECTED) {
+        strncpy(syncError, "WIFI CONNECT FAILED", sizeof(syncError) - 1);
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+        return false;
+    }
+    
+    Serial.printf("[WIGLE_MENU] WiFi connected, IP: %s\n", WiFi.localIP().toString().c_str());
+    return true;
+}
+
+void WigleMenu::disconnectWiFi() {
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    Serial.println("[WIGLE_MENU] WiFi disconnected");
+}
+
+void WigleMenu::startSync() {
+    Serial.println("[WIGLE_MENU] Starting WiGLE sync...");
+    
+    // Reset sync state
+    syncModalActive = true;
+    syncState = WigleSyncState::CONNECTING_WIFI;
+    syncStatusText[0] = '\0';
+    syncError[0] = '\0';
+    syncProgress = 0;
+    syncTotal = 0;
+    syncUploaded = 0;
+    syncFailed = 0;
+    syncSkipped = 0;
+    syncStatsFetched = false;
+    syncStartTime = millis();
+    
+    // Pre-flight checks
+    if (!WiGLE::hasCredentials()) {
+        strncpy(syncError, "NO WIGLE CREDENTIALS", sizeof(syncError) - 1);
+        syncState = WigleSyncState::ERROR;
+        return;
+    }
+    
+    // Free memory before heavy operations
+    files.clear();
+    files.shrink_to_fit();
+    WiGLE::freeUploadedListMemory();
+    
+    Serial.printf("[WIGLE_MENU] Heap after freeing: %u\n", (unsigned int)ESP.getFreeHeap());
+}
+
+void WigleMenu::cancelSync() {
+    Serial.println("[WIGLE_MENU] Sync cancelled");
+    
+    // Clean up
+    disconnectWiFi();
+    syncModalActive = false;
+    syncState = WigleSyncState::IDLE;
+    
+    // Rescan files
+    scanFiles();
+}
+
+void WigleMenu::processSyncState() {
+    if (!syncModalActive || syncState == WigleSyncState::IDLE) {
+        return;
+    }
+    
+    switch (syncState) {
+        case WigleSyncState::CONNECTING_WIFI:
+            strncpy(syncStatusText, "CONNECTING WIFI...", sizeof(syncStatusText) - 1);
+            if (connectToWiFi()) {
+                syncState = WigleSyncState::FREEING_MEMORY;
+            } else {
+                syncState = WigleSyncState::ERROR;
+            }
+            break;
+            
+        case WigleSyncState::FREEING_MEMORY:
+            strncpy(syncStatusText, "PREPARING...", sizeof(syncStatusText) - 1);
+            // Check heap
+            if (!WiGLE::canSync()) {
+                strncpy(syncError, "LOW HEAP", sizeof(syncError) - 1);
+                syncState = WigleSyncState::ERROR;
+            } else {
+                syncState = WigleSyncState::UPLOADING;
+            }
+            break;
+            
+        case WigleSyncState::UPLOADING:
+            {
+                // Run sync (blocking but with progress callback)
+                strncpy(syncStatusText, "SYNCING...", sizeof(syncStatusText) - 1);
+                
+                WigleSyncResult result = WiGLE::syncFiles(onSyncProgress);
+                
+                syncUploaded = result.uploaded;
+                syncFailed = result.failed;
+                syncSkipped = result.skipped;
+                syncStatsFetched = result.statsFetched;
+                
+                if (result.error[0] != '\0') {
+                    strncpy(syncError, result.error, sizeof(syncError) - 1);
+                }
+                
+                syncState = WigleSyncState::COMPLETE;
+            }
+            break;
+            
+        case WigleSyncState::FETCHING_STATS:
+            // Handled within UPLOADING state via syncFiles
+            break;
+            
+        case WigleSyncState::COMPLETE:
+            // Stay in complete state until user dismisses
+            disconnectWiFi();
+            break;
+            
+        case WigleSyncState::ERROR:
+            // Stay in error state until user dismisses
+            disconnectWiFi();
+            break;
+            
+        default:
+            break;
+    }
+}
+
+void WigleMenu::drawSyncModal(M5Canvas& canvas) {
+    // Modal box dimensions
+    const int boxW = 200;
+    const int boxH = 85;
+    const int boxX = (canvas.width() - boxW) / 2;
+    const int boxY = (canvas.height() - boxH) / 2 - 5;
+    
+    // Black border then pink fill
+    canvas.fillRoundRect(boxX - 2, boxY - 2, boxW + 4, boxH + 4, 8, COLOR_BG);
+    canvas.fillRoundRect(boxX, boxY, boxW, boxH, 8, COLOR_FG);
+    
+    // Black text on pink background
+    canvas.setTextColor(COLOR_BG, COLOR_FG);
+    canvas.setTextDatum(top_center);
+    canvas.setTextSize(1);
+    
+    int centerX = canvas.width() / 2;
+    
+    // Title
+    canvas.drawString("WIGLE SYNC", centerX, boxY + 6);
+    
+    if (syncState == WigleSyncState::ERROR) {
+        // Error state
+        canvas.drawString("!! ERROR !!", centerX, boxY + 24);
+        canvas.drawString(syncError, centerX, boxY + 42);
+        canvas.drawString("[ENTER] CLOSE", centerX, boxY + 68);
+    } else if (syncState == WigleSyncState::COMPLETE) {
+        // Complete state
+        canvas.drawString("SYNC COMPLETE", centerX, boxY + 24);
+        
+        char stats[48];
+        snprintf(stats, sizeof(stats), "UP:%u FAIL:%u SKIP:%u", 
+                 (unsigned)syncUploaded, (unsigned)syncFailed, (unsigned)syncSkipped);
+        canvas.drawString(stats, centerX, boxY + 42);
+        
+        // Stats status
+        const char* statsMsg = syncStatsFetched ? "STATS UPDATED" : "STATS FAILED";
+        canvas.drawString(statsMsg, centerX, boxY + 54);
+        
+        canvas.drawString("[ENTER] CLOSE", centerX, boxY + 68);
+    } else {
+        // In progress
+        canvas.drawString(syncStatusText, centerX, boxY + 24);
+        
+        // Progress bar
+        if (syncTotal > 0) {
+            const int barW = 160;
+            const int barH = 10;
+            const int barX = boxX + (boxW - barW) / 2;
+            const int barY = boxY + 42;
+            
+            // Background
+            canvas.fillRect(barX, barY, barW, barH, COLOR_BG);
+            
+            // Fill
+            int fillW = (barW * syncProgress) / syncTotal;
+            if (fillW > 0) {
+                canvas.fillRect(barX, barY, fillW, barH, COLOR_FG);
+            }
+            
+            // Progress text
+            char progText[16];
+            snprintf(progText, sizeof(progText), "%u/%u", (unsigned)syncProgress, (unsigned)syncTotal);
+            canvas.drawString(progText, centerX, barY + barH + 4);
+        } else {
+            // Heap display
+            char heapText[32];
+            snprintf(heapText, sizeof(heapText), "HEAP: %uKB", 
+                     (unsigned)(ESP.getFreeHeap() / 1024));
+            canvas.drawString(heapText, centerX, boxY + 42);
+        }
+        
+        canvas.drawString("[ESC] CANCEL", centerX, boxY + 68);
+    }
+    
+    canvas.setTextDatum(top_left);
 }

@@ -4,6 +4,7 @@
 #include "settings_menu.h"
 #include "display.h"
 #include "../core/config.h"
+#include "../core/sd_layout.h"
 #include "../core/sdlog.h"
 #include "../gps/gps.h"
 #include <M5Cardputer.h>
@@ -28,6 +29,7 @@ enum SettingId : uint8_t {
     SET_DIM_AFTER,
     SET_DIM_LEVEL,
     SET_G0_ACTION,
+    SET_BOOT_MODE,
     SET_WIFI_SSID,
     SET_WIFI_PASS,
     SET_WPASEC_STATUS,
@@ -76,7 +78,8 @@ static const EntryData kDirectEntries[] = {
     {SET_SOUND, "SOUND", SettingType::TOGGLE, 0, 1, 1, "", "BEEPS AND BOOPS"},
     {SET_DIM_AFTER, "DIM AFTER", SettingType::VALUE, 0, 300, 10, "S", "0 = NEVER DIM"},
     {SET_DIM_LEVEL, "DIM LEVEL", SettingType::VALUE, 0, 50, 5, "%", "0 = SCREEN OFF"},
-    {SET_G0_ACTION, "G0 ACTION", SettingType::VALUE, 0, (int)G0_ACTION_COUNT - 1, 1, "", "G0 HOTKEY"}
+    {SET_G0_ACTION, "G0 ACTION", SettingType::VALUE, 0, (int)G0_ACTION_COUNT - 1, 1, "", "G0 HOTKEY"},
+    {SET_BOOT_MODE, "BOOT MODE", SettingType::VALUE, 0, (int)BOOT_MODE_COUNT - 1, 1, "", "AUTO MODE ON BOOT"}
 };
 
 static const RootEntry kRootEntries[] = {
@@ -86,8 +89,9 @@ static const RootEntry kRootEntries[] = {
     {"DIM AFTER", "0 = NEVER DIM", false, GROUP_NONE, SET_DIM_AFTER},
     {"DIM LEVEL", "0 = SCREEN OFF", false, GROUP_NONE, SET_DIM_LEVEL},
     {"G0 ACTION", "G0 HOTKEY", false, GROUP_NONE, SET_G0_ACTION},
+    {"BOOT MODE", "AUTO MODE ON BOOT", false, GROUP_NONE, SET_BOOT_MODE},
     {"NETWORK", "WIFI CREDENTIALS", true, GROUP_NET, SET_THEME},
-    {"INTEG", "API KEYS", true, GROUP_INTEG, SET_THEME},
+    {"INTEGRATION", "API KEYS", true, GROUP_INTEG, SET_THEME},
     {"RADIO", "WIFI SCAN/ATTACK TIMING", true, GROUP_RADIO, SET_THEME},
     {"GPS", "GPS MODULE SETTINGS", true, GROUP_GPS, SET_THEME},
     {"BLE", "BLE ATTACK TUNING", true, GROUP_BLE, SET_THEME}
@@ -136,9 +140,17 @@ static const EntryData kLogEntries[] = {
 static const char* const kG0ActionLabels[G0_ACTION_COUNT] = {
     "SCREEN",
     "OINK",
-    "DNHAM",
+    "DNOHAM",
     "SPECTRM",
-    "PIGSYNC"
+    "PIGSYNC",
+    "IDLE"
+};
+
+static const char* const kBootModeLabels[BOOT_MODE_COUNT] = {
+    "IDLE",
+    "OINK",
+    "DN0HAM",
+    "WARHOG"
 };
 
 static const uint32_t kGpsBaudRates[] = {9600, 38400, 57600, 115200};
@@ -155,7 +167,8 @@ static bool isTextEditable(SettingId id) {
 
 static bool isPersonalitySetting(SettingId id) {
     return id == SET_THEME || id == SET_BRIGHTNESS || id == SET_SOUND ||
-           id == SET_DIM_AFTER || id == SET_DIM_LEVEL || id == SET_G0_ACTION;
+           id == SET_DIM_AFTER || id == SET_DIM_LEVEL || id == SET_G0_ACTION ||
+           id == SET_BOOT_MODE;
 }
 
 static bool isConfigSetting(SettingId id) {
@@ -221,7 +234,7 @@ static const char* getGroupLabel(GroupId group) {
         case GROUP_NET:
             return "NETWORK";
         case GROUP_INTEG:
-            return "INTEG";
+            return "INTEGRATION";
         case GROUP_RADIO:
             return "RADIO";
         case GROUP_GPS:
@@ -253,7 +266,7 @@ static uint32_t getGpsBaudForIndex(int index) {
 
 static void formatWpaSecStatus(char* out, size_t len) {
     if (!out || len == 0) return;
-    const char* key = Config::wifi().wpaSecKey.c_str();
+    const char* key = Config::wifi().wpaSecKey;
     size_t keyLen = strlen(key);
     if (keyLen == 0) {
         strncpy(out, "UNSET", len - 1);
@@ -280,7 +293,7 @@ static void formatWpaSecStatus(char* out, size_t len) {
 
 static void formatWigleNameStatus(char* out, size_t len) {
     if (!out || len == 0) return;
-    const char* name = Config::wifi().wigleApiName.c_str();
+    const char* name = Config::wifi().wigleApiName;
     size_t nameLen = strlen(name);
     if (nameLen == 0) {
         strncpy(out, "UNSET", len - 1);
@@ -305,7 +318,7 @@ static void formatWigleNameStatus(char* out, size_t len) {
 
 static void formatWigleTokenStatus(char* out, size_t len) {
     if (!out || len == 0) return;
-    const char* token = Config::wifi().wigleApiToken.c_str();
+    const char* token = Config::wifi().wigleApiToken;
     size_t tokenLen = strlen(token);
     if (tokenLen == 0) {
         strncpy(out, "UNSET", len - 1);
@@ -335,11 +348,11 @@ static void getSettingTextBuf(SettingId id, char* out, size_t len) {
     out[0] = '\0';
     switch (id) {
         case SET_WIFI_SSID:
-            strncpy(out, Config::wifi().otaSSID.c_str(), len - 1);
+            strncpy(out, Config::wifi().otaSSID, len - 1);
             out[len - 1] = '\0';
             return;
         case SET_WIFI_PASS:
-            strncpy(out, Config::wifi().otaPassword.c_str(), len - 1);
+            strncpy(out, Config::wifi().otaPassword, len - 1);
             out[len - 1] = '\0';
             return;
         case SET_WPASEC_STATUS:
@@ -354,6 +367,23 @@ static void getSettingTextBuf(SettingId id, char* out, size_t len) {
         default:
             out[0] = '\0';
             return;
+    }
+}
+
+static size_t getTextLimit(SettingId id) {
+    switch (id) {
+        case SET_WIFI_SSID:
+            return sizeof(Config::wifi().otaSSID) - 1;
+        case SET_WIFI_PASS:
+            return sizeof(Config::wifi().otaPassword) - 1;
+        case SET_WPASEC_STATUS:
+            return sizeof(Config::wifi().wpaSecKey) - 1;
+        case SET_WIGLE_NAME_STATUS:
+            return sizeof(Config::wifi().wigleApiName) - 1;
+        case SET_WIGLE_TOKEN_STATUS:
+            return sizeof(Config::wifi().wigleApiToken) - 1;
+        default:
+            return 32;
     }
 }
 
@@ -394,6 +424,13 @@ static const char* getG0ActionLabel(int idx) {
     return kG0ActionLabels[idx];
 }
 
+static const char* getBootModeLabel(int idx) {
+    if (idx < 0 || idx >= (int)BOOT_MODE_COUNT) {
+        return kBootModeLabels[0];
+    }
+    return kBootModeLabels[idx];
+}
+
 static int getSettingValue(SettingId id) {
     switch (id) {
         case SET_THEME:
@@ -408,6 +445,8 @@ static int getSettingValue(SettingId id) {
             return Config::personality().dimLevel;
         case SET_G0_ACTION:
             return static_cast<int>(Config::personality().g0Action);
+        case SET_BOOT_MODE:
+            return static_cast<int>(Config::personality().bootMode);
         case SET_CH_HOP:
             return Config::wifi().channelHopInterval;
         case SET_LOCK_TIME:
@@ -486,6 +525,15 @@ static bool setSettingValue(SettingId id, int value) {
             Config::personality().g0Action = static_cast<G0Action>(newVal);
             return true;
         }
+        case SET_BOOT_MODE: {
+            uint8_t newVal = static_cast<uint8_t>(value);
+            if (newVal >= BOOT_MODE_COUNT) {
+                newVal = static_cast<uint8_t>(BootMode::IDLE);
+            }
+            if (Config::personality().bootMode == static_cast<BootMode>(newVal)) return false;
+            Config::personality().bootMode = static_cast<BootMode>(newVal);
+            return true;
+        }
         case SET_CH_HOP: {
             uint16_t newVal = static_cast<uint16_t>(value);
             if (Config::wifi().channelHopInterval == newVal) return false;
@@ -538,12 +586,14 @@ static bool setSettingValue(SettingId id, int value) {
             uint8_t newVal = static_cast<uint8_t>(value);
             if (Config::gps().rxPin == newVal) return false;
             Config::gps().rxPin = newVal;
+            Config::gps().source = GPSSource::CUSTOM;
             return true;
         }
         case SET_GPS_TX: {
             uint8_t newVal = static_cast<uint8_t>(value);
             if (Config::gps().txPin == newVal) return false;
             Config::gps().txPin = newVal;
+            Config::gps().source = GPSSource::CUSTOM;
             return true;
         }
         case SET_GPS_TZ: {
@@ -578,12 +628,29 @@ static bool setSettingValue(SettingId id, int value) {
 static bool setSettingText(SettingId id, const String& value) {
     switch (id) {
         case SET_WIFI_SSID:
-            if (Config::wifi().otaSSID == value) return false;
-            Config::wifi().otaSSID = value;
+            if (strcmp(Config::wifi().otaSSID, value.c_str()) == 0) return false;
+            strncpy(Config::wifi().otaSSID, value.c_str(), sizeof(Config::wifi().otaSSID) - 1);
+            Config::wifi().otaSSID[sizeof(Config::wifi().otaSSID) - 1] = '\0';
             return true;
         case SET_WIFI_PASS:
-            if (Config::wifi().otaPassword == value) return false;
-            Config::wifi().otaPassword = value;
+            if (strcmp(Config::wifi().otaPassword, value.c_str()) == 0) return false;
+            strncpy(Config::wifi().otaPassword, value.c_str(), sizeof(Config::wifi().otaPassword) - 1);
+            Config::wifi().otaPassword[sizeof(Config::wifi().otaPassword) - 1] = '\0';
+            return true;
+        case SET_WPASEC_STATUS:
+            if (strcmp(Config::wifi().wpaSecKey, value.c_str()) == 0) return false;
+            strncpy(Config::wifi().wpaSecKey, value.c_str(), sizeof(Config::wifi().wpaSecKey) - 1);
+            Config::wifi().wpaSecKey[sizeof(Config::wifi().wpaSecKey) - 1] = '\0';
+            return true;
+        case SET_WIGLE_NAME_STATUS:
+            if (strcmp(Config::wifi().wigleApiName, value.c_str()) == 0) return false;
+            strncpy(Config::wifi().wigleApiName, value.c_str(), sizeof(Config::wifi().wigleApiName) - 1);
+            Config::wifi().wigleApiName[sizeof(Config::wifi().wigleApiName) - 1] = '\0';
+            return true;
+        case SET_WIGLE_TOKEN_STATUS:
+            if (strcmp(Config::wifi().wigleApiToken, value.c_str()) == 0) return false;
+            strncpy(Config::wifi().wigleApiToken, value.c_str(), sizeof(Config::wifi().wigleApiToken) - 1);
+            Config::wifi().wigleApiToken[sizeof(Config::wifi().wigleApiToken) - 1] = '\0';
             return true;
         default:
             return false;
@@ -591,7 +658,7 @@ static bool setSettingText(SettingId id, const String& value) {
 }
 
 static String getSettingText(SettingId id) {
-    char buf[48];
+    char buf[80];
     getSettingTextBuf(id, buf, sizeof(buf));
     return String(buf);
 }
@@ -684,7 +751,7 @@ void SettingsMenu::saveIfDirty(bool showToast) {
             if (Config::gps().enabled) {
                 GPS::reinit(origGpsRxPin, origGpsTxPin, origGpsBaud);
                 if (showToast) {
-                    Display::notify(NoticeKind::STATUS, "GPS reinit");
+                    Display::notify(NoticeKind::STATUS, "GPS REINIT");
                 }
             }
         }
@@ -837,23 +904,25 @@ void SettingsMenu::handleInput() {
                 case SettingType::ACTION:
                     if (entry.id == SET_WPASEC_LOAD) {
                         if (Config::loadWpaSecKeyFromFile()) {
-                            Display::notify(NoticeKind::STATUS, "Key loaded");
+                            Display::notify(NoticeKind::STATUS, "KEY LOADED");
                         } else if (!Config::isSDAvailable()) {
-                            Display::notify(NoticeKind::WARNING, "No SD card");
-                        } else if (!SD.exists("/wpasec_key.txt")) {
-                            Display::notify(NoticeKind::WARNING, "No key file");
+                            Display::notify(NoticeKind::WARNING, "NO SD CARD");
+                        } else if (!SD.exists(SDLayout::wpasecKeyPath()) &&
+                                   !SD.exists(SDLayout::legacyWpasecKeyPath())) {
+                            Display::notify(NoticeKind::WARNING, "NO KEY FILE");
                         } else {
-                            Display::notify(NoticeKind::WARNING, "Invalid key");
+                            Display::notify(NoticeKind::WARNING, "INVALID KEY");
                         }
                     } else if (entry.id == SET_WIGLE_LOAD) {
                         if (Config::loadWigleKeyFromFile()) {
-                            Display::notify(NoticeKind::STATUS, "WiGLE key loaded");
+                            Display::notify(NoticeKind::STATUS, "WIGLE KEY LOADED");
                         } else if (!Config::isSDAvailable()) {
-                            Display::notify(NoticeKind::WARNING, "No SD card");
-                        } else if (!SD.exists("/wigle_key.txt")) {
-                            Display::notify(NoticeKind::WARNING, "No key file");
+                            Display::notify(NoticeKind::WARNING, "NO SD CARD");
+                        } else if (!SD.exists(SDLayout::wigleKeyPath()) &&
+                                   !SD.exists(SDLayout::legacyWigleKeyPath())) {
+                            Display::notify(NoticeKind::WARNING, "NO KEY FILE");
                         } else {
-                            Display::notify(NoticeKind::WARNING, "Invalid format");
+                            Display::notify(NoticeKind::WARNING, "INVALID FORMAT");
                         }
                     }
                     break;
@@ -939,9 +1008,10 @@ void SettingsMenu::handleTextInput() {
         }
     }
 
-    if (textBuffer.length() < 32) {
+    const size_t limit = getTextLimit(static_cast<SettingId>(textEditId));
+    if (textBuffer.length() < limit) {
         for (char c : keys.word) {
-            if (c >= 32 && c <= 126 && c != '`' && textBuffer.length() < 32) {
+            if (c >= 32 && c <= 126 && c != '`' && textBuffer.length() < limit) {
                 textBuffer += c;
             }
         }
@@ -1017,6 +1087,14 @@ void SettingsMenu::draw(M5Canvas& canvas) {
                             snprintf(valBuf, sizeof(valBuf), "[%s]", actionLabel);
                         } else {
                             strncpy(valBuf, actionLabel, sizeof(valBuf) - 1);
+                            valBuf[sizeof(valBuf) - 1] = '\0';
+                        }
+                    } else if (direct->id == SET_BOOT_MODE) {
+                        const char* modeLabel = getBootModeLabel(value);
+                        if (selected && editing) {
+                            snprintf(valBuf, sizeof(valBuf), "[%s]", modeLabel);
+                        } else {
+                            strncpy(valBuf, modeLabel, sizeof(valBuf) - 1);
                             valBuf[sizeof(valBuf) - 1] = '\0';
                         }
                     } else if (selected && editing) {

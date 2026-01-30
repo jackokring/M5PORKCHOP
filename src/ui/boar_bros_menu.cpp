@@ -7,6 +7,7 @@
 #include <string.h>
 #include "display.h"
 #include "../modes/oink.h"
+#include "../core/sd_layout.h"
 
 // Static member initialization
 std::vector<BroInfo> BoarBrosMenu::bros;
@@ -15,8 +16,6 @@ uint8_t BoarBrosMenu::scrollOffset = 0;
 bool BoarBrosMenu::active = false;
 bool BoarBrosMenu::keyWasPressed = false;
 bool BoarBrosMenu::deleteConfirmActive = false;
-
-static const char* BOAR_BROS_FILE = "/boar_bros.txt";
 
 void BoarBrosMenu::init() {
     bros.clear();
@@ -43,12 +42,13 @@ void BoarBrosMenu::hide() {
 void BoarBrosMenu::loadBros() {
     bros.clear();
     
-    if (!SD.exists(BOAR_BROS_FILE)) {
+    const char* boarPath = SDLayout::boarBrosPath();
+    if (!SD.exists(boarPath)) {
         Serial.println("[BOAR_BROS] No file found");
         return;
     }
     
-    File f = SD.open(BOAR_BROS_FILE, FILE_READ);
+    File f = SD.open(boarPath, FILE_READ);
     if (!f) {
         Serial.println("[BOAR_BROS] Failed to open file");
         return;

@@ -3,6 +3,7 @@
 #include "crash_viewer.h"
 #include "display.h"
 #include "../core/config.h"
+#include "../core/sd_layout.h"
 #include <M5Cardputer.h>
 #include <SD.h>
 #include <algorithm>
@@ -74,15 +75,17 @@ void CrashViewer::scanCrashFiles() {
         return;
     }
 
-    if (!SD.exists("/crash")) {
+    const char* crashDir = SDLayout::crashDir();
+    if (!SD.exists(crashDir)) {
         return;
     }
 
-    File dir = SD.open("/crash");
+    File dir = SD.open(crashDir);
     if (!dir) {
         return;
     }
 
+    uint8_t yieldCounter = 0;
     while (true) {
         File entry = dir.openNextFile();
         if (!entry) break;
@@ -96,20 +99,24 @@ void CrashViewer::scanCrashFiles() {
                 continue;
             }
 
-            String path = name;
-            if (!path.startsWith("/")) {
-                if (path.startsWith("crash/")) {
-                    path = "/" + path;
-                } else {
-                    path = "/crash/" + path;
-                }
+            String base = name;
+            int slash = base.lastIndexOf('/');
+            if (slash >= 0) {
+                base = base.substring(slash + 1);
             }
+            String path = String(crashDir) + "/" + base;
             CrashEntry entryInfo;
             entryInfo.path = path;
             entryInfo.timestamp = lastWrite;
             crashFiles.push_back(entryInfo);
         } else {
             entry.close();
+        }
+        
+        // Yield every 10 files to prevent WDT timeout
+        if (++yieldCounter >= 10) {
+            yieldCounter = 0;
+            yield();
         }
     }
 
@@ -135,6 +142,7 @@ void CrashViewer::loadCrashFile(const String& path) {
     }
 
     std::vector<String> allLines;
+    allLines.reserve(MAX_LOG_LINES);  // FIX: Pre-allocate to avoid realloc fragmentation
     while (f.available()) {
         String line = f.readStringUntil('\n');
         line.trim();
@@ -180,15 +188,17 @@ void CrashViewer::hide() {
 }
 
 void CrashViewer::nukeCrashFiles() {
-    if (!SD.exists("/crash")) {
+    const char* crashDir = SDLayout::crashDir();
+    if (!SD.exists(crashDir)) {
         return;
     }
 
-    File dir = SD.open("/crash");
+    File dir = SD.open(crashDir);
     if (!dir) {
         return;
     }
 
+    uint8_t yieldCounter = 0;
     while (true) {
         File entry = dir.openNextFile();
         if (!entry) break;
@@ -197,20 +207,21 @@ void CrashViewer::nukeCrashFiles() {
             String name = entry.name();
             entry.close();
 
-            String path = name;
-            if (!path.startsWith("/")) {
-                if (path.startsWith("crash/")) {
-                    path = "/" + path;
-                } else {
-                    path = "/crash/" + path;
-                }
-            }
+            int slash = name.lastIndexOf('/');
+            String base = (slash >= 0) ? name.substring(slash + 1) : name;
+            String path = String(crashDir) + "/" + base;
 
             if (path.endsWith(".txt") || path.endsWith(".elf")) {
                 SD.remove(path.c_str());
             }
         } else {
             entry.close();
+        }
+        
+        // Yield every 10 files to prevent WDT timeout
+        if (++yieldCounter >= 10) {
+            yieldCounter = 0;
+            yield();
         }
     }
 
@@ -226,7 +237,7 @@ void CrashViewer::drawList(M5Canvas& canvas) {
 
     if (crashFiles.empty()) {
         canvas.drawString("NO CRASH FILES", 2, 8);
-        canvas.drawString("CHECK /crash", 2, 20);
+        canvas.drawString("CHECK CRASH DIR", 2, 20);
         return;
     }
 
@@ -265,7 +276,7 @@ void CrashViewer::drawList(M5Canvas& canvas) {
         int thumbHeight = max(10, (int)(barHeight * VISIBLE_LINES / count));
         int thumbY = barY + (barHeight - thumbHeight) * listScroll / (count - VISIBLE_LINES);
 
-        canvas.fillRect(DISPLAY_W - 4, barY, 3, barHeight, 0x2104);
+        canvas.fillRect(DISPLAY_W - 4, barY, 3, barHeight, COLOR_BG);
         canvas.fillRect(DISPLAY_W - 4, thumbY, 3, thumbHeight, COLOR_FG);
     }
 }
@@ -299,7 +310,7 @@ void CrashViewer::drawFile(M5Canvas& canvas) {
         int thumbHeight = max(10, (int)(barHeight * VISIBLE_LINES / totalLines));
         int thumbY = barY + (barHeight - thumbHeight) * fileScroll / (totalLines - VISIBLE_LINES);
 
-        canvas.fillRect(DISPLAY_W - 4, barY, 3, barHeight, 0x2104);
+        canvas.fillRect(DISPLAY_W - 4, barY, 3, barHeight, COLOR_BG);
         canvas.fillRect(DISPLAY_W - 4, thumbY, 3, thumbHeight, COLOR_FG);
     }
 }
@@ -321,7 +332,9 @@ void CrashViewer::drawNukeConfirm(M5Canvas& canvas) {
     int centerX = canvas.width() / 2;
 
     canvas.drawString("!! SCORCHED EARTH !!", centerX, boxY + 8);
-    canvas.drawString("rm -rf /crash/*", centerX, boxY + 22);
+    char cmd[48];
+    snprintf(cmd, sizeof(cmd), "rm -rf %s/*", SDLayout::crashDir());
+    canvas.drawString(cmd, centerX, boxY + 22);
     canvas.drawString("THIS KILLS THE DUMPS.", centerX, boxY + 36);
     canvas.drawString("[Y] DO IT  [N] ABORT", centerX, boxY + 54);
 }

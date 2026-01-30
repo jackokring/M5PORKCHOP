@@ -3,6 +3,8 @@
 
 #include <Arduino.h>
 #include <TinyGPSPlus.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 struct GPSData {
     double latitude;
@@ -26,20 +28,22 @@ public:
     static void update();
     static void sleep();
     static void wake();
+    static void ensureContinuousMode();  // Force continuous mode regardless of software state
     
     static bool hasFix();
     static GPSData getData();
     static String getLocationString();
     static String getTimeString();
     static void getTimeString(char* out, size_t len);
+    static bool getLocationString(char* out, size_t len); // Non-allocating version
     
     // Power management
     static void setPowerMode(bool active);
     static bool isActive();
     
     // Statistics
-    static uint32_t getFixCount() { return fixCount; }
-    static uint32_t getLastFixTime() { return lastFixTime; }
+    static uint32_t getFixCount();
+    static uint32_t getLastFixTime();
     
 private:
     static TinyGPSPlus gps;
@@ -49,6 +53,7 @@ private:
     static uint32_t fixCount;
     static uint32_t lastFixTime;
     static uint32_t lastUpdateTime;
+    static SemaphoreHandle_t mutex;
     
     static void processSerial();
     static void updateData();

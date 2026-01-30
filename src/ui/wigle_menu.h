@@ -1,13 +1,11 @@
-// WiGLE Menu - View and upload wardriving files to wigle.net
+// WiGLE Menu - View wardriving files with sync support
 #pragma once
 
 #include <Arduino.h>
 #include <M5Unified.h>
 #include <vector>
-
-// FreeRTOS task helpers (ESP32)
-#include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
+#include <FS.h>
+#include <SD.h>
 
 // Upload status for display
 enum class WigleFileStatus {
@@ -21,6 +19,17 @@ struct WigleFileInfo {
     uint32_t fileSize;
     uint32_t networkCount;  // Approximate based on file size
     WigleFileStatus status;
+};
+
+// Sync state machine for WiGLE operations
+enum class WigleSyncState {
+    IDLE,
+    CONNECTING_WIFI,
+    FREEING_MEMORY,
+    UPLOADING,
+    FETCHING_STATS,
+    COMPLETE,
+    ERROR
 };
 
 class WigleMenu {
@@ -42,22 +51,6 @@ private:
     static bool keyWasPressed;
     static bool detailViewActive;   // File detail view
     static bool nukeConfirmActive;  // Nuke confirmation modal
-    static bool connectingWiFi;     // WiFi connection in progress
-    static bool uploadingFile;      // Upload in progress
-
-    // Upload worker task (runs TLS off the Arduino loopTask stack)
-    static TaskHandle_t uploadTaskHandle;
-    static volatile bool uploadTaskDone;
-    static volatile bool uploadTaskSuccess;
-    static uint8_t uploadTaskIndex;  // which file index was uploaded
-    static char uploadTaskResultMsg[64];
-
-    struct UploadTaskCtx {
-        char fullPath[128];
-        uint8_t index;
-    };
-
-    static void uploadTaskFn(void* pv);
     
     static const uint8_t VISIBLE_ITEMS = 5;
     
@@ -65,8 +58,43 @@ private:
     static void handleInput();
     static void drawDetailView(M5Canvas& canvas);
     static void drawNukeConfirm(M5Canvas& canvas);
-    static void drawConnecting(M5Canvas& canvas);
-    static void uploadSelected();
     static void nukeTrack();
     static void formatSize(char* out, size_t len, uint32_t bytes);
+    
+    // Async scan state
+    static bool scanInProgress;
+    static unsigned long lastScanTime;
+    static const unsigned long SCAN_DELAY = 50; // ms between scan chunks
+    static File scanDir;
+    static File currentFile;
+    static bool scanComplete;
+    static size_t scanProgress;
+    static const size_t SCAN_CHUNK_SIZE = 5; // files to process per chunk
+    
+    // Async scan processing
+    static void processAsyncScan();
+    
+    // WiGLE Sync modal state
+    static bool syncModalActive;
+    static WigleSyncState syncState;
+    static char syncStatusText[48];
+    static uint8_t syncProgress;
+    static uint8_t syncTotal;
+    static unsigned long syncStartTime;
+    static uint8_t syncUploaded;
+    static uint8_t syncFailed;
+    static uint8_t syncSkipped;
+    static bool syncStatsFetched;
+    static char syncError[48];
+    
+    // Sync operations
+    static void startSync();
+    static void processSyncState();
+    static void drawSyncModal(M5Canvas& canvas);
+    static void cancelSync();
+    static bool connectToWiFi();
+    static void disconnectWiFi();
+    
+    // Sync progress callback (static for C-style callback)
+    static void onSyncProgress(const char* status, uint8_t progress, uint8_t total);
 };

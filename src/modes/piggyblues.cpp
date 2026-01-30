@@ -4,6 +4,7 @@
 #include "../core/config.h"
 #include "../core/xp.h"
 #include "../core/wifi_utils.h"
+#include "../core/network_recon.h"
 #include "../ui/display.h"
 #include "../piglet/mood.h"
 #include "../piglet/avatar.h"
@@ -38,6 +39,11 @@ static const uint16_t DIALOG_HEIGHT = 70;               // Warning dialog height
 static const uint32_t DIALOG_TIMEOUT_MS = 5000;         // Warning dialog timeout
 static const uint32_t MOOD_UPDATE_INTERVAL_MS = 3000;   // Mood phrase update interval
 
+// Warm-up payload (31 bytes) to pre-allocate advertisement buffer
+static const uint8_t ADV_WARMUP_PAYLOAD[] = {
+    0x1d, 0x09, 'P','I','G','G','Y','-','B','L','U','E','S','-','W','A','R','M','U','P','-','B','U','F','F','E','R','-','0'
+};
+
 // Runtime config values (loaded from Config::ble())
 static uint16_t cfgBurstInterval = DEFAULT_BURST_INTERVAL_MS;
 static uint16_t cfgAdvDuration = DEFAULT_ADV_DURATION_MS;
@@ -57,6 +63,48 @@ uint32_t PiggyBluesMode::androidCount = 0;
 uint32_t PiggyBluesMode::samsungCount = 0;
 uint32_t PiggyBluesMode::windowsCount = 0;
 
+// BLE state synchronization
+static portMUX_TYPE bleStateMux = portMUX_INITIALIZER_UNLOCKED;
+
+bool PiggyBluesMode::getAdvertisingNow() {
+    bool value;
+    taskENTER_CRITICAL(&bleStateMux);
+    value = advertisingNow;
+    taskEXIT_CRITICAL(&bleStateMux);
+    return value;
+}
+
+void PiggyBluesMode::setAdvertisingNow(bool value) {
+    taskENTER_CRITICAL(&bleStateMux);
+    advertisingNow = value;
+    taskEXIT_CRITICAL(&bleStateMux);
+}
+
+bool PiggyBluesMode::getScanRunning() {
+    bool value;
+    taskENTER_CRITICAL(&bleStateMux);
+    value = scanRunning;
+    taskEXIT_CRITICAL(&bleStateMux);
+    return value;
+}
+
+void PiggyBluesMode::setScanRunning(bool value) {
+    taskENTER_CRITICAL(&bleStateMux);
+    scanRunning = value;
+    taskEXIT_CRITICAL(&bleStateMux);
+}
+
+// Reusable advertisement data to avoid heap churn in hot paths
+static NimBLEAdvertisementData advDataCache;
+static bool advCachePrimed = false;
+static inline void primeAdvCache() {
+    if (advCachePrimed) return;
+    advDataCache.clearData();
+    advDataCache.addData(ADV_WARMUP_PAYLOAD, sizeof(ADV_WARMUP_PAYLOAD));
+    advDataCache.clearData();
+    advCachePrimed = true;
+}
+
 // ============ Deferred Target System ============
 // Scan callback sets pending target, update() processes in main thread
 // Single-slot pattern (like OINK) - missing a few is acceptable
@@ -73,18 +121,33 @@ static PiggyBluesScanCallbacks scanCallbacks;
 
 static BLEVendor identifyVendorFromPayload(const std::vector<uint8_t>& payload) {
     size_t idx = 0;
+    // Add bounds checking to prevent out-of-bounds access
     while (idx + 1 < payload.size()) {
         uint8_t len = payload[idx];
         if (len == 0) {
             break;
+        }
+        // Ensure we don't go out of bounds when accessing payload[idx + len + 1]
+        if (idx + len >= payload.size()) {
+            break; // Prevent out-of-bounds access
         }
         size_t next = idx + len + 1;
         if (next > payload.size()) {
             break;
         }
         if (payload[idx + 1] == 0xFF) {  // Manufacturer data
+            // Make sure we have at least 2 bytes for company ID
+            if (len < 1) {
+                idx = next;
+                continue;
+            }
             const uint8_t* data = payload.data() + idx + 2;
             size_t dataLen = len - 1;
+            // Make sure we have at least 2 bytes for company ID
+            if (dataLen < 2) {
+                idx = next;
+                continue;
+            }
             return PiggyBluesMode::identifyVendor(data, dataLen);
         }
         idx = next;
@@ -97,7 +160,7 @@ void PiggyBluesScanCallbacks::onResult(const NimBLEAdvertisedDevice* device) {
     // Use deferred pattern: quick copy, process in main thread
     
     if (!device) return;
-    if (PiggyBluesMode::advertisingNow) return;  // Skip during advertising (RF interference)
+    if (PiggyBluesMode::getAdvertisingNow()) return;  // Skip during advertising (RF interference)
     
     // Extract info quickly
     BLETarget target;
@@ -121,9 +184,9 @@ void PiggyBluesScanCallbacks::onScanEnd(const NimBLEScanResults& results, int re
     // Continuous scan shouldn't end unless stopped or error
     // NimBLE 2.x: stop() does NOT call onScanEnd, so this only fires on unexpected termination
     // If we're still running and not advertising, restart scan
-    if (PiggyBluesMode::isRunning() && !PiggyBluesMode::advertisingNow) {
+    if (PiggyBluesMode::isRunning() && !PiggyBluesMode::getAdvertisingNow()) {
         // Mark scan as stopped so startContinuousScan() will restart it
-        PiggyBluesMode::scanRunning = false;
+        PiggyBluesMode::setScanRunning(false);
         PiggyBluesMode::startContinuousScan();
     }
 }
@@ -131,7 +194,7 @@ void PiggyBluesScanCallbacks::onScanEnd(const NimBLEScanResults& results, int re
 // ============ New Continuous Scan Functions ============
 
 void PiggyBluesMode::startContinuousScan() {
-    if (scanRunning) return;
+    if (getScanRunning()) return;
     
     NimBLEScan* pScan = NimBLEDevice::getScan();
     if (!pScan) {
@@ -148,19 +211,19 @@ void PiggyBluesMode::startContinuousScan() {
     // NimBLE 2.x: start(duration, callback, continuous) 
     // duration=0 means forever, continuous=true for real-time callbacks
     if (pScan->start(0, false, true)) {
-        scanRunning = true;
+        setScanRunning(true);
     }
 }
 
 void PiggyBluesMode::stopContinuousScan() {
-    if (!scanRunning) return;
+    if (!getScanRunning()) return;
     
     NimBLEScan* pScan = NimBLEDevice::getScan();
     if (pScan && pScan->isScanning()) {
         pScan->stop();
         delay(BLE_OP_DELAY_MS);
     }
-    scanRunning = false;
+    setScanRunning(false);
 }
 
 void PiggyBluesMode::processTargets() {
@@ -199,38 +262,26 @@ void PiggyBluesMode::upsertTarget(const BLETarget& target) {
     // New target - add if room
     if (targets.size() < MAX_TARGETS) {
         targets.push_back(target);
-        
-        // Log new device
-        const char* vendorStr = "Unknown";
-        switch(target.vendor) {
-            case BLEVendor::APPLE: vendorStr = "Apple"; break;
-            case BLEVendor::ANDROID: vendorStr = "Android"; break;
-            case BLEVendor::SAMSUNG: vendorStr = "Samsung"; break;
-            case BLEVendor::WINDOWS: vendorStr = "Windows"; break;
-            default: break;
-        }
-        
-        char addrStr[18];
-        snprintf(addrStr, sizeof(addrStr), "%02X:%02X:%02X:%02X:%02X:%02X",
-                 target.addr[0], target.addr[1], target.addr[2],
-                 target.addr[3], target.addr[4], target.addr[5]);
-        
-        // Sniff animation is triggered via onPiggyBluesUpdate() when first target acquired
     }
 }
 
 void PiggyBluesMode::ageOutStaleTargets() {
     uint32_t now = millis();
+    size_t writeIdx = 0;
     
-    // Remove targets not seen in TARGET_STALE_TIMEOUT_MS
-    auto it = targets.begin();
-    while (it != targets.end()) {
-        if (now - it->lastSeen > TARGET_STALE_TIMEOUT_MS) {
-            it = targets.erase(it);
-        } else {
-            ++it;
+    // Compact the targets array without using erase() to avoid heap churn
+    for (size_t readIdx = 0; readIdx < targets.size(); ++readIdx) {
+        if (now - targets[readIdx].lastSeen <= TARGET_STALE_TIMEOUT_MS) {
+            // Keep this target - move to write position if needed
+            if (writeIdx != readIdx) {
+                targets[writeIdx] = targets[readIdx];
+            }
+            ++writeIdx;
         }
     }
+    
+    // Truncate the vector to new size - this may still allocate but less frequently
+    targets.resize(writeIdx);
 }
 
 void PiggyBluesMode::selectActiveTargets() {
@@ -423,8 +474,8 @@ void PiggyBluesMode::init() {
     running = false;
     confirmed = false;
     lastBurstTime = 0;
-    scanRunning = false;
-    advertisingNow = false;
+    setScanRunning(false);
+    setAdvertisingNow(false);
     
     // Load config values
     cfgBurstInterval = Config::ble().burstInterval;
@@ -437,6 +488,7 @@ void PiggyBluesMode::init() {
     
     burstInterval = cfgBurstInterval;
     targets.clear();
+    targets.reserve(MAX_TARGETS);
     activeCount = 0;
     totalPackets = 0;
     appleCount = 0;
@@ -451,6 +503,9 @@ void PiggyBluesMode::init() {
     // Reset timing state
     lastMoodUpdateTime = 0;
     advertisingStartTime = 0;
+
+    // Pre-allocate advertisement buffer to avoid hot-path allocations
+    primeAdvCache();
 }
 
 bool PiggyBluesMode::showWarningDialog() {
@@ -532,6 +587,9 @@ void PiggyBluesMode::start() {
     
     confirmed = true;
     
+    // Stop NetworkRecon before disabling WiFi (BLE needs exclusive radio)
+    NetworkRecon::stop();
+    
     // Disable WiFi to improve BLE performance (shared antenna)
     WiFi.mode(WIFI_OFF);
     delay(BLE_OP_DELAY_MS);
@@ -591,8 +649,9 @@ void PiggyBluesMode::stop() {
     running = false;
     confirmed = false;
     targets.clear();
+    targets.shrink_to_fit();  // FIX: Release vector capacity to recover heap
     activeCount = 0;
-    advertisingNow = false;
+    setAdvertisingNow(false);
     
     Avatar::setGrassMoving(false);
     Avatar::resetGrassPattern();
@@ -618,12 +677,13 @@ void PiggyBluesMode::stop() {
         return;
     }
     
-    // No reboot this time - reward XP and restore WiFi
+    // No reboot this time - reward XP and restore network recon
     Display::showToast("BLUES SLAYED.\nJUST ROULETTE.\n+15 XP");
     XP::addRouletteWin();
     XP::addXPSilent(NO_REBOOT_XP_BONUS);
-    // WiFi is already off. Let the next mode handle re-enabling it.
-    // Calling WiFiUtils::shutdown() here causes a crash.
+    
+    // Restart background network reconnaissance (WiFi promiscuous mode)
+    NetworkRecon::start();
 }
 
 void PiggyBluesMode::update() {
@@ -641,18 +701,19 @@ void PiggyBluesMode::update() {
     selectActiveTargets();
     
     // Non-blocking advertising state machine
-    if (advertisingNow) {
+    bool advNow = getAdvertisingNow();
+    if (advNow) {
         // We are in an advertising burst. Check if it's time to stop.
         if (now - advertisingStartTime >= cfgAdvDuration) {
             if (pAdvertising && pAdvertising->isAdvertising()) {
                 pAdvertising->stop();
             }
-            advertisingNow = false;
+            setAdvertisingNow(false);
         }
     } else {
         // We are not advertising. Check if it's time to start a new burst.
         if (now - lastBurstTime >= burstInterval) {
-            advertisingNow = true;
+            setAdvertisingNow(true);
             advertisingStartTime = now;
             lastBurstTime = now; // Reset timer for the next burst interval.
             
@@ -730,11 +791,11 @@ void PiggyBluesMode::sendAppleJuice() {
     pAdvertising->setConnectableMode(BLE_GAP_CONN_MODE_NON);
     
     // Use raw payload directly in advertisement data
-    NimBLEAdvertisementData advData;
-    if (!advData.addData(payload, len)) {
+    advDataCache.clearData();
+    if (!advDataCache.addData(payload, len)) {
         return;
     }
-    if (!pAdvertising->setAdvertisementData(advData)) {
+    if (!pAdvertising->setAdvertisementData(advDataCache)) {
         return;
     }
     
@@ -756,19 +817,30 @@ void PiggyBluesMode::sendAndroidFastPair() {
     // Random FastPair model
     uint32_t modelId = FASTPAIR_MODELS[random(0, FASTPAIR_MODEL_COUNT)];
     
-    // FastPair service data format
-    uint8_t serviceData[3];
-    serviceData[0] = (modelId >> 16) & 0xFF;
-    serviceData[1] = (modelId >> 8) & 0xFF;
-    serviceData[2] = modelId & 0xFF;
-    
-    NimBLEAdvertisementData advData;
-    advData.setFlags(0x06);
-    advData.setCompleteServices16({NimBLEUUID((uint16_t)0xFE2C)});
-    advData.setServiceData(NimBLEUUID((uint16_t)0xFE2C), std::string((char*)serviceData, 3));
+    // Build FastPair advertisement payload without heap allocations
+    uint8_t payload[14];
+    payload[0] = 0x02;  // Flags length
+    payload[1] = 0x01;  // Flags type
+    payload[2] = 0x06;  // LE General Discoverable + BR/EDR not supported
+    payload[3] = 0x03;  // Service UUID list length
+    payload[4] = 0x03;  // Complete list of 16-bit Service UUIDs
+    payload[5] = 0x2C;  // 0xFE2C (Fast Pair)
+    payload[6] = 0xFE;
+    payload[7] = 0x06;  // Service Data length
+    payload[8] = 0x16;  // Service Data AD type
+    payload[9] = 0x2C;  // 0xFE2C
+    payload[10] = 0xFE;
+    payload[11] = (modelId >> 16) & 0xFF;
+    payload[12] = (modelId >> 8) & 0xFF;
+    payload[13] = modelId & 0xFF;
+
+    advDataCache.clearData();
+    if (!advDataCache.addData(payload, sizeof(payload))) {
+        return;
+    }
     
     pAdvertising->setConnectableMode(BLE_GAP_CONN_MODE_NON);
-    if (!pAdvertising->setAdvertisementData(advData)) {
+    if (!pAdvertising->setAdvertisementData(advDataCache)) {
         return;
     }
     
@@ -793,11 +865,11 @@ void PiggyBluesMode::sendSamsungSpam() {
     
     // Use raw payload directly in advertisement data
     pAdvertising->setConnectableMode(BLE_GAP_CONN_MODE_NON);
-    NimBLEAdvertisementData advData;
-    if (!advData.addData(payload, len)) {
+    advDataCache.clearData();
+    if (!advDataCache.addData(payload, len)) {
         return;
     }
-    if (!pAdvertising->setAdvertisementData(advData)) {
+    if (!pAdvertising->setAdvertisementData(advDataCache)) {
         return;
     }
     
@@ -825,13 +897,34 @@ void PiggyBluesMode::sendWindowsSwiftPair() {
         0x80                     // Display icon (0x80 = generic)
     };
     
-    NimBLEAdvertisementData advData;
-    advData.setFlags(0x06);
-    advData.setManufacturerData(mfgData, sizeof(mfgData));
-    advData.setName("Free Bluetooth");
+    // Build SwiftPair payload without heap allocations
+    static const char kSwiftPairName[] = "Free Bluetooth";
+    constexpr size_t kSwiftPairNameLen = sizeof(kSwiftPairName) - 1;
+    uint8_t payload[31];
+    size_t idx = 0;
+    payload[idx++] = 0x02;  // Flags length
+    payload[idx++] = 0x01;  // Flags type
+    payload[idx++] = 0x06;  // LE General Discoverable + BR/EDR not supported
+    payload[idx++] = static_cast<uint8_t>(sizeof(mfgData) + 1); // Length of mfg data + type
+    payload[idx++] = 0xFF;  // Manufacturer data type
+    memcpy(&payload[idx], mfgData, sizeof(mfgData));
+    idx += sizeof(mfgData);
+    payload[idx++] = static_cast<uint8_t>(kSwiftPairNameLen + 1); // Name length + type
+    payload[idx++] = 0x09;  // Complete local name
+    memcpy(&payload[idx], kSwiftPairName, kSwiftPairNameLen);
+    idx += kSwiftPairNameLen;
+
+    if (idx > sizeof(payload)) {
+        return;
+    }
+
+    advDataCache.clearData();
+    if (!advDataCache.addData(payload, idx)) {
+        return;
+    }
     
     pAdvertising->setConnectableMode(BLE_GAP_CONN_MODE_NON);
-    if (!pAdvertising->setAdvertisementData(advData)) {
+    if (!pAdvertising->setAdvertisementData(advDataCache)) {
         return;
     }
     

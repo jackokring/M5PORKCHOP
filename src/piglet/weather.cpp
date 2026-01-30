@@ -14,6 +14,8 @@ static bool cloudMoving = true;  // Always drift
 static bool cloudDirection = true;  // true = right
 static uint32_t lastCloudUpdate = 0;
 static uint16_t cloudSpeed = 14400;  // Ultra slow atmospheric drift (matches sirloin)
+static uint32_t lastCloudParallax = 0;
+static const uint8_t CLOUD_PARALLAX_GRASS_SHIFTS = 6;  // Shift clouds every N grass shifts
 
 // === RAIN STATE ===
 struct RainDrop {
@@ -57,6 +59,7 @@ static int currentMood = 50;  // Cached mood level
 
 // Forward declaration
 static void resetCloudPattern();
+static void shiftCloudPattern(bool direction, bool allowMutation);
 
 // === INITIALIZATION ===
 void init() {
@@ -69,6 +72,7 @@ void init() {
     }
     
     lastCloudUpdate = millis();
+    lastCloudParallax = lastCloudUpdate;
     lastWindGust = millis();
     lastThunderStorm = millis();
 }
@@ -100,6 +104,32 @@ static void resetCloudPattern() {
         // Add gap between clouds
         int gap = random(4, 10);  // 4 to 9 spaces
         pos += gap;
+    }
+}
+
+static void shiftCloudPattern(bool direction, bool allowMutation) {
+    if (direction) {
+        // Shift right
+        char last = cloudPattern[38];
+        for (int i = 38; i > 0; i--) {
+            cloudPattern[i] = cloudPattern[i - 1];
+        }
+        cloudPattern[0] = last;
+    } else {
+        // Shift left
+        char first = cloudPattern[0];
+        for (int i = 0; i < 38; i++) {
+            cloudPattern[i] = cloudPattern[i + 1];
+        }
+        cloudPattern[38] = first;
+    }
+
+    if (allowMutation && random(0, 50) == 0) {
+        int pos = random(0, 39);
+        if (cloudPattern[pos] != ' ') {
+            const char cloudChars[] = {'.', '-', '_'};
+            cloudPattern[pos] = cloudChars[random(0, 3)];
+        }
     }
 }
 
@@ -185,10 +215,6 @@ void triggerThunderStorm() {
     lastThunderStorm = millis();
 }
 
-void setWindActive(bool active) {
-    windActive = active;
-}
-
 // Forward declarations for static update functions
 static void updateClouds(uint32_t now);
 static void updateRain(uint32_t now);
@@ -217,33 +243,22 @@ void update() {
 }
 
 static void updateClouds(uint32_t now) {
-    if (now - lastCloudUpdate < cloudSpeed) return;
-    lastCloudUpdate = now;
-    
-    // Shift pattern based on direction
-    if (cloudDirection) {
-        // Shift right
-        char last = cloudPattern[38];
-        for (int i = 38; i > 0; i--) {
-            cloudPattern[i] = cloudPattern[i - 1];
-        }
-        cloudPattern[0] = last;
-    } else {
-        // Shift left
-        char first = cloudPattern[0];
-        for (int i = 0; i < 38; i++) {
-            cloudPattern[i] = cloudPattern[i + 1];
-        }
-        cloudPattern[38] = first;
+    if (cloudMoving && now - lastCloudUpdate >= cloudSpeed) {
+        lastCloudUpdate = now;
+        shiftCloudPattern(cloudDirection, true);
     }
-    
-    // Occasionally mutate a cloud character for organic drift
-    if (random(0, 50) == 0) {
-        int pos = random(0, 39);
-        if (cloudPattern[pos] != ' ') {
-            const char cloudChars[] = {'.', '-', '_'};
-            cloudPattern[pos] = cloudChars[random(0, 3)];
+
+    // Parallax: when grass is moving, nudge clouds in the same direction (slower).
+    if (Avatar::isGrassMoving()) {
+        uint32_t parallaxInterval = (uint32_t)Avatar::getGrassSpeed() * CLOUD_PARALLAX_GRASS_SHIFTS;
+        if (parallaxInterval < 150) parallaxInterval = 150;
+
+        if (now - lastCloudParallax >= parallaxInterval) {
+            lastCloudParallax = now;
+            shiftCloudPattern(Avatar::isGrassDirectionRight(), false);
         }
+    } else {
+        lastCloudParallax = now;
     }
 }
 

@@ -3,7 +3,7 @@
 // Key changes from original:
 // - No entries[] vector - data goes directly to disk
 // - No "waiting for GPS" state - either GPS or ML-only
-// - Simpler memory management - just seenBSSIDs for duplicate detection
+// - Simpler memory management - Bloom filter for duplicate detection
 // - Per-network file writes instead of batch saves
 
 #include "warhog.h"
@@ -11,8 +11,10 @@
 #include "../build_info.h"
 #include "../core/config.h"
 #include "../core/wifi_utils.h"
+#include "../core/network_recon.h"
 #include "../core/wsl_bypasser.h"
 #include "../core/sdlog.h"
+#include "../core/sd_layout.h"
 #include "../core/xp.h"
 #include "../ui/display.h"
 #include "../piglet/mood.h"
@@ -23,18 +25,35 @@
 #include <SD.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <freertos/semphr.h>
 #include <math.h>
+#include <string.h>
 #include <esp_heap_caps.h>
 
-// Maximum BSSIDs tracked in seenBSSIDs set
-// Each std::set node = 24 bytes (8 byte key + 16 byte tree overhead)
-// 5000 entries = ~120KB - leaves headroom for other allocations
-static const size_t MAX_SEEN_BSSIDS = 5000;
-static const size_t SEEN_BSSID_ALLOC_MIN_BLOCK = 256;
+// Bloom filter for seen BSSIDs (fixed memory, no heap churn)
+// 8KB = 65,536 bits -> ~0.8% false positives around 5k entries with 3 hashes
+static const size_t SEEN_BLOOM_BYTES = 8192;
+static const size_t SEEN_BLOOM_BITS = SEEN_BLOOM_BYTES * 8;
+static const size_t SEEN_BLOOM_MASK = SEEN_BLOOM_BITS - 1;
+static const uint8_t SEEN_BLOOM_HASHES = 3;
+static_assert((SEEN_BLOOM_BITS & (SEEN_BLOOM_BITS - 1)) == 0, "SEEN_BLOOM_BITS must be power of two");
+
+// Captured bloom for bounty exclusion (small, fast)
+static const size_t CAPTURED_BLOOM_BYTES = 2048;
+static const size_t CAPTURED_BLOOM_BITS = CAPTURED_BLOOM_BYTES * 8;
+static const size_t CAPTURED_BLOOM_MASK = CAPTURED_BLOOM_BITS - 1;
+static const uint8_t CAPTURED_BLOOM_HASHES = 3;
+static_assert((CAPTURED_BLOOM_BITS & (CAPTURED_BLOOM_BITS - 1)) == 0, "CAPTURED_BLOOM_BITS must be power of two");
+
+// Bounty pool (reservoir sample of seen networks)
+static const size_t BOUNTY_POOL_SIZE = 50;
 
 // Heap threshold for emergency cleanup (bytes)
 static const size_t HEAP_WARNING_THRESHOLD = 40000;
 static const size_t HEAP_CRITICAL_THRESHOLD = 25000;
+
+// Minimum scan interval to avoid tight-loop scanning
+static const uint32_t SCAN_INTERVAL_MIN_MS = 1000;
 
 // SD card retry settings (SD can be busy with other operations)
 static const int SD_RETRY_COUNT = 3;
@@ -81,8 +100,12 @@ static uint32_t lastDistanceCheck = 0;
 bool WarhogMode::running = false;
 uint32_t WarhogMode::lastScanTime = 0;
 uint32_t WarhogMode::scanInterval = 5000;
-std::set<uint64_t> WarhogMode::seenBSSIDs;
-std::set<uint64_t> WarhogMode::capturedBSSIDs;
+static uint8_t seenBloom[SEEN_BLOOM_BYTES];
+static uint8_t capturedBloom[CAPTURED_BLOOM_BYTES];
+static uint64_t bountyPool[BOUNTY_POOL_SIZE];
+static uint16_t bountyPoolCount = 0;
+static uint32_t bountySeenTotal = 0;
+static SemaphoreHandle_t beaconMutex = nullptr;
 uint32_t WarhogMode::totalNetworks = 0;
 uint32_t WarhogMode::openNetworks = 0;
 uint32_t WarhogMode::wepNetworks = 0;
@@ -100,7 +123,7 @@ uint32_t WarhogMode::scanStartTime = 0;
 // Enhanced mode statics
 bool WarhogMode::enhancedMode = false;
 std::map<uint64_t, WiFiFeatures> WarhogMode::beaconFeatures;
-uint32_t WarhogMode::beaconCount = 0;
+std::atomic<uint32_t> WarhogMode::beaconCount{0};  // Atomic for thread-safe callback + main access
 volatile bool WarhogMode::beaconMapBusy = false;
 
 // Background scan task statics
@@ -110,6 +133,74 @@ volatile int WarhogMode::scanResult = -2;  // -2 = not started, -1 = running, >=
 // Scan task check: returns true if should abort
 static inline bool shouldAbortScan() {
     return stopRequested || !WarhogMode::isRunning();
+}
+
+static uint32_t mix32(uint64_t x) {
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    x *= 0xc4ceb9fe1a85ec53ULL;
+    x ^= x >> 33;
+    return (uint32_t)x;
+}
+
+static bool bloomTest(const uint8_t* bloom, size_t mask, uint8_t hashes, uint64_t key) {
+    uint32_t h1 = mix32(key);
+    uint32_t h2 = mix32(key ^ 0x9e3779b97f4a7c15ULL) | 1U;
+    for (uint8_t i = 0; i < hashes; i++) {
+        uint32_t idx = (h1 + (uint32_t)i * h2) & (uint32_t)mask;
+        if ((bloom[idx >> 3] & (1 << (idx & 7))) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void bloomAdd(uint8_t* bloom, size_t mask, uint8_t hashes, uint64_t key) {
+    uint32_t h1 = mix32(key);
+    uint32_t h2 = mix32(key ^ 0x9e3779b97f4a7c15ULL) | 1U;
+    for (uint8_t i = 0; i < hashes; i++) {
+        uint32_t idx = (h1 + (uint32_t)i * h2) & (uint32_t)mask;
+        bloom[idx >> 3] |= (1 << (idx & 7));
+    }
+}
+
+static void resetSeenTracking() {
+    memset(seenBloom, 0, sizeof(seenBloom));
+    memset(capturedBloom, 0, sizeof(capturedBloom));
+    bountyPoolCount = 0;
+    bountySeenTotal = 0;
+}
+
+static void seedCapturedFromOink() {
+    for (const auto& hs : OinkMode::getHandshakes()) {
+        bloomAdd(capturedBloom, CAPTURED_BLOOM_MASK, CAPTURED_BLOOM_HASHES, bssidToKey(hs.bssid));
+    }
+    for (const auto& p : OinkMode::getPMKIDs()) {
+        bloomAdd(capturedBloom, CAPTURED_BLOOM_MASK, CAPTURED_BLOOM_HASHES, bssidToKey(p.bssid));
+    }
+}
+
+void WarhogMode::clearBeaconFeatures() {
+    beaconMapBusy = true;
+    // Ensure we're not stuck waiting indefinitely for the mutex
+    if (beaconMutex) {
+        if (xSemaphoreTake(beaconMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            beaconFeatures.clear();
+            beaconCount = 0;  // Also reset beacon count when clearing features
+            xSemaphoreGive(beaconMutex);
+        }
+        // If we couldn't acquire the mutex, we still set beaconMapBusy to allow
+        // other code to know that a clear operation is happening conceptually
+    } else {
+        beaconFeatures.clear();
+        beaconCount = 0;
+    }
+    beaconMapBusy = false;
+}
+
+static uint32_t clampScanIntervalMs(uint32_t intervalMs) {
+    return (intervalMs < SCAN_INTERVAL_MIN_MS) ? SCAN_INTERVAL_MIN_MS : intervalMs;
 }
 
 // Helper to write CSV-escaped SSID field (quoted, doubles internal quotes, strips control chars)
@@ -126,8 +217,10 @@ static void writeCSVField(File& f, const char* ssid) {
 }
 
 void WarhogMode::init() {
-    seenBSSIDs.clear();
-    capturedBSSIDs.clear();
+    if (!beaconMutex) {
+        beaconMutex = xSemaphoreCreateMutex();
+    }
+
     totalNetworks = 0;
     openNetworks = 0;
     wepNetworks = 0;
@@ -137,24 +230,31 @@ void WarhogMode::init() {
     currentFilename = "";
     currentMLFilename = "";
     currentWigleFilename = "";
+
+    resetSeenTracking();
     
     // ML disabled for heap savings
     enhancedMode = false;
     // Guard beacon map in case callback still registered from abnormal shutdown
-    beaconMapBusy = true;
-    beaconFeatures.clear();
-    beaconMapBusy = false;
+    clearBeaconFeatures();
     beaconCount = 0;
     
-    scanInterval = Config::gps().updateInterval * 1000;
+    scanInterval = clampScanIntervalMs(Config::gps().updateInterval * 1000UL);
 }
 
 void WarhogMode::start() {
     if (running) return;
+
+    // Initialize mutex if not already done
+    if (!beaconMutex) {
+        beaconMutex = xSemaphoreCreateMutex();
+        if (!beaconMutex) {
+            // Critical error - can't operate safely without mutex
+            return;
+        }
+    }
     
     // Clear previous session data
-    seenBSSIDs.clear();
-    capturedBSSIDs.clear();
     totalNetworks = 0;
     openNetworks = 0;
     wepNetworks = 0;
@@ -164,11 +264,12 @@ void WarhogMode::start() {
     currentFilename = "";
     currentMLFilename = "";
     currentWigleFilename = "";
+
+    resetSeenTracking();
+    seedCapturedFromOink();
     
     // Guard beacon map in case callback still registered from previous session
-    beaconMapBusy = true;
-    beaconFeatures.clear();
-    beaconMapBusy = false;
+    clearBeaconFeatures();
     beaconCount = 0;
     
     // Reset distance tracking for XP
@@ -177,13 +278,16 @@ void WarhogMode::start() {
     lastDistanceCheck = 0;
     
     // Reload scan interval from config
-    scanInterval = Config::gps().updateInterval * 1000;
+    scanInterval = clampScanIntervalMs(Config::gps().updateInterval * 1000UL);
     
     // Reset stop flag for clean start
     stopRequested = false;
     
     // ML disabled for heap savings
     enhancedMode = false;
+    
+    // Stop NetworkRecon before WiFi manipulation (uses promiscuous mode, incompatible with STA scanning)
+    NetworkRecon::stop();
     
     // Full WiFi reinitialization for clean slate
     WiFi.disconnect(true);  // Disconnect and clear settings
@@ -203,8 +307,9 @@ void WarhogMode::start() {
     
     // ML features disabled
     
-    // Wake up GPS
-    GPS::wake();
+    // Ensure GPS is in continuous mode regardless of software state
+    // FIX: Addresses issue where GPS doesn't show until mode restart
+    GPS::ensureContinuousMode();
     
     running = true;
     lastScanTime = 0;  // Trigger immediate scan
@@ -217,6 +322,7 @@ void WarhogMode::start() {
     Mood::onWarhogUpdate();  // Show WARHOG phrase on start
     Mood::setDialogueLock(true);
 }
+
 
 void WarhogMode::stop() {
     if (!running) return;
@@ -256,8 +362,9 @@ void WarhogMode::stop() {
         GPS::sleep();
     }
     
-    WiFiUtils::shutdown();
-    Display::setWiFiStatus(false);
+    // Restart NetworkRecon (restores promiscuous mode for OINK/DNH/etc)
+    NetworkRecon::start();
+    Display::setWiFiStatus(true);  // Recon is active
     
     // Reset stop flag for next run
     stopRequested = false;
@@ -328,14 +435,34 @@ void WarhogMode::update() {
         
         if (freeHeap < HEAP_CRITICAL_THRESHOLD) {
             Display::showToast("LOW MEMORY!");
-            // Emergency: clear tracking data to prevent crash
+            // Emergency: clear beacon feature cache (heap heavy)
             // Guard beacon map from promiscuous callback during clear
-            beaconMapBusy = true;
-            seenBSSIDs.clear();
-            beaconFeatures.clear();
-            beaconMapBusy = false;
+            if (enhancedMode) {
+                esp_wifi_set_promiscuous(false);
+            }
+            clearBeaconFeatures();
+            if (enhancedMode) {
+                esp_wifi_set_promiscuous(true);
+            }
         }
         lastHeapCheck = now;
+    }
+    
+    // Periodic beacon map cleanup to prevent unbounded growth (every 10s - Phase 3B fix)
+    // Clear stale beacon features to reclaim heap before it becomes critical
+    static uint32_t lastBeaconCleanup = 0;
+    if (enhancedMode && now - lastBeaconCleanup > 10000) {
+        // Only clear if map is getting large (>200 entries = ~25KB)
+        if (beaconFeatures.size() > 200) {
+            beaconMapBusy = true;
+            if (beaconMutex && xSemaphoreTake(beaconMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                beaconFeatures.clear();
+                beaconCount = 0;
+                xSemaphoreGive(beaconMutex);
+            }
+            beaconMapBusy = false;
+        }
+        lastBeaconCleanup = now;
     }
     
     // Update grass animation based on GPS fix status
@@ -447,8 +574,9 @@ bool WarhogMode::ensureCSVFileReady() {
     if (currentFilename.length() > 0) return true;
     
     // Ensure wardriving directory exists
-    if (!SD.exists("/wardriving")) {
-        if (!SD.mkdir("/wardriving")) {
+    const char* wardrivingDir = SDLayout::wardrivingDir();
+    if (!SD.exists(wardrivingDir)) {
+        if (!SD.mkdir(wardrivingDir)) {
             return false;
         }
     }
@@ -472,15 +600,19 @@ bool WarhogMode::ensureMLFileReady() {
     if (currentMLFilename.length() > 0) return true;
     
     // Ensure mldata directory exists
-    if (!SD.exists("/mldata")) {
-        if (!SD.mkdir("/mldata")) {
+    const char* wardrivingDir = SDLayout::wardrivingDir();
+    const char* mldataDir = SDLayout::mldataDir();
+    if (!SD.exists(mldataDir)) {
+        if (!SD.mkdir(mldataDir)) {
             return false;
         }
     }
     
     currentMLFilename = generateFilename("ml.csv");
     // Put ML files in /mldata folder
-    currentMLFilename.replace("/wardriving/warhog_", "/mldata/ml_training_");
+    String wardrivingPrefix = String(wardrivingDir) + "/warhog_";
+    String mldataPrefix = String(mldataDir) + "/ml_training_";
+    currentMLFilename.replace(wardrivingPrefix, mldataPrefix);
     
     File f = openFileWithRetry(currentMLFilename.c_str(), FILE_WRITE);
     if (!f) {
@@ -574,8 +706,9 @@ bool WarhogMode::ensureWigleFileReady() {
     if (currentWigleFilename.length() > 0) return true;
     
     // Ensure wardriving directory exists
-    if (!SD.exists("/wardriving")) {
-        if (!SD.mkdir("/wardriving")) {
+    const char* wardrivingDir = SDLayout::wardrivingDir();
+    if (!SD.exists(wardrivingDir)) {
+        if (!SD.mkdir(wardrivingDir)) {
             return false;
         }
     }
@@ -628,6 +761,22 @@ String WarhogMode::authModeToWigleString(wifi_auth_mode_t mode) {
     }
 }
 
+static int channelToFrequency(uint8_t channel) {
+    if (channel >= 1 && channel <= 13) {
+        return 2412 + (channel - 1) * 5;
+    }
+    if (channel == 14) {
+        return 2484;
+    }
+    if (channel <= 196) {
+        return 5000 + channel * 5;
+    }
+    if (channel <= 233) {
+        return 5950 + channel * 5;
+    }
+    return 0;
+}
+
 // Append single network to WiGLE file
 void WarhogMode::appendWigleEntry(const uint8_t* bssid, const char* ssid,
                                    int8_t rssi, uint8_t channel, wifi_auth_mode_t auth,
@@ -668,9 +817,8 @@ void WarhogMode::appendWigleEntry(const uint8_t* bssid, const char* ssid,
     // Channel
     f.printf("%d,", channel);
     
-    // Frequency (calculate from channel for 2.4GHz)
-    int freq = 2412 + (channel - 1) * 5;
-    if (channel == 14) freq = 2484;  // Special case for channel 14
+    // Frequency (best-effort mapping for 2.4/5/6 GHz)
+    int freq = channelToFrequency(channel);
     f.printf("%d,", freq);
     
     // RSSI
@@ -698,32 +846,39 @@ void WarhogMode::processScanResults() {
     
     // Get current GPS data - check for valid fix
     GPSData gpsData = GPS::getData();
-    bool hasGPS = GPS::hasFix() && (gpsData.latitude != 0.0 && gpsData.longitude != 0.0);
+    bool hasGPS = GPS::hasFix();
     
     SDLOG("WARHOG", "Processing %d networks (GPS: %s)", n, hasGPS ? "yes" : "no");
-    
-    // Guard beacon map access from promiscuous callback
-    beaconMapBusy = true;
     
     uint32_t newThisScan = 0;
     uint32_t geotaggedThisScan = 0;
     
+    // Process each network with periodic yield to prevent WDT issues
     for (int i = 0; i < n; i++) {
+        // Yield periodically during long processing loops to prevent WDT
+        if (i % 5 == 0) {
+            yield(); // Allow other tasks to run
+        }
+
         uint8_t* bssidPtr = WiFi.BSSID(i);
         if (!bssidPtr) continue;
         
         uint64_t bssidKey = bssidToKey(bssidPtr);
         
-        // Skip if already processed this session
-        if (seenBSSIDs.count(bssidKey) > 0) {
+        // Skip if already processed this session (Bloom filter)
+        if (bloomTest(seenBloom, SEEN_BLOOM_MASK, SEEN_BLOOM_HASHES, bssidKey)) {
             continue;
         }
-        
-        // Add to seen set immediately (before any file writes)
-        if (seenBSSIDs.size() < MAX_SEEN_BSSIDS) {
-            size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-            if (largest >= SEEN_BSSID_ALLOC_MIN_BLOCK) {
-                seenBSSIDs.insert(bssidKey);
+
+        // Mark as seen and update bounty reservoir before any file writes
+        bloomAdd(seenBloom, SEEN_BLOOM_MASK, SEEN_BLOOM_HASHES, bssidKey);
+        bountySeenTotal++;
+        if (bountyPoolCount < BOUNTY_POOL_SIZE) {
+            bountyPool[bountyPoolCount++] = bssidKey;
+        } else {
+            uint32_t pick = esp_random() % bountySeenTotal;
+            if (pick < BOUNTY_POOL_SIZE) {
+                bountyPool[pick] = bssidKey;
             }
         }
         
@@ -734,15 +889,26 @@ void WarhogMode::processScanResults() {
         uint8_t channel = WiFi.channel(i);
         wifi_auth_mode_t authmode = WiFi.encryptionType(i);
         
+        // Validate extracted data to prevent potential crashes
+        if (!ssid || strlen(ssid) > 32) continue;
+        if (channel == 0 || channel > 165) continue; // Valid WiFi channels are 1-165
+        
         // Extract ML features
         WiFiFeatures features;
-        if (enhancedMode) {
-            auto it = beaconFeatures.find(bssidKey);
-            if (it != beaconFeatures.end()) {
-                features = it->second;
-                features.rssi = rssi;
-                features.snr = (float)(rssi - features.noise);
-            } else {
+        if (enhancedMode && beaconMutex && !beaconMapBusy) {
+            bool found = false;
+            // Use timeout for mutex to prevent indefinite blocking
+            if (xSemaphoreTake(beaconMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                auto it = beaconFeatures.find(bssidKey);
+                if (it != beaconFeatures.end()) {
+                    features = it->second;
+                    features.rssi = rssi;
+                    features.snr = (float)(rssi - features.noise);
+                    found = true;
+                }
+                xSemaphoreGive(beaconMutex);
+            }
+            if (!found) {
                 features = FeatureExtractor::extractBasic(rssi, channel, authmode);
             }
         } else {
@@ -803,9 +969,6 @@ void WarhogMode::processScanResults() {
             }
         }
     }
-    
-    // Release beacon map guard
-    beaconMapBusy = false;
     
     // Trigger mood update if we found new networks
     if (newThisScan > 0) {
@@ -877,30 +1040,29 @@ String WarhogMode::authModeToString(wifi_auth_mode_t mode) {
 // Track which BSSIDs were actually captured (handshakes/PMKIDs) so Papa only sends misses
 void WarhogMode::markCaptured(const uint8_t* bssid) {
     if (!bssid) return;
-    if (capturedBSSIDs.size() >= MAX_SEEN_BSSIDS) return;
     
     uint64_t key = bssidToKey(bssid);
-    capturedBSSIDs.insert(key);
+    bloomAdd(capturedBloom, CAPTURED_BLOOM_MASK, CAPTURED_BLOOM_HASHES, key);
+
+    // Remove from bounty pool if present
+    for (uint16_t i = 0; i < bountyPoolCount; i++) {
+        if (bountyPool[i] == key) {
+            bountyPool[i] = bountyPool[bountyPoolCount - 1];
+            bountyPoolCount--;
+            break;
+        }
+    }
 }
 
 std::vector<uint64_t> WarhogMode::getUnclaimedBSSIDs() {
-    // Start with captured set populated by Oink events
-    std::set<uint64_t> captured = capturedBSSIDs;
-    
-    // Add any captures currently in Oink buffers (ensures we exclude saved loot too)
-    for (const auto& hs : OinkMode::getHandshakes()) {
-        captured.insert(bssidToKey(hs.bssid));
-    }
-    for (const auto& p : OinkMode::getPMKIDs()) {
-        captured.insert(bssidToKey(p.bssid));
-    }
-    
     std::vector<uint64_t> unclaimed;
-    unclaimed.reserve(seenBSSIDs.size());
-    for (uint64_t seen : seenBSSIDs) {
-        if (captured.find(seen) == captured.end()) {
-            unclaimed.push_back(seen);
+    unclaimed.reserve(bountyPoolCount);
+    for (uint16_t i = 0; i < bountyPoolCount; i++) {
+        uint64_t key = bountyPool[i];
+        if (bloomTest(capturedBloom, CAPTURED_BLOOM_MASK, CAPTURED_BLOOM_HASHES, key)) {
+            continue;
         }
+        unclaimed.push_back(key);
     }
     return unclaimed;
 }
@@ -926,6 +1088,7 @@ void WarhogMode::buildBountyList(uint8_t* buffer, uint8_t* count) {
 String WarhogMode::generateFilename(const char* ext) {
     char buf[64];
     GPSData gps = GPS::getData();
+    const char* wardrivingDir = SDLayout::wardrivingDir();
     
     if (gps.date > 0 && gps.time > 0) {
         // date format: DDMMYY, time format: HHMMSSCC (centiseconds)
@@ -936,11 +1099,13 @@ String WarhogMode::generateFilename(const char* ext) {
         uint8_t minute = (gps.time / 10000) % 100;
         uint8_t second = (gps.time / 100) % 100;
         
-        snprintf(buf, sizeof(buf), "/wardriving/warhog_20%02d%02d%02d_%02d%02d%02d.%s",
+        snprintf(buf, sizeof(buf), "%s/warhog_20%02d%02d%02d_%02d%02d%02d.%s",
+                wardrivingDir,
                 year, month, day, hour, minute, second, ext);
     } else {
         // No GPS time - use millis with random suffix for uniqueness
-        snprintf(buf, sizeof(buf), "/wardriving/warhog_%lu_%04X.%s", 
+        snprintf(buf, sizeof(buf), "%s/warhog_%lu_%04X.%s", 
+                wardrivingDir,
                 millis(), (uint16_t)esp_random(), ext);
     }
     
@@ -952,13 +1117,14 @@ String WarhogMode::generateFilename(const char* ext) {
 void WarhogMode::promiscuousCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
     if (type != WIFI_PKT_MGMT) return;
     if (beaconMapBusy) return;
+    if (!buf) return;  // Null check for safety
     
     wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
     const uint8_t* frame = pkt->payload;
     uint16_t len = pkt->rx_ctrl.sig_len;
     int8_t rssi = pkt->rx_ctrl.rssi;
     
-    if (len < 24) return;
+    if (len < 24 || len > 2048) return;  // Bounds check to prevent invalid lengths
     
     uint16_t frameControl = frame[0] | (frame[1] << 8);
     uint8_t frameType = (frameControl >> 2) & 0x03;
@@ -971,17 +1137,23 @@ void WarhogMode::promiscuousCallback(void* buf, wifi_promiscuous_pkt_type_t type
     uint64_t key = bssidToKey(bssid);
     
     WiFiFeatures features = FeatureExtractor::extractFromBeacon(frame, len, rssi);
-    
-    if (beaconFeatures.size() < 500) {
-        auto it = beaconFeatures.find(key);
-        if (it != beaconFeatures.end()) {
-            it->second.beaconCount++;
-        } else {
-            features.beaconCount = 1;
-            beaconFeatures[key] = features;
+
+    // Use timeout for mutex to prevent blocking indefinitely in interrupt context
+    if (beaconMutex && xSemaphoreTake(beaconMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        // Limit beaconFeatures size to prevent memory exhaustion
+        if (beaconFeatures.size() < 500) {
+            auto it = beaconFeatures.find(key);
+            if (it != beaconFeatures.end()) {
+                it->second.beaconCount++;
+            } else {
+                features.beaconCount = 1;
+                beaconFeatures[key] = features;
+            }
+            beaconCount++;
         }
-        beaconCount++;
+        xSemaphoreGive(beaconMutex);
     }
+    // If mutex unavailable, skip adding to map (safe fallback)
 }
 
 void WarhogMode::startEnhancedCapture() {

@@ -65,6 +65,12 @@ private:
     static uint32_t androidCount;
     static uint32_t samsungCount;
     static uint32_t windowsCount;
+
+    // BLE state synchronization helpers
+    static bool getAdvertisingNow();
+    static void setAdvertisingNow(bool value);
+    static bool getScanRunning();
+    static void setScanRunning(bool value);
     
     // Internal methods
     static bool showWarningDialog();
@@ -90,4 +96,5 @@ public:
     void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override;
     void onScanEnd(const NimBLEScanResults& results, int reason) override;
 };
+
 

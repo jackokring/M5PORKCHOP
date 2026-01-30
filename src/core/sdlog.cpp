@@ -2,6 +2,7 @@
 
 #include "sdlog.h"
 #include "config.h"
+#include "sd_layout.h"
 #include <SD.h>
 #include <stdarg.h>
 
@@ -38,12 +39,13 @@ void SDLog::ensureLogFile() {
     if (!Config::isSDAvailable()) return;
     
     // Create logs directory if needed
-    if (!SD.exists("/logs")) {
-        SD.mkdir("/logs");
+    const char* logsDir = SDLayout::logsDir();
+    if (!SD.exists(logsDir)) {
+        SD.mkdir(logsDir);
     }
     
     // Use fixed filename - easier to find and read
-    currentLogFile = "/logs/porkchop.log";
+    currentLogFile = String(logsDir) + "/porkchop.log";
     
     // Create file with header
     File f = SD.open(currentLogFile.c_str(), FILE_WRITE);

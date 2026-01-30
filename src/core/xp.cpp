@@ -3,6 +3,7 @@
 #include "xp.h"
 #include "sdlog.h"
 #include "config.h"
+#include "sd_layout.h"
 #include "challenges.h"
 #include "../ui/display.h"
 #include "../ui/swine_stats.h"
@@ -10,6 +11,8 @@
 #include <M5Unified.h>
 #include <SD.h>
 #include <esp_mac.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 // SD backup file path - immortal pig survives M5Burner
 //
@@ -19,7 +22,6 @@
 //  Every veteran typed it. Every veteran lived forever.
 //  The slayer's first gift before the slaying began."
 //
-static const char* XP_BACKUP_FILE = "/xp_backup.bin";
 
 // Static member initialization
 PorkXPData XP::data = {0};
@@ -30,7 +32,11 @@ void (*XP::levelUpCallback)(uint8_t, uint8_t) = nullptr;
 
 // Deferred save flag - set by achievements/unlockables, processed by processPendingSave()
 // Avoids SD writes during active WiFi promiscuous mode (bus contention)
-static volatile bool pendingSaveFlag = false;
+// Protected by achQueueMutex to prevent race conditions
+static bool pendingSaveFlag = false;
+
+// Mutex for protecting achievement queue operations AND pendingSaveFlag
+static SemaphoreHandle_t achQueueMutex = nullptr;
 
 // Achievement queue - prevents cascade of sounds/toasts when multiple unlock at once
 // Achievements are queued and processed one per frame via processAchievementQueue()
@@ -236,7 +242,9 @@ static const char* ACHIEVEMENT_NAMES[] = {
     // CLIENT MONITOR achievements (bits 60-62)
     "QU1CK DR4W",         // 5 clients in 30 seconds
     "D34D 3Y3",           // Deauth within 2 seconds of entering
-    "H1GH N00N"           // Deauth during noon hour
+    "H1GH N00N",          // Deauth during noon hour
+    // Ultimate achievement (bit 63)
+    "TH3_C0MPL3T10N1ST"
 };
 static const uint8_t ACHIEVEMENT_COUNT = sizeof(ACHIEVEMENT_NAMES) / sizeof(ACHIEVEMENT_NAMES[0]);
 
@@ -274,6 +282,10 @@ static uint32_t calculateDeviceBoundCRC(const PorkXPData* xpData, size_t dataSiz
         for (int j = 0; j < 8; j++) {
             crc = (crc >> 1) ^ (0xEDB88320 & -(crc & 1));
         }
+        // Yield periodically to prevent WDT issues during long CRC calculations
+        if (i % 100 == 0) {
+            delay(1);  // Allow other tasks to run
+        }
     }
     // the binding ritual
     for (int i = 0; i < 6; i++) {
@@ -291,7 +303,8 @@ bool XP::backupToSD() {
         return false;
     }
     
-    File f = SD.open(XP_BACKUP_FILE, FILE_WRITE);
+    const char* backupPath = SDLayout::xpBackupPath();
+    File f = SD.open(backupPath, FILE_WRITE);
     if (!f) {
         Serial.println("[XP] SD backup: failed to open file");
         return false;
@@ -320,12 +333,13 @@ bool XP::restoreFromSD() {
         return false;
     }
     
-    if (!SD.exists(XP_BACKUP_FILE)) {
+    const char* backupPath = SDLayout::xpBackupPath();
+    if (!SD.exists(backupPath)) {
         Serial.println("[XP] SD restore: no backup file found");
         return false;
     }
-    
-    File f = SD.open(XP_BACKUP_FILE, FILE_READ);
+
+    File f = SD.open(backupPath, FILE_READ);
     if (!f) {
         Serial.println("[XP] SD restore: failed to open file");
         return false;
@@ -412,6 +426,11 @@ bool XP::restoreFromSD() {
 
 void XP::init() {
     if (initialized) return;
+    
+    // Initialize achievement queue mutex
+    if (achQueueMutex == nullptr) {
+        achQueueMutex = xSemaphoreCreateMutex();
+    }
     
     // Initialize achievement queue
     achQueueHead = 0;
@@ -520,8 +539,18 @@ void XP::save() {
 void XP::processPendingSave() {
     // Process deferred saves from achievements/unlockables
     // Call from safe context (mode exit, IDLE, etc.) to avoid SD bus contention
-    if (pendingSaveFlag) {
-        pendingSaveFlag = false;
+    bool needsSave = false;
+    
+    // Protect flag access with mutex to prevent race with unlockAchievement()
+    if (achQueueMutex != nullptr && xSemaphoreTake(achQueueMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        needsSave = pendingSaveFlag;
+        if (needsSave) {
+            pendingSaveFlag = false;
+        }
+        xSemaphoreGive(achQueueMutex);
+    }
+    
+    if (needsSave) {
         save();
         Serial.println("[XP] Deferred save completed");
     }
@@ -583,7 +612,12 @@ void XP::endSession() {
 }
 
 void XP::addXP(XPEvent event) {
-    uint16_t amount = XP_VALUES[static_cast<uint8_t>(event)];
+    uint8_t eventIdx = static_cast<uint8_t>(event);
+    // Bounds check to prevent array access violation
+    if (eventIdx >= sizeof(XP_VALUES) / sizeof(XP_VALUES[0])) {
+        return; // Invalid event type, silently ignore
+    }
+    uint16_t amount = XP_VALUES[eventIdx];
     
     // Track lifetime stats based on event type
     switch (event) {
@@ -834,12 +868,22 @@ void XP::addXP(uint16_t amount) {
         uint8_t roll = random(0, 100);
         if (roll >= 98) {
             // JACKPOT! 2% chance for 5x
-            amount *= 5;
+            // Prevent overflow by checking before multiplication
+            if (amount <= UINT16_MAX / 5) {
+                amount *= 5;
+            } else {
+                amount = UINT16_MAX;  // Cap at max value
+            }
             Display::showToast("JACKPOT!");
             SFX::play(SFX::JACKPOT_XP);  // Non-blocking celebration
         } else if (roll >= 90) {
             // Bonus! 8% chance for 2x
-            amount *= 2;
+            // Prevent overflow by checking before multiplication
+            if (amount <= UINT16_MAX / 2) {
+                amount *= 2;
+            } else {
+                amount = UINT16_MAX;  // Cap at max value
+            }
         }
     }
     
@@ -849,33 +893,67 @@ void XP::addXP(uint16_t amount) {
     if (streakAppliesForCurrentEvent) {
         if (captureStreak >= 20) {
             // 20 or more captures -> +50%
-            amount = (uint16_t)((amount * 150) / 100);
+            // Prevent overflow: multiply by 1.5 without exceeding limits
+            if (amount <= UINT16_MAX / 3) {
+                amount = (uint16_t)((amount * 150) / 100);
+            } else {
+                amount = UINT16_MAX;  // Cap at max value
+            }
         } else if (captureStreak >= 10) {
             // 10–19 captures -> +35%
-            amount = (uint16_t)((amount * 135) / 100);
+            // Prevent overflow: multiply by 1.35 without exceeding limits
+            if (amount <= UINT16_MAX / 1.35) {
+                amount = (uint16_t)((amount * 135) / 100);
+            } else {
+                amount = UINT16_MAX;  // Cap at max value
+            }
         } else if (captureStreak >= 5) {
             // 5–9 captures -> +20%
-            amount = (uint16_t)((amount * 120) / 100);
+            // Prevent overflow: multiply by 1.2 without exceeding limits
+            if (amount <= UINT16_MAX / 1.2) {
+                amount = (uint16_t)((amount * 120) / 100);
+            } else {
+                amount = UINT16_MAX;  // Cap at max value
+            }
         } else if (captureStreak >= 3) {
             // 3–4 captures -> +10%
-            amount = (uint16_t)((amount * 110) / 100);
+            // Prevent overflow: multiply by 1.1 without exceeding limits
+            if (amount <= UINT16_MAX / 1.1) {
+                amount = (uint16_t)((amount * 110) / 100);
+            } else {
+                amount = UINT16_MAX;  // Cap at max value
+            }
         }
     }
     
     // Apply buff/debuff XP multiplier (SNOUT$HARP +18%, F0GSNOUT -10%)
     float mult = SwineStats::getXPMultiplier();
-    uint16_t modifiedAmount = (uint16_t)(amount * mult);
+    // Prevent overflow when applying multiplier
+    uint32_t tempAmount = (uint32_t)amount * mult;
+    uint16_t modifiedAmount = (tempAmount > UINT16_MAX) ? UINT16_MAX : (uint16_t)tempAmount;
     if (modifiedAmount < 1) modifiedAmount = 1;  // Always at least 1 XP
     
     uint8_t oldLevel = data.cachedLevel;
     
-    data.totalXP += modifiedAmount;
-    session.xp += modifiedAmount;
+    // Prevent total XP overflow - cap at max possible level threshold
+    uint32_t maxThreshold = getXPForLevel(MAX_LEVEL);
+    if (data.totalXP <= maxThreshold && (data.totalXP + modifiedAmount) > maxThreshold) {
+        // Cap at max level threshold to prevent overflow beyond max level
+        modifiedAmount = (uint32_t)(maxThreshold - data.totalXP);
+    } else if (data.totalXP > maxThreshold) {
+        // If already past max level, don't add more XP
+        modifiedAmount = 0;
+    }
+    
+    if (modifiedAmount > 0) {
+        data.totalXP += modifiedAmount;
+        session.xp += modifiedAmount;
 
-    // Record last significant XP gain for UI (show +XP<N> under the bar)
-    if (modifiedAmount > 2) {
-        lastXPGainAmount = modifiedAmount;
-        lastXPGainMs = millis();
+        // Record last significant XP gain for UI (show +XP<N> under the bar)
+        if (modifiedAmount > 2) {
+            lastXPGainAmount = modifiedAmount;
+            lastXPGainMs = millis();
+        }
     }
     
     uint8_t newLevel = calculateLevel(data.totalXP);
@@ -898,18 +976,32 @@ void XP::addXPSilent(uint16_t amount) {
     
     // Apply buff/debuff XP multiplier (SNOUT$HARP +18%, F0GSNOUT -10%)
     float mult = SwineStats::getXPMultiplier();
-    uint16_t modifiedAmount = (uint16_t)(amount * mult);
+    // Prevent overflow when applying multiplier
+    uint32_t tempAmount = (uint32_t)amount * mult;
+    uint16_t modifiedAmount = (tempAmount > UINT16_MAX) ? UINT16_MAX : (uint16_t)tempAmount;
     if (modifiedAmount < 1) modifiedAmount = 1;
     
     uint8_t oldLevel = data.cachedLevel;
     
-    data.totalXP += modifiedAmount;
-    session.xp += modifiedAmount;
+    // Prevent total XP overflow - cap at max possible level threshold
+    uint32_t maxThreshold = getXPForLevel(MAX_LEVEL);
+    if (data.totalXP <= maxThreshold && (data.totalXP + modifiedAmount) > maxThreshold) {
+        // Cap at max level threshold to prevent overflow beyond max level
+        modifiedAmount = (uint32_t)(maxThreshold - data.totalXP);
+    } else if (data.totalXP > maxThreshold) {
+        // If already past max level, don't add more XP
+        modifiedAmount = 0;
+    }
+    
+    if (modifiedAmount > 0) {
+        data.totalXP += modifiedAmount;
+        session.xp += modifiedAmount;
 
-    // Record last significant XP gain for UI
-    if (modifiedAmount > 2) {
-        lastXPGainAmount = modifiedAmount;
-        lastXPGainMs = millis();
+        // Record last significant XP gain for UI
+        if (modifiedAmount > 2) {
+            lastXPGainAmount = modifiedAmount;
+            lastXPGainMs = millis();
+        }
     }
     
     uint8_t newLevel = calculateLevel(data.totalXP);
@@ -1212,12 +1304,15 @@ void XP::unlockAchievement(PorkAchievement ach) {
     // Queue achievement for celebration (prevents cascade of sounds)
     // Celebration happens in processAchievementQueue() called from main loop
     if (initialized) {
-        uint8_t nextHead = (achQueueHead + 1) % ACH_QUEUE_SIZE;
-        if (nextHead != achQueueTail) {  // Not full
-            achQueue[achQueueHead] = ach;
-            achQueueHead = nextHead;
+        // Protect the queue with mutex
+        if (achQueueMutex != nullptr && xSemaphoreTake(achQueueMutex, portMAX_DELAY) == pdTRUE) {
+            uint8_t nextHead = (achQueueHead + 1) % ACH_QUEUE_SIZE;
+            if (nextHead != achQueueTail) {  // Not full
+                achQueue[achQueueHead] = ach;
+                achQueueHead = nextHead;
+            }
+            xSemaphoreGive(achQueueMutex);
         }
-        // If queue full, achievement is still unlocked, just no fanfare (rare edge case)
     }
     
     // Defer save to avoid SD writes during active WiFi mode
@@ -1228,28 +1323,37 @@ void XP::unlockAchievement(PorkAchievement ach) {
 void XP::processAchievementQueue() {
     // Process ONE queued achievement per call (debounced)
     // Called from main loop to spread celebrations across frames
-    if (achQueueTail == achQueueHead) return;  // Queue empty
-    
-    uint32_t now = millis();
-    if (now - lastAchievementTime < ACH_COOLDOWN_MS) return;  // Cooldown active
-    
-    PorkAchievement ach = achQueue[achQueueTail];
-    achQueueTail = (achQueueTail + 1) % ACH_QUEUE_SIZE;
-    lastAchievementTime = now;
-    
-    // Find achievement name
-    uint8_t idx = 0;
-    uint64_t mask = 1ULL;
-    while (mask < (uint64_t)ach && idx < ACHIEVEMENT_COUNT - 1) {
-        mask <<= 1;
-        idx++;
+    if (achQueueMutex != nullptr && xSemaphoreTake(achQueueMutex, portMAX_DELAY) == pdTRUE) {
+        if (achQueueTail == achQueueHead) {
+            xSemaphoreGive(achQueueMutex);
+            return;  // Queue empty
+        }
+
+        uint32_t now = millis();
+        if (now - lastAchievementTime < ACH_COOLDOWN_MS) {
+            xSemaphoreGive(achQueueMutex);
+            return;  // Cooldown active
+        }
+
+        PorkAchievement ach = achQueue[achQueueTail];
+        achQueueTail = (achQueueTail + 1) % ACH_QUEUE_SIZE;
+        lastAchievementTime = now;
+        xSemaphoreGive(achQueueMutex);
+
+        // Find achievement name
+        uint8_t idx = 0;
+        uint64_t mask = 1ULL;
+        while (mask < (uint64_t)ach && idx < ACHIEVEMENT_COUNT - 1) {
+            mask <<= 1;
+            idx++;
+        }
+
+        // NOW do the celebration (one at a time, with cooldown)
+        char toastMsg[48];
+        snprintf(toastMsg, sizeof(toastMsg), "* %s *", ACHIEVEMENT_NAMES[idx]);
+        Display::showToast(toastMsg);
+        SFX::play(SFX::ACHIEVEMENT);
     }
-    
-    // NOW do the celebration (one at a time, with cooldown)
-    char toastMsg[48];
-    snprintf(toastMsg, sizeof(toastMsg), "* %s *", ACHIEVEMENT_NAMES[idx]);
-    Display::showToast(toastMsg);
-    SFX::play(SFX::ACHIEVEMENT);
 }
 
 bool XP::hasAchievement(PorkAchievement ach) {
@@ -1268,6 +1372,10 @@ uint8_t XP::getUnlockedCount() {
         ach >>= 1;
     }
     return count;
+}
+
+uint8_t XP::getAchievementCount() {
+    return ACHIEVEMENT_COUNT;
 }
 
 // Unlockables (v0.1.8) - secret challenges
@@ -1693,20 +1801,39 @@ void XP::drawBar(M5Canvas& canvas) {
     int levelW = canvas.textWidth(levelStr);
     canvas.drawString(levelStr, 2, barY);
     
-    // Title - fill space between level and XP: label
+    // Title - fill space between level and XP: label (avoid String to prevent heap churn)
     const char* title = getTitle();
-    String titleStr = title;
     int titleX = 2 + levelW + 4;  // 4px gap after level
     int maxTitleW = xpLabelX - titleX - 4;  // Available space for title
     
-    // Truncate only if really needed
-    while (canvas.textWidth(titleStr) > maxTitleW && titleStr.length() > 3) {
-        titleStr = titleStr.substring(0, titleStr.length() - 1);
+    // Check if title fits without truncation
+    int titleW = canvas.textWidth(title);
+    if (titleW <= maxTitleW) {
+        // Title fits, draw as-is
+        canvas.drawString(title, titleX, barY);
+    } else {
+        // Title too long, truncate to stack buffer to avoid heap alloc
+        char titleBuf[24];  // Max title length ~15 chars + ".." + null
+        size_t titleLen = strlen(title);
+        if (titleLen > sizeof(titleBuf) - 3) titleLen = sizeof(titleBuf) - 3;
+        
+        // Binary search for fitting length
+        size_t len = titleLen;
+        while (len > 3) {
+            memcpy(titleBuf, title, len);
+            titleBuf[len] = '\0';
+            if (canvas.textWidth(titleBuf) + canvas.textWidth("..") <= maxTitleW) {
+                break;
+            }
+            len--;
+        }
+        
+        // Append ".." if truncated
+        if (len < titleLen) {
+            strcpy(titleBuf + len, "..");
+        }
+        canvas.drawString(titleBuf, titleX, barY);
     }
-    if (titleStr.length() < strlen(title)) {
-        titleStr = titleStr.substring(0, titleStr.length() - 2) + "..";
-    }
-    canvas.drawString(titleStr, titleX, barY);
 }
 
 // ============ TOP BAR XP NOTIFICATION (Option B) ============
@@ -1751,19 +1878,39 @@ void XP::drawTopBarXP(M5Canvas& topBar) {
     int xpW = topBar.textWidth(xpStr);
     int xpX = DISPLAY_W - xpW - 2;
     
-    // Max title width
+    // Max title width (avoid String to prevent heap churn in hot path)
     int maxTitleW = xpX - titleX - 6;
-    String titleStr = title;
-    while (topBar.textWidth(titleStr) > maxTitleW && titleStr.length() > 3) {
-        titleStr = titleStr.substring(0, titleStr.length() - 1);
-    }
-    if (titleStr.length() < strlen(title)) {
-        titleStr = titleStr.substring(0, titleStr.length() - 2) + "..";
+    int titleW = topBar.textWidth(title);
+    
+    if (titleW <= maxTitleW) {
+        // Title fits, draw as-is
+        topBar.drawString(title, titleX, 3);
+    } else {
+        // Title too long, truncate to stack buffer
+        char titleBuf[24];
+        size_t titleLen = strlen(title);
+        if (titleLen > sizeof(titleBuf) - 3) titleLen = sizeof(titleBuf) - 3;
+        
+        // Find fitting length
+        size_t len = titleLen;
+        while (len > 3) {
+            memcpy(titleBuf, title, len);
+            titleBuf[len] = '\0';
+            if (topBar.textWidth(titleBuf) + topBar.textWidth("..") <= maxTitleW) {
+                break;
+            }
+            len--;
+        }
+        
+        // Append ".." if truncated
+        if (len < titleLen) {
+            strcpy(titleBuf + len, "..");
+        }
+        topBar.drawString(titleBuf, titleX, 3);
     }
     
-    // Draw
+    // Draw level and XP gain
     topBar.drawString(levelStr, 2, 3);
-    topBar.drawString(titleStr, titleX, 3);
     topBar.setTextDatum(top_right);
     topBar.drawString(xpStr, DISPLAY_W - 2, 3);
 }

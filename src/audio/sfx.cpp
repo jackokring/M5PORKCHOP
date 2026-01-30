@@ -12,6 +12,8 @@
 #include "sfx.h"
 #include "../core/config.h"
 #include <M5Unified.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 namespace SFX {
 
@@ -279,6 +281,7 @@ static constexpr uint8_t QUEUE_SIZE = 4;
 static Event eventQueue[QUEUE_SIZE];
 static volatile uint8_t queueHead = 0;  // next write position
 static volatile uint8_t queueTail = 0;  // next read position
+static portMUX_TYPE queueMutex = portMUX_INITIALIZER_UNLOCKED;
 
 // ==[ IMPLEMENTATION ]==
 
@@ -309,10 +312,13 @@ void play(Event event) {
         currentSequence = nullptr;
         currentStep = 0;
         // Clear queue on priority
+        taskENTER_CRITICAL(&queueMutex);
         queueHead = queueTail = 0;
+        taskEXIT_CRITICAL(&queueMutex);
     }
     
     // Enqueue event (ring buffer - drops oldest if full)
+    taskENTER_CRITICAL(&queueMutex);
     uint8_t nextHead = (queueHead + 1) % QUEUE_SIZE;
     if (nextHead == queueTail) {
         // Buffer full - advance tail (drop oldest)
@@ -320,6 +326,7 @@ void play(Event event) {
     }
     eventQueue[queueHead] = event;
     queueHead = nextHead;
+    taskEXIT_CRITICAL(&queueMutex);
 }
 
 static void startSequence(const Note* seq) {
@@ -338,16 +345,24 @@ bool update() {
     // Skip if sound disabled
     if (!Config::personality().soundEnabled) {
         // Clear any queued events
+        taskENTER_CRITICAL(&queueMutex);
         queueHead = queueTail;
+        taskEXIT_CRITICAL(&queueMutex);
         currentSequence = nullptr;
         return false;
     }
     
     // Process queued event if nothing playing
-    if (queueTail != queueHead && currentSequence == nullptr) {
-        Event e = eventQueue[queueTail];
+    taskENTER_CRITICAL(&queueMutex);
+    bool hasEvents = (queueTail != queueHead && currentSequence == nullptr);
+    Event e = NONE;
+    if (hasEvents) {
+        e = eventQueue[queueTail];
         queueTail = (queueTail + 1) % QUEUE_SIZE;
-        
+    }
+    taskEXIT_CRITICAL(&queueMutex);
+    
+    if (hasEvents) {
         switch (e) {
             case DEAUTH:
                 startSequence(SND_DEAUTH);
@@ -440,7 +455,10 @@ bool update() {
     
     // Process current sequence
     if (currentSequence == nullptr) {
-        return (queueTail != queueHead);  // More events waiting?
+        taskENTER_CRITICAL(&queueMutex);
+        bool eventsWaiting = (queueTail != queueHead);
+        taskEXIT_CRITICAL(&queueMutex);
+        return eventsWaiting;  // More events waiting?
     }
     
     uint32_t now = millis();
@@ -450,7 +468,10 @@ bool update() {
     if (note.duration == 0) {
         currentSequence = nullptr;
         currentStep = 0;
-        return (queueTail != queueHead);
+        taskENTER_CRITICAL(&queueMutex);
+        bool eventsWaiting = (queueTail != queueHead);
+        taskEXIT_CRITICAL(&queueMutex);
+        return eventsWaiting;
     }
     
     if (inNote) {
@@ -491,13 +512,18 @@ bool update() {
 }
 
 bool isPlaying() {
-    return currentSequence != nullptr || (queueTail != queueHead);
+    taskENTER_CRITICAL(&queueMutex);
+    bool playing = currentSequence != nullptr || (queueTail != queueHead);
+    taskEXIT_CRITICAL(&queueMutex);
+    return playing;
 }
 
 void stop() {
     currentSequence = nullptr;
     currentStep = 0;
+    taskENTER_CRITICAL(&queueMutex);
     queueHead = queueTail = 0;
+    taskEXIT_CRITICAL(&queueMutex);
     M5.Speaker.stop();
 }
 

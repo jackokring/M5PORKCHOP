@@ -52,7 +52,7 @@ static const char* const H_BLUES[] = {
     "BECAUSE SILENCE IS FOR WELL-ADJUSTED.",
     "I OPTIMIZED IT. NOW IT FAILS FASTER."
 };
-static const char* const H_DNHAM[] = {
+static const char* const H_DNOHAM[] = {
     "DO NO HAM. ZERO TX. PURE POVERTY.",
     "PASSIVE MODE: MY WILL TO DEBUG.",
     "NO PSRAM. ONLY VIBES."
@@ -132,6 +132,11 @@ static const char* const H_DIAG[] = {
     "STABLE. YEAH. PREDICTABLE? LOL.",
     "HEALTHCHECK PASSED. YOU DIED."
 };
+static const char* const H_SDFMT[] = {
+    "FAT32 OR BUST.",
+    "WIPE THE PAST. FORMAT THE FUTURE.",
+    "SD CARD REBORN."
+};
 static const char* const H_ABOUT[] = {
     "IT WAS not A MISTAKE. ",
     "CREDIT ROLLS. HEAP FALLS.",
@@ -151,14 +156,14 @@ const uint8_t Menu::ROOT_COUNT = sizeof(ROOT_ITEMS) / sizeof(ROOT_ITEMS[0]);
 
 // Group: ATTACK - offensive TX operations
 const MenuItem Menu::GROUP_ATTACK[] = {
-    {"/>", "OINK",   1,  H_OINK,   (uint8_t)(sizeof(H_OINK)/sizeof(H_OINK[0]))},
+    {"/>", "OINKS",  1,  H_OINK,   (uint8_t)(sizeof(H_OINK)/sizeof(H_OINK[0]))},
     {"!!", "BLUES", 8,  H_BLUES,  (uint8_t)(sizeof(H_BLUES)/sizeof(H_BLUES[0]))}
 };
 const uint8_t Menu::GROUP_ATTACK_SIZE = sizeof(GROUP_ATTACK) / sizeof(GROUP_ATTACK[0]);
 
 // Group: RECON - passive RX intelligence
 const MenuItem Menu::GROUP_RECON[] = {
-    {"o~", "DNHAM",   14, H_DNHAM,  (uint8_t)(sizeof(H_DNHAM)/sizeof(H_DNHAM[0]))},
+    {"o~", "DNOHAM",  14, H_DNOHAM, (uint8_t)(sizeof(H_DNOHAM)/sizeof(H_DNOHAM[0]))},
     {"<>", "WARHOG",  2,  H_WARHOG, (uint8_t)(sizeof(H_WARHOG)/sizeof(H_WARHOG[0]))},
     {"~~", "SPCTRM", 10,  H_SPCTRM, (uint8_t)(sizeof(H_SPCTRM)/sizeof(H_SPCTRM[0]))}
 };
@@ -192,9 +197,10 @@ const uint8_t Menu::GROUP_RANK_SIZE = sizeof(GROUP_RANK) / sizeof(GROUP_RANK[0])
 const MenuItem Menu::GROUP_SYSTEM[] = {
     {"==", "SETTINGS",   5,  H_SETTINGS, (uint8_t)(sizeof(H_SETTINGS)/sizeof(H_SETTINGS[0]))},
     {"[]", "BOARBROS",  12, H_BRBRS,    (uint8_t)(sizeof(H_BRBRS)/sizeof(H_BRBRS[0]))},
-    {"!!", "CRASHES",    7,  H_CRASHES,  (uint8_t)(sizeof(H_CRASHES)/sizeof(H_CRASHES[0]))},
-    {"::", "DIAG",       19, H_DIAG,     (uint8_t)(sizeof(H_DIAG)/sizeof(H_DIAG[0]))},
-    {":?", "ABOUT",      6,  H_ABOUT,    (uint8_t)(sizeof(H_ABOUT)/sizeof(H_ABOUT[0]))}
+    {"!!", "COREDUMP",  7,  H_CRASHES,  (uint8_t)(sizeof(H_CRASHES)/sizeof(H_CRASHES[0]))},
+    {"::", "DIAGDATA",   19, H_DIAG,     (uint8_t)(sizeof(H_DIAG)/sizeof(H_DIAG[0]))},
+    {"SD", "FORMATSD",  20, H_SDFMT,    (uint8_t)(sizeof(H_SDFMT)/sizeof(H_SDFMT[0]))},
+    {":?", "ABOUTPIG",   6,  H_ABOUT,    (uint8_t)(sizeof(H_ABOUT)/sizeof(H_ABOUT[0]))}
 };
 const uint8_t Menu::GROUP_SYSTEM_SIZE = sizeof(GROUP_SYSTEM) / sizeof(GROUP_SYSTEM[0]);
 
@@ -278,8 +284,8 @@ void Menu::init() {
     modalIdx = 0;
     modalScroll = 0;
     // Seed root hint selection
-    for (uint8_t i = 0; i < ROOT_COUNT; i++) {
-        if (ROOT_ITEMS[i].hintCount) {
+    for (uint8_t i = 0; i < ROOT_COUNT && i < sizeof(rootHintIndex)/sizeof(rootHintIndex[0]); i++) {
+        if (ROOT_ITEMS[i].hintCount > 0) {
             rootHintIndex[i] = esp_random() % ROOT_ITEMS[i].hintCount;
         } else {
             rootHintIndex[i] = 0;
@@ -295,8 +301,8 @@ void Menu::show() {
     modalIdx = 0;
     modalScroll = 0;
     // Rotate root hints on each show
-    for (uint8_t i = 0; i < ROOT_COUNT; i++) {
-        if (ROOT_ITEMS[i].hintCount) {
+    for (uint8_t i = 0; i < ROOT_COUNT && i < sizeof(rootHintIndex)/sizeof(rootHintIndex[0]); i++) {
+        if (ROOT_ITEMS[i].hintCount > 0) {
             rootHintIndex[i] = esp_random() % ROOT_ITEMS[i].hintCount;
         } else {
             rootHintIndex[i] = 0;
@@ -330,13 +336,14 @@ const char* Menu::getSelectedDescription() {
             case GroupId::SYSTEM: indices = systemHintIndex; break;
             default: break;
         }
-        if (items && indices && items[modalIdx].hintCount) {
+        uint8_t groupSize = getGroupSize(activeGroup);
+        if (items && indices && modalIdx < groupSize && items[modalIdx].hintCount > 0 && indices[modalIdx] < items[modalIdx].hintCount) {
             return items[modalIdx].hintPool[indices[modalIdx]];
         }
         return "";
     }
     // At root - return selected root item's hint
-    if (ROOT_ITEMS[rootIdx].hintCount == 0) return "";
+    if (rootIdx >= ROOT_COUNT || ROOT_ITEMS[rootIdx].hintCount == 0 || rootHintIndex[rootIdx] >= ROOT_ITEMS[rootIdx].hintCount) return "";
     return ROOT_ITEMS[rootIdx].hintPool[rootHintIndex[rootIdx]];
 }
 
@@ -449,7 +456,7 @@ void Menu::handleInput() {
                 uint8_t* indices = nullptr;
                 switch (activeGroup) {
                     case GroupId::ATTACK: indices = attackHintIndex; break;
-                    case GroupId::RECON:  indices = reconHintIndex;  break;
+                    case GroupId::RECON:  indices = reconHintIndex; break;
                     case GroupId::LOOT:   indices = lootHintIndex;   break;
                     case GroupId::COMMS:  indices = commsHintIndex;  break;
                     case GroupId::RANK:   indices = rankHintIndex;   break;
@@ -457,8 +464,18 @@ void Menu::handleInput() {
                     default: break;
                 }
                 if (items && indices) {
-                    for (uint8_t i = 0; i < groupSize; i++) {
-                        if (items[i].hintCount) {
+                    uint8_t maxIndex = 0;
+                    switch (activeGroup) {
+                        case GroupId::ATTACK: maxIndex = sizeof(attackHintIndex)/sizeof(attackHintIndex[0]); break;
+                        case GroupId::RECON:  maxIndex = sizeof(reconHintIndex)/sizeof(reconHintIndex[0]); break;
+                        case GroupId::LOOT:   maxIndex = sizeof(lootHintIndex)/sizeof(lootHintIndex[0]); break;
+                        case GroupId::COMMS:  maxIndex = sizeof(commsHintIndex)/sizeof(commsHintIndex[0]); break;
+                        case GroupId::RANK:   maxIndex = sizeof(rankHintIndex)/sizeof(rankHintIndex[0]); break;
+                        case GroupId::SYSTEM: maxIndex = sizeof(systemHintIndex)/sizeof(systemHintIndex[0]); break;
+                        default: maxIndex = 0; break;
+                    }
+                    for (uint8_t i = 0; i < groupSize && i < maxIndex; i++) {
+                        if (items[i].hintCount > 0) {
                             indices[i] = esp_random() % items[i].hintCount;
                         } else {
                             indices[i] = 0;
@@ -504,7 +521,7 @@ void Menu::drawRoot(M5Canvas& canvas) {
     canvas.setTextSize(2);
     char titleBuf[32];
     const RootItem& sel = ROOT_ITEMS[rootIdx];
-    if (sel.icon && sel.icon[0]) {
+    if (sel.icon && sel.icon[0] && strlen(sel.icon) < sizeof(titleBuf) - 10) {  // Ensure enough space for " PORKCHOP OS"
         snprintf(titleBuf, sizeof(titleBuf), "%s PORKCHOP OS", sel.icon);
     } else {
         strncpy(titleBuf, "PORKCHOP OS", sizeof(titleBuf) - 1);
@@ -543,9 +560,35 @@ void Menu::drawRoot(M5Canvas& canvas) {
         char labelBuf[40];
         const char* icon = (item.icon && item.icon[0]) ? item.icon : ">";
         if (item.type == RootType::GROUP) {
-            snprintf(labelBuf, sizeof(labelBuf), "%s %s >", icon, item.label);
+            // Check that the combined length won't exceed buffer size
+            size_t totalLen = strlen(icon) + strlen(item.label) + 3; // +3 for " >" and null terminator
+            if (totalLen <= sizeof(labelBuf)) {
+                snprintf(labelBuf, sizeof(labelBuf), "%s %s >", icon, item.label);
+            } else {
+                // Truncate the label to fit in the buffer
+                size_t maxLabelLen = sizeof(labelBuf) - strlen(icon) - 3; // -3 for " >" and null terminator
+                if (maxLabelLen > 0) {
+                    snprintf(labelBuf, sizeof(labelBuf), "%s %.*s >", icon, (int)maxLabelLen, item.label);
+                } else {
+                    strncpy(labelBuf, icon, sizeof(labelBuf) - 1);
+                    labelBuf[sizeof(labelBuf) - 1] = '\0';
+                }
+            }
         } else {
-            snprintf(labelBuf, sizeof(labelBuf), "%s %s", icon, item.label);
+            // Check that the combined length won't exceed buffer size
+            size_t totalLen = strlen(icon) + strlen(item.label) + 2; // +2 for space and null terminator
+            if (totalLen <= sizeof(labelBuf)) {
+                snprintf(labelBuf, sizeof(labelBuf), "%s %s", icon, item.label);
+            } else {
+                // Truncate the label to fit in the buffer
+                size_t maxLabelLen = sizeof(labelBuf) - strlen(icon) - 2; // -2 for space and null terminator
+                if (maxLabelLen > 0) {
+                    snprintf(labelBuf, sizeof(labelBuf), "%s %.*s", icon, (int)maxLabelLen, item.label);
+                } else {
+                    strncpy(labelBuf, icon, sizeof(labelBuf) - 1);
+                    labelBuf[sizeof(labelBuf) - 1] = '\0';
+                }
+            }
         }
         canvas.drawString(labelBuf, 10, y);
     }
@@ -622,8 +665,13 @@ void Menu::drawModal(M5Canvas& canvas) {
 
         constexpr int kMaxLabelChars = 10;  // keep width with icon
         char shortLabel[kMaxLabelChars + 1];
-        strncpy(shortLabel, item.label, kMaxLabelChars);
-        shortLabel[kMaxLabelChars] = '\0';
+        // Ensure we don't copy more characters than the buffer can hold
+        if (strlen(item.label) <= kMaxLabelChars) {
+            strcpy(shortLabel, item.label);
+        } else {
+            strncpy(shortLabel, item.label, kMaxLabelChars);
+            shortLabel[kMaxLabelChars] = '\0';
+        }
         canvas.print(shortLabel);
     }
     
@@ -639,4 +687,3 @@ void Menu::drawModal(M5Canvas& canvas) {
         canvas.print("v");
     }
 }
-

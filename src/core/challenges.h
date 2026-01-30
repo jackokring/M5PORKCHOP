@@ -56,7 +56,7 @@ public:
     static void reset();
     
     // accessors for UI
-    static const ActiveChallenge& get(uint8_t idx);
+    static bool getSnapshot(uint8_t idx, ActiveChallenge& out);
     static uint8_t getActiveCount();
     static uint8_t getCompletedCount();
     static bool allCompleted();

@@ -53,6 +53,8 @@ public:
     // Grass animation control (direction: true=right, false=left)
     static void setGrassMoving(bool moving, bool directionRight = true);
     static bool isGrassMoving() { return grassMoving; }
+    static bool isGrassDirectionRight() { return grassDirection; }
+    static uint16_t getGrassSpeed() { return grassSpeed; }
     static void setGrassSpeed(uint16_t ms);  // Speed in ms per shift (lower = faster)
     static void setGrassPattern(const char* pattern);  // Custom pattern (max 26 chars)
     static void resetGrassPattern();  // Reset to random binary pattern

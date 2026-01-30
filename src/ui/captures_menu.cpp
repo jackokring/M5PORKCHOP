@@ -3,15 +3,14 @@
 #include "captures_menu.h"
 #include <M5Cardputer.h>
 #include <SD.h>
+#include <WiFi.h>
 #include <time.h>
 #include <ctype.h>
 #include <string.h>
 #include "display.h"
 #include "../web/wpasec.h"
 #include "../core/config.h"
-
-// For heap statistics logging
-#include <esp_heap_caps.h>
+#include "../core/sd_layout.h"
 
 // Static member initialization
 std::vector<CaptureInfo> CapturesMenu::captures;
@@ -21,77 +20,27 @@ bool CapturesMenu::active = false;
 bool CapturesMenu::keyWasPressed = false;
 bool CapturesMenu::nukeConfirmActive = false;
 bool CapturesMenu::detailViewActive = false;
-bool CapturesMenu::connectingWiFi = false;
-bool CapturesMenu::uploadingFile = false;
-bool CapturesMenu::refreshingResults = false;
+bool CapturesMenu::scanInProgress = false;
+unsigned long CapturesMenu::lastScanTime = 0;
+File CapturesMenu::scanDir;
+File CapturesMenu::currentFile;
+bool CapturesMenu::scanComplete = false;
+size_t CapturesMenu::scanProgress = 0;
+bool CapturesMenu::wpasecUpdateInProgress = false;
+unsigned long CapturesMenu::lastWpasecUpdateTime = 0;
+size_t CapturesMenu::wpasecUpdateProgress = 0;
 
-TaskHandle_t CapturesMenu::wpaTaskHandle = nullptr;
-volatile bool CapturesMenu::wpaTaskDone = false;
-volatile bool CapturesMenu::wpaTaskSuccess = false;
-volatile CapturesMenu::WpaTaskAction CapturesMenu::wpaTaskAction = CapturesMenu::WpaTaskAction::NONE;
-uint8_t CapturesMenu::wpaTaskIndex = 0;
-char CapturesMenu::wpaTaskResultMsg[64] = {0};
-
-void CapturesMenu::wpaTaskFn(void* pv) {
-    WpaTaskCtx* ctx = reinterpret_cast<WpaTaskCtx*>(pv);
-
-    // Run WiFi + TLS from a dedicated task with a large stack.
-    // This avoids stack canary panics from mbedTLS handshake inside loopTask.
-
-    bool weConnected = false;
-    if (!WPASec::isConnected()) {
-        connectingWiFi = true;
-        if (!WPASec::connect()) {
-            strncpy(wpaTaskResultMsg, WPASec::getLastError(), sizeof(wpaTaskResultMsg) - 1);
-            wpaTaskResultMsg[sizeof(wpaTaskResultMsg) - 1] = '\0';
-            wpaTaskSuccess = false;
-            wpaTaskAction = ctx->action;
-            wpaTaskIndex = ctx->index;
-            wpaTaskDone = true;
-            connectingWiFi = false;
-            delete ctx;
-            vTaskDelete(nullptr);
-            return;
-        }
-        weConnected = true;
-        connectingWiFi = false;
-    }
-
-    bool ok = false;
-    if (ctx->action == WpaTaskAction::UPLOAD) {
-        uploadingFile = true;
-        ok = WPASec::uploadCapture(ctx->pcapPath);
-        uploadingFile = false;
-    } else if (ctx->action == WpaTaskAction::REFRESH) {
-        refreshingResults = true;
-        ok = WPASec::fetchResults();
-        refreshingResults = false;
-    }
-
-    if (weConnected) {
-        WPASec::disconnect();
-    }
-
-    wpaTaskSuccess = ok;
-    wpaTaskAction = ctx->action;
-    wpaTaskIndex = ctx->index;
-    if (ok) {
-        if (ctx->action == WpaTaskAction::UPLOAD) {
-            strncpy(wpaTaskResultMsg, "UPLOAD OK!", sizeof(wpaTaskResultMsg) - 1);
-        } else {
-            // fetchResults has a user-friendly status string
-            strncpy(wpaTaskResultMsg, WPASec::getStatus(), sizeof(wpaTaskResultMsg) - 1);
-        }
-    } else {
-        strncpy(wpaTaskResultMsg, WPASec::getLastError(), sizeof(wpaTaskResultMsg) - 1);
-    }
-    wpaTaskResultMsg[sizeof(wpaTaskResultMsg) - 1] = '\0';
-
-    wpaTaskDone = true;
-
-    delete ctx;
-    vTaskDelete(nullptr);
-}
+// WPA-SEC Sync state
+bool CapturesMenu::syncModalActive = false;
+SyncState CapturesMenu::syncState = SyncState::IDLE;
+char CapturesMenu::syncStatusText[48] = "";
+uint8_t CapturesMenu::syncProgress = 0;
+uint8_t CapturesMenu::syncTotal = 0;
+unsigned long CapturesMenu::syncStartTime = 0;
+uint8_t CapturesMenu::syncUploaded = 0;
+uint8_t CapturesMenu::syncFailed = 0;
+uint16_t CapturesMenu::syncCracked = 0;
+char CapturesMenu::syncError[48] = "";
 
 void CapturesMenu::init() {
     captures.clear();
@@ -112,42 +61,128 @@ void CapturesMenu::show() {
 
 void CapturesMenu::hide() {
     active = false;
+    
+    // FIX: Always call emergencyCleanup first - ensures file handles closed
+    emergencyCleanup();
+    
+    // Enhanced: Force cleanup even if interrupted
     captures.clear();
-    captures.shrink_to_fit();  // Release vector memory
+    captures.shrink_to_fit();  // Release vector capacity
+    WPASec::freeCacheMemory();
+    
+    // Reset all async state to prevent leaks (redundant after emergencyCleanup but safe)
+    scanInProgress = false;
+    wpasecUpdateInProgress = false;
+    if (scanDir) {
+        scanDir.close();
+    }
+    if (currentFile) {
+        currentFile.close();
+    }
+}
+
+void CapturesMenu::emergencyCleanup() {
+    // Can be called from main loop when heap is critical
+    if (!active) return;
+    
+    Serial.println("[CAPTURES] Emergency cleanup triggered");
+    captures.clear();
+    captures.shrink_to_fit();
+    WPASec::freeCacheMemory();
+    
+    // Stop any in-progress operations
+    scanInProgress = false;
+    wpasecUpdateInProgress = false;
+    if (scanDir) {
+        scanDir.close();
+    }
+    if (currentFile) {
+        currentFile.close();
+    }
 }
 
 bool CapturesMenu::scanCaptures() {
+    // Initialize async scan
     captures.clear();
+    captures.reserve(MAX_CAPTURES);
 
     // Guard: Skip if no SD card available
     if (!Config::isSDAvailable()) {
         Serial.println("[CAPTURES] No SD card available");
+        scanComplete = true;
+        scanInProgress = false;
         return false;
     }
 
     // Create directory if it doesn't exist
-    if (!SD.exists("/handshakes")) {
+    const char* handshakesDir = SDLayout::handshakesDir();
+    if (!SD.exists(handshakesDir)) {
         Serial.println("[CAPTURES] No handshakes directory, creating...");
-        if (!SD.mkdir("/handshakes")) {
+        if (!SD.mkdir(handshakesDir)) {
             Serial.println("[CAPTURES] Failed to create handshakes directory");
+            scanComplete = true;
+            scanInProgress = false;
             return false;
         }
     }
 
-    File dir = SD.open("/handshakes");
-    if (!dir || !dir.isDirectory()) {
+    scanDir = SD.open(handshakesDir);
+    if (!scanDir || !scanDir.isDirectory()) {
         Serial.println("[CAPTURES] Failed to open handshakes directory");
+        scanComplete = true;
+        scanInProgress = false;
+        scanDir.close();
         return false;
     }
 
-    File file = dir.openNextFile();
-    while (file) {
-        if (captures.size() >= MAX_CAPTURES) {
-            Serial.printf("[CAPTURES] Cap reached (%u), skipping rest\n", (unsigned)MAX_CAPTURES);
-            file.close();
+    scanInProgress = true;
+    scanComplete = false;
+    scanProgress = 0;
+    lastScanTime = millis();
+    
+    return true;
+}
+
+void CapturesMenu::processAsyncScan() {
+    if (!scanInProgress || scanComplete) {
+        return;
+    }
+    
+    // Throttle the scan to avoid blocking the UI
+    if (millis() - lastScanTime < SCAN_DELAY) {
+        return;
+    }
+    
+    lastScanTime = millis();
+    
+    // Process a chunk of files
+    size_t processed = 0;
+    while (processed < SCAN_CHUNK_SIZE && !scanComplete) {
+        currentFile = scanDir.openNextFile();
+        
+        if (!currentFile) {
+            // No more files, we're done with scanning
+            scanComplete = true;
+            scanInProgress = false;
+            scanDir.close();
+            
+            // Sort by capture time (newest first)
+            std::sort(captures.begin(), captures.end(), [](const CaptureInfo& a, const CaptureInfo& b) {
+                return a.captureTime > b.captureTime;
+            });
+
+            // Start async WPA-SEC status update after scanning is complete
+            if (!captures.empty()) {
+                wpasecUpdateInProgress = true;
+                wpasecUpdateProgress = 0;
+                lastWpasecUpdateTime = millis();
+            }
+
+            Serial.printf("[CAPTURES] Async scan complete. Found %d captures\n", captures.size());
             break;
         }
-        String name = file.name();
+        
+        String name = currentFile.name();
         bool isPCAP = name.endsWith(".pcap");
         bool isPMKID = name.endsWith(".22000") && !name.endsWith("_hs.22000");
         bool isHS22000 = name.endsWith("_hs.22000");
@@ -156,11 +191,11 @@ bool CapturesMenu::scanCaptures() {
         // Prefer showing _hs.22000 because it's hashcat-ready.
         if (isPCAP) {
             String baseName = name.substring(0, name.indexOf('.'));
-            String hs22kPath = "/handshakes/" + baseName + "_hs.22000";
+            String hs22kPath = String(SDLayout::handshakesDir()) + "/" + baseName + "_hs.22000";
             if (SD.exists(hs22kPath)) {
-                // Close current file before skipping to next to avoid leaking file handles
-                file.close();
-                file = dir.openNextFile();
+                // Close current file and continue to next
+                currentFile.close();
+                processed++;
                 continue;
             }
         }
@@ -168,8 +203,8 @@ bool CapturesMenu::scanCaptures() {
         if (isPCAP || isPMKID || isHS22000) {
             CaptureInfo info;
             info.filename = name;
-            info.fileSize = file.size();
-            info.captureTime = file.getLastWrite();
+            info.fileSize = currentFile.size();
+            info.captureTime = currentFile.getLastWrite();
             info.isPMKID = isPMKID;  // Only true for PMKID files
 
             // Extract BSSID from filename (e.g., "64EEB7208286.pcap" or "64EEB7208286_hs.22000")
@@ -191,8 +226,8 @@ bool CapturesMenu::scanCaptures() {
 
             // Try to get SSID from companion .txt file if it exists. For PMKID we use _pmkid.txt suffix, otherwise .txt
             String txtPath = isPMKID ?
-                "/handshakes/" + baseName + "_pmkid.txt" :
-                "/handshakes/" + baseName + ".txt";
+                (String(SDLayout::handshakesDir()) + "/" + baseName + "_pmkid.txt") :
+                (String(SDLayout::handshakesDir()) + "/" + baseName + ".txt");
             if (SD.exists(txtPath)) {
                 File txtFile = SD.open(txtPath, FILE_READ);
                 if (txtFile) {
@@ -210,39 +245,48 @@ bool CapturesMenu::scanCaptures() {
             info.password = "";
 
             captures.push_back(info);
+            
+            // Hard cap at 100 captures to prevent OOM on devices with limited heap
+            if (captures.size() >= 100) {
+                scanComplete = true;
+                scanInProgress = false;
+                currentFile.close();
+                scanDir.close();
+                Serial.println("[CAPTURES] Hit 100 capture limit, stopped scan");
+                break;
+            }
         }
 
-        // Close current file and move to next
-        file.close();
-        file = dir.openNextFile();
+        // Close current file and increment counter
+        currentFile.close();
+        processed++;
+        scanProgress++;
+        
+        // Yield periodically to allow other tasks to run
+        if (processed >= SCAN_CHUNK_SIZE) {
+            // Still more to do, but yield control back to other tasks
+            break;
+        }
     }
-    dir.close();
-
-    // Update WPA-SEC status for all captures
-    updateWPASecStatus();
-
-    // Sort by capture time (newest first)
-    std::sort(captures.begin(), captures.end(), [](const CaptureInfo& a, const CaptureInfo& b) {
-        return a.captureTime > b.captureTime;
-    });
-
-    Serial.printf("[CAPTURES] Found %d captures\n", captures.size());
-    return true;
 }
 
 void CapturesMenu::updateWPASecStatus() {
     // Load WPA-SEC cache (lazy, only loads once)
     WPASec::loadCache();
     
+    char normalized[13] = {0};
     for (auto& cap : captures) {
         // Normalize BSSID for lookup (remove colons)
-        String normalBssid = cap.bssid;
-        normalBssid.replace(":", "");
+        WPASec::normalizeBSSID_Char(cap.bssid.c_str(), normalized, sizeof(normalized));
+        if (normalized[0] == '\0') {
+            cap.status = CaptureStatus::LOCAL;
+            continue;
+        }
         
-        if (WPASec::isCracked(normalBssid.c_str())) {
+        if (WPASec::isCracked(normalized)) {
             cap.status = CaptureStatus::CRACKED;
-            cap.password = WPASec::getPassword(normalBssid.c_str());
-        } else if (WPASec::isUploaded(normalBssid.c_str())) {
+            cap.password = WPASec::getPassword(normalized);
+        } else if (WPASec::isUploaded(normalized)) {
             cap.status = CaptureStatus::UPLOADED;
         } else {
             cap.status = CaptureStatus::LOCAL;
@@ -250,28 +294,75 @@ void CapturesMenu::updateWPASecStatus() {
     }
 }
 
+void CapturesMenu::processAsyncWPASecUpdate() {
+    if (!wpasecUpdateInProgress || captures.empty()) {
+        wpasecUpdateInProgress = false;
+        return;
+    }
+    
+    // Throttle the update to avoid blocking the UI
+    if (millis() - lastWpasecUpdateTime < WPASEC_UPDATE_DELAY) {
+        return;
+    }
+    
+    lastWpasecUpdateTime = millis();
+    
+    // Process a chunk of captures
+    size_t processed = 0;
+    while (processed < WPASEC_UPDATE_CHUNK_SIZE && wpasecUpdateProgress < captures.size()) {
+        auto& cap = captures[wpasecUpdateProgress];
+        
+        // Normalize BSSID for lookup (remove colons)
+        char normalized[13] = {0};
+        WPASec::normalizeBSSID_Char(cap.bssid.c_str(), normalized, sizeof(normalized));
+        
+        if (normalized[0] != '\0') {
+            if (WPASec::isCracked(normalized)) {
+                cap.status = CaptureStatus::CRACKED;
+                cap.password = WPASec::getPassword(normalized);
+            } else if (WPASec::isUploaded(normalized)) {
+                cap.status = CaptureStatus::UPLOADED;
+            } else {
+                cap.status = CaptureStatus::LOCAL;
+            }
+        } else {
+            cap.status = CaptureStatus::LOCAL;
+        }
+        
+        wpasecUpdateProgress++;
+        processed++;
+        
+        // Yield periodically to allow other tasks to run
+        if (processed >= WPASEC_UPDATE_CHUNK_SIZE) {
+            // Still more to do, but yield control back to other tasks
+            break;
+        }
+    }
+    
+    // Check if we're done with all captures
+    if (wpasecUpdateProgress >= captures.size()) {
+        wpasecUpdateInProgress = false;
+        Serial.printf("[CAPTURES] Async WPA-SEC update complete. Updated %d captures\n", captures.size());
+    }
+}
+
 void CapturesMenu::update() {
     if (!active) return;
-
-    // Handle completion of background WPA‑SEC task
-    if (wpaTaskHandle != nullptr && wpaTaskDone) {
-        // Task self-deletes; clear handle and report result in the UI thread.
-        wpaTaskHandle = nullptr;
-        connectingWiFi = false;
-        uploadingFile = false;
-        refreshingResults = false;
-
-        // Surface result in the top bar
-        const char* msg = wpaTaskResultMsg[0] ? wpaTaskResultMsg : (wpaTaskSuccess ? "OK" : "FAIL");
-        Display::setTopBarMessage(String("WPA-SEC ") + msg, 4000);
-
-        // Update capture statuses after task completion
-        updateWPASecStatus();
-        WPASec::freeCacheMemory();
-
-        wpaTaskDone = false;
+    
+    // Process sync state machine if active
+    if (syncModalActive && syncState != SyncState::IDLE && 
+        syncState != SyncState::COMPLETE && syncState != SyncState::ERROR) {
+        processSyncState();
     }
-
+    
+    // Process async file scanning if in progress (not during sync)
+    if (!syncModalActive) {
+        processAsyncScan();
+        
+        // Process async WPA-SEC status updates if in progress
+        processAsyncWPASecUpdate();
+    }
+    
     handleInput();
 }
 
@@ -287,7 +378,25 @@ void CapturesMenu::handleInput() {
     keyWasPressed = true;
     
     auto keys = M5Cardputer.Keyboard.keysState();
-    
+
+    // Handle sync modal
+    if (syncModalActive) {
+        if (syncState == SyncState::ERROR || syncState == SyncState::COMPLETE) {
+            // Enter closes the modal after completion/error
+            if (keys.enter || M5Cardputer.Keyboard.isKeyPressed(KEY_BACKSPACE)) {
+                syncModalActive = false;
+                syncState = SyncState::IDLE;
+                scanCaptures();  // Rescan captures after sync
+            }
+        } else {
+            // ESC cancels during sync
+            if (M5Cardputer.Keyboard.isKeyPressed(KEY_BACKSPACE)) {
+                cancelSync();
+            }
+        }
+        return;  // Block other inputs during sync
+    }
+
     // Handle nuke confirmation modal
     if (nukeConfirmActive) {
         if (M5Cardputer.Keyboard.isKeyPressed('y') || M5Cardputer.Keyboard.isKeyPressed('Y')) {
@@ -303,23 +412,10 @@ void CapturesMenu::handleInput() {
         return;
     }
     
-    // Handle detail view modal - Enter/backspace closes, U/R trigger actions
+    // Handle detail view modal - Enter/backspace closes
     if (detailViewActive) {
         if (keys.enter || M5Cardputer.Keyboard.isKeyPressed(KEY_BACKSPACE)) {
             detailViewActive = false;
-            return;
-        }
-        // Allow U/R in modal - close modal and trigger action
-        if (M5Cardputer.Keyboard.isKeyPressed('u') || M5Cardputer.Keyboard.isKeyPressed('U')) {
-            detailViewActive = false;
-            if (!captures.empty() && selectedIndex < captures.size()) {
-                uploadSelected();
-            }
-            return;
-        }
-        if (M5Cardputer.Keyboard.isKeyPressed('r') || M5Cardputer.Keyboard.isKeyPressed('R')) {
-            detailViewActive = false;
-            refreshResults();
             return;
         }
         return;  // Block other inputs while detail view is open
@@ -351,24 +447,17 @@ void CapturesMenu::handleInput() {
         }
     }
     
+    // S key triggers WPA-SEC sync
+    if (M5Cardputer.Keyboard.isKeyPressed('s') || M5Cardputer.Keyboard.isKeyPressed('S')) {
+        startSync();
+    }
+    
     // Nuke all loot with D key
     if (M5Cardputer.Keyboard.isKeyPressed('d') || M5Cardputer.Keyboard.isKeyPressed('D')) {
         if (!captures.empty()) {
             nukeConfirmActive = true;
             Display::setBottomOverlay("PERMANENT | NO UNDO");
         }
-    }
-    
-    // U key uploads selected capture to WPA-SEC
-    if (M5Cardputer.Keyboard.isKeyPressed('u') || M5Cardputer.Keyboard.isKeyPressed('U')) {
-        if (!captures.empty() && selectedIndex < captures.size()) {
-            uploadSelected();
-        }
-    }
-    
-    // R key refreshes results from WPA-SEC
-    if (M5Cardputer.Keyboard.isKeyPressed('r') || M5Cardputer.Keyboard.isKeyPressed('R')) {
-        refreshResults();
     }
     
     // Backspace - go back
@@ -406,23 +495,61 @@ void CapturesMenu::draw(M5Canvas& canvas) {
     // Check if SD card is not available
     if (!Config::isSDAvailable()) {
         canvas.setCursor(4, 40);
-        canvas.print("NO SD CARD!");
+        canvas.print("NO SD CARD");
         canvas.setCursor(4, 55);
         canvas.print("INSERT AND RESTART");
         return;
     }
 
-    if (captures.empty()) {
-        canvas.setCursor(4, 40);
-        canvas.print("No captures found");
-        canvas.setCursor(4, 55);
-        canvas.print("[O] to hunt.");
+    // Draw sync modal FIRST - takes precedence over empty captures message
+    // (captures are cleared for heap during sync, but modal should still show)
+    if (syncModalActive) {
+        drawSyncModal(canvas);
         return;
     }
 
+    if (captures.empty()) {
+        canvas.setCursor(4, 36);
+        canvas.print("NO CAPTURES FOUND");
+        canvas.setCursor(4, 52);
+        canvas.print("PRESS [O] FOR OINK");
+        canvas.setCursor(4, 68);
+        canvas.print("SYNC VIA COMMANDER");
+        return;
+    }
+
+    // Summary line
+    uint16_t total = captures.size();
+    uint16_t hsCount = 0;
+    uint16_t pmkCount = 0;
+    uint16_t cracked = 0;
+    uint16_t uploaded = 0;
+    for (const auto& cap : captures) {
+        if (cap.isPMKID) pmkCount++;
+        else hsCount++;
+        if (cap.status == CaptureStatus::CRACKED) cracked++;
+        else if (cap.status == CaptureStatus::UPLOADED) uploaded++;
+    }
+    char summary[64];
+    snprintf(summary, sizeof(summary), "CAP %u HS %u PMK %u CRK %u UP %u",
+             (unsigned)total, (unsigned)hsCount, (unsigned)pmkCount,
+             (unsigned)cracked, (unsigned)uploaded);
+    canvas.setCursor(4, 2);
+    canvas.print(summary);
+
+    // Header row
+    canvas.setCursor(4, 12);
+    canvas.print("SSID");
+    canvas.setCursor(105, 12);
+    canvas.print("ST");
+    canvas.setCursor(135, 12);
+    canvas.print("TIME");
+    canvas.setCursor(210, 12);
+    canvas.print("SIZE");
+
     // Draw captures list
-    int y = 2;
-    int lineHeight = 18;
+    int y = 22;
+    int lineHeight = 16;
 
     for (uint8_t i = scrollOffset; i < captures.size() && i < scrollOffset + VISIBLE_ITEMS; i++) {
         const CaptureInfo& cap = captures[i];
@@ -481,12 +608,12 @@ void CapturesMenu::draw(M5Canvas& canvas) {
 
     // Scroll indicators
     if (scrollOffset > 0) {
-        canvas.setCursor(canvas.width() - 10, 16);
+        canvas.setCursor(canvas.width() - 10, 22);
         canvas.setTextColor(COLOR_FG);
         canvas.print("^");
     }
     if (scrollOffset + VISIBLE_ITEMS < captures.size()) {
-        canvas.setCursor(canvas.width() - 10, 16 + (VISIBLE_ITEMS - 1) * lineHeight);
+        canvas.setCursor(canvas.width() - 10, 22 + (VISIBLE_ITEMS - 1) * lineHeight);
         canvas.setTextColor(COLOR_FG);
         canvas.print("v");
     }
@@ -500,8 +627,13 @@ void CapturesMenu::draw(M5Canvas& canvas) {
     if (detailViewActive) {
         drawDetailView(canvas);
     }
+    
+    // Draw sync modal if active
+    if (syncModalActive) {
+        drawSyncModal(canvas);
+    }
 
-    // BSSID shown in bottom bar via getSelectedBSSID()
+    // Bottom bar controls via getSelectedBSSID()
 }
 
 void CapturesMenu::drawNukeConfirm(M5Canvas& canvas) {
@@ -524,7 +656,9 @@ void CapturesMenu::drawNukeConfirm(M5Canvas& canvas) {
     
     // Hacker edgy message
     canvas.drawString("!! SCORCHED EARTH !!", centerX, boxY + 8);
-    canvas.drawString("rm -rf /handshakes/*", centerX, boxY + 22);
+    char cmd[56];
+    snprintf(cmd, sizeof(cmd), "rm -rf %s/*", SDLayout::handshakesDir());
+    canvas.drawString(cmd, centerX, boxY + 22);
     canvas.drawString("THIS KILLS THE LOOT.", centerX, boxY + 36);
     canvas.drawString("[Y] DO IT  [N] ABORT", centerX, boxY + 54);
 }
@@ -532,11 +666,12 @@ void CapturesMenu::drawNukeConfirm(M5Canvas& canvas) {
 void CapturesMenu::nukeLoot() {
     Serial.println("[CAPTURES] Nuking all loot...");
     
-    if (!SD.exists("/handshakes")) {
+    const char* handshakesDir = SDLayout::handshakesDir();
+    if (!SD.exists(handshakesDir)) {
         return;
     }
-    
-    File dir = SD.open("/handshakes");
+
+    File dir = SD.open(handshakesDir);
     if (!dir || !dir.isDirectory()) {
         return;
     }
@@ -544,11 +679,21 @@ void CapturesMenu::nukeLoot() {
     // Collect filenames first (can't delete while iterating)
     std::vector<String> files;
     File file = dir.openNextFile();
+    uint8_t yieldCounter = 0;
     while (file) {
-        files.push_back(String("/handshakes/") + file.name());
+        const char* base = file.name();
+        int slash = String(base).lastIndexOf('/');
+        String name = (slash >= 0) ? String(base).substring(slash + 1) : String(base);
+        files.push_back(String(handshakesDir) + "/" + name);
         // Always close file handle to avoid exhausting SD file descriptors
         file.close();
         file = dir.openNextFile();
+        
+        // Yield every 10 files to prevent WDT timeout
+        if (++yieldCounter >= 10) {
+            yieldCounter = 0;
+            yield();
+        }
     }
     dir.close();
     
@@ -569,15 +714,7 @@ void CapturesMenu::nukeLoot() {
 }
 
 const char* CapturesMenu::getSelectedBSSID() {
-    if (selectedIndex < captures.size()) {
-        const CaptureInfo& cap = captures[selectedIndex];
-        // PMKIDs can't be uploaded to WPA-SEC (requires PCAP)
-        if (cap.isPMKID) {
-            return "L0C4L CR4CK: [R] [D]";
-        }
-        return "CR4CK TH3 L00T: [U] [R] [D]";
-    }
-    return "CR4CK TH3 L00T: [U] [R] [D]";
+    return "ENT=DET S=SYNC D=NUKE";
 }
 void CapturesMenu::drawDetailView(M5Canvas& canvas) {
     if (selectedIndex >= captures.size()) return;
@@ -639,176 +776,249 @@ void CapturesMenu::drawDetailView(M5Canvas& canvas) {
         }
         canvas.drawString(pwLine, centerX, boxY + 54);
     } else if (cap.status == CaptureStatus::UPLOADED) {
-        canvas.drawString("UPLOADED, WAITING...", centerX, boxY + 38);
-        canvas.drawString("[R] REFRESH RESULTS", centerX, boxY + 54);
+        canvas.drawString("UPLOADED - PENDING CRACK", centerX, boxY + 38);
+        canvas.drawString("PRESS [S] TO CHECK STATUS", centerX, boxY + 54);
     } else if (cap.isPMKID) {
         canvas.drawString("PMKID - LOCAL CRACK ONLY", centerX, boxY + 38);
         canvas.drawString("hashcat -m 22000", centerX, boxY + 54);
     } else {
         canvas.drawString("NOT UPLOADED YET", centerX, boxY + 38);
-        canvas.drawString("[U] UPLOAD TO WPA-SEC", centerX, boxY + 54);
+        canvas.drawString("PRESS [S] TO SYNC", centerX, boxY + 54);
     }
     
     canvas.drawString("[ENTER] CLOSE", centerX, boxY + 72);
 }
 
-void CapturesMenu::drawConnecting(M5Canvas& canvas) {
-    // Overlay message
-    const int boxW = 180;
-    const int boxH = 40;
+// ============================================================================
+// WPA-SEC Sync Operations
+// ============================================================================
+
+void CapturesMenu::onSyncProgress(const char* status, uint8_t progress, uint8_t total) {
+    // Update sync state for UI
+    strncpy(syncStatusText, status, sizeof(syncStatusText) - 1);
+    syncStatusText[sizeof(syncStatusText) - 1] = '\0';
+    syncProgress = progress;
+    syncTotal = total;
+}
+
+bool CapturesMenu::connectToWiFi() {
+    const char* ssid = Config::wifi().otaSSID;
+    const char* password = Config::wifi().otaPassword;
+    
+    if (!ssid || ssid[0] == '\0') {
+        strncpy(syncError, "NO WIFI SSID CONFIG", sizeof(syncError) - 1);
+        return false;
+    }
+    
+    Serial.printf("[CAPTURES] Connecting to WiFi: %s\n", ssid);
+    strncpy(syncStatusText, "CONNECTING WIFI...", sizeof(syncStatusText) - 1);
+    
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, password);
+    
+    unsigned long startTime = millis();
+    const unsigned long timeout = 15000;  // 15 second timeout
+    
+    while (WiFi.status() != WL_CONNECTED && (millis() - startTime) < timeout) {
+        delay(100);
+        yield();
+    }
+    
+    if (WiFi.status() != WL_CONNECTED) {
+        strncpy(syncError, "WIFI CONNECT FAILED", sizeof(syncError) - 1);
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+        return false;
+    }
+    
+    Serial.printf("[CAPTURES] WiFi connected, IP: %s\n", WiFi.localIP().toString().c_str());
+    return true;
+}
+
+void CapturesMenu::disconnectWiFi() {
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    Serial.println("[CAPTURES] WiFi disconnected");
+}
+
+void CapturesMenu::startSync() {
+    Serial.println("[CAPTURES] Starting WPA-SEC sync...");
+    
+    // Reset sync state
+    syncModalActive = true;
+    syncState = SyncState::CONNECTING_WIFI;
+    syncStatusText[0] = '\0';
+    syncError[0] = '\0';
+    syncProgress = 0;
+    syncTotal = 0;
+    syncUploaded = 0;
+    syncFailed = 0;
+    syncCracked = 0;
+    syncStartTime = millis();
+    
+    // Pre-flight checks
+    if (!WPASec::hasApiKey()) {
+        strncpy(syncError, "NO WPA-SEC KEY", sizeof(syncError) - 1);
+        syncState = SyncState::ERROR;
+        return;
+    }
+    
+    // Free memory before heavy operations
+    captures.clear();
+    captures.shrink_to_fit();
+    WPASec::freeCacheMemory();
+    
+    Serial.printf("[CAPTURES] Heap after freeing: %u\n", (unsigned int)ESP.getFreeHeap());
+}
+
+void CapturesMenu::cancelSync() {
+    Serial.println("[CAPTURES] Sync cancelled");
+    
+    // Clean up
+    disconnectWiFi();
+    syncModalActive = false;
+    syncState = SyncState::IDLE;
+    
+    // Rescan captures
+    scanCaptures();
+}
+
+void CapturesMenu::processSyncState() {
+    if (!syncModalActive || syncState == SyncState::IDLE) {
+        return;
+    }
+    
+    switch (syncState) {
+        case SyncState::CONNECTING_WIFI:
+            strncpy(syncStatusText, "CONNECTING WIFI...", sizeof(syncStatusText) - 1);
+            if (connectToWiFi()) {
+                syncState = SyncState::FREEING_MEMORY;
+            } else {
+                syncState = SyncState::ERROR;
+            }
+            break;
+            
+        case SyncState::FREEING_MEMORY:
+            strncpy(syncStatusText, "PREPARING...", sizeof(syncStatusText) - 1);
+            // Check heap
+            if (!WPASec::canSync()) {
+                strncpy(syncError, "LOW HEAP", sizeof(syncError) - 1);
+                syncState = SyncState::ERROR;
+            } else {
+                syncState = SyncState::UPLOADING;
+            }
+            break;
+            
+        case SyncState::UPLOADING:
+            {
+                // Run sync (blocking but with progress callback)
+                strncpy(syncStatusText, "SYNCING...", sizeof(syncStatusText) - 1);
+                
+                WPASecSyncResult result = WPASec::syncCaptures(onSyncProgress);
+                
+                syncUploaded = result.uploaded;
+                syncFailed = result.failed;
+                syncCracked = result.cracked;
+                
+                if (result.error[0] != '\0') {
+                    strncpy(syncError, result.error, sizeof(syncError) - 1);
+                }
+                
+                syncState = SyncState::COMPLETE;
+            }
+            break;
+            
+        case SyncState::DOWNLOADING_POTFILE:
+            // Handled within UPLOADING state via syncCaptures
+            break;
+            
+        case SyncState::COMPLETE:
+            // Stay in complete state until user dismisses
+            disconnectWiFi();
+            break;
+            
+        case SyncState::ERROR:
+            // Stay in error state until user dismisses
+            disconnectWiFi();
+            break;
+            
+        default:
+            break;
+    }
+}
+
+void CapturesMenu::drawSyncModal(M5Canvas& canvas) {
+    // Modal box dimensions
+    const int boxW = 200;
+    const int boxH = 85;
     const int boxX = (canvas.width() - boxW) / 2;
-    const int boxY = (canvas.height() - boxH) / 2;
+    const int boxY = (canvas.height() - boxH) / 2 - 5;
     
-    canvas.fillRoundRect(boxX - 2, boxY - 2, boxW + 4, boxH + 4, 6, COLOR_BG);
-    canvas.fillRoundRect(boxX, boxY, boxW, boxH, 6, COLOR_FG);
+    // Black border then pink fill
+    canvas.fillRoundRect(boxX - 2, boxY - 2, boxW + 4, boxH + 4, 8, COLOR_BG);
+    canvas.fillRoundRect(boxX, boxY, boxW, boxH, 8, COLOR_FG);
     
+    // Black text on pink background
     canvas.setTextColor(COLOR_BG, COLOR_FG);
     canvas.setTextDatum(top_center);
+    canvas.setTextSize(1);
     
     int centerX = canvas.width() / 2;
     
-    if (connectingWiFi) {
-        canvas.drawString("CONNECTING WIFI...", centerX, boxY + 8);
-        canvas.drawString(WPASec::getStatus(), centerX, boxY + 22);
-    } else if (uploadingFile) {
-        canvas.drawString("UPLOADING...", centerX, boxY + 8);
-        canvas.drawString(WPASec::getStatus(), centerX, boxY + 22);
-    } else if (refreshingResults) {
-        canvas.drawString("FETCHING RESULTS...", centerX, boxY + 8);
-        canvas.drawString(WPASec::getStatus(), centerX, boxY + 22);
-    }
-}
-
-void CapturesMenu::uploadSelected() {
-    if (selectedIndex >= captures.size()) return;
-
-    // Prevent starting multiple parallel WPA‑SEC operations
-    if (wpaTaskHandle != nullptr) {
-        Display::setTopBarMessage("WPA-SEC BUSY", 3000);
-        return;
-    }
-    // Guard: ensure enough contiguous heap for task stack (~24 KB)
-    if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < 30000) {
-        Display::setTopBarMessage("LOW HEAP FOR WPA-SEC", 3000);
-        return;
-    }
-
-    const CaptureInfo& cap = captures[selectedIndex];
-
-    // Check if WPA-SEC key is configured
-    if (Config::wifi().wpaSecKey.isEmpty()) {
-        Display::setTopBarMessage("SET WPA-SEC KEY FIRST", 4000);
-        return;
-    }
-
-    // Already cracked? No need to upload
-    if (cap.status == CaptureStatus::CRACKED) {
-        Display::setTopBarMessage("ALREADY CRACKED", 3000);
-        return;
-    }
-
-    // Already uploaded? Hard-stop for messaging parity.
-    if (WPASec::isUploaded(cap.bssid.c_str())) {
-        Display::setTopBarMessage("ALREADY UPLOADED", 3000);
-        return;
-    }
-
-    // PMKIDs can't be uploaded (WPA-SEC requires PCAP format)
-    if (cap.isPMKID) {
-        Display::setTopBarMessage("PMKID = LOCAL ONLY", 4000);
-        return;
-    }
-
-    // Find the PCAP file for this capture
-    String baseName = cap.bssid;
-    baseName.replace(":", "");
-    String pcapPath = "/handshakes/" + baseName + ".pcap";
-
-    if (!SD.exists(pcapPath)) {
-        Display::setTopBarMessage("NO PCAP FILE FOUND", 4000);
-        return;
-    }
-
-    // Kick off upload in a dedicated FreeRTOS task with a larger stack.
-    // TLS handshakes can overflow Arduino's loopTask stack.
-    wpaTaskDone = false;
-    wpaTaskSuccess = false;
-    wpaTaskAction = WpaTaskAction::UPLOAD;
-    wpaTaskIndex = selectedIndex;
-    wpaTaskResultMsg[0] = '\0';
-
-    WpaTaskCtx* ctx = new WpaTaskCtx();
-    ctx->action = WpaTaskAction::UPLOAD;
-    strncpy(ctx->pcapPath, pcapPath.c_str(), sizeof(ctx->pcapPath) - 1);
-    ctx->pcapPath[sizeof(ctx->pcapPath) - 1] = '\0';
-    ctx->index = selectedIndex;
-
-    uploadingFile = true;
-    Display::setTopBarMessage("WPA-SEC UP...", 0);
-
-    BaseType_t ok = xTaskCreatePinnedToCore(
-        wpaTaskFn,
-        "wpasec_upload",
-        16384,
-        ctx,
-        1,
-        &wpaTaskHandle,
-        0
-    );
-    if (ok != pdPASS) {
-        wpaTaskHandle = nullptr;
-        uploadingFile = false;
-        delete ctx;
-        Display::setTopBarMessage("WPA-SEC TASK FAIL", 4000);
-    }
-}
-
-void CapturesMenu::refreshResults() {
-    // Check if WPA-SEC key is configured
-    if (Config::wifi().wpaSecKey.isEmpty()) {
-        Display::setTopBarMessage("SET WPA-SEC KEY FIRST", 4000);
-        return;
-    }
-
-    // Prevent starting multiple parallel WPA‑SEC operations
-    if (wpaTaskHandle != nullptr) {
-        Display::setTopBarMessage("WPA-SEC BUSY", 3000);
-        return;
-    }
-    // Guard: ensure enough contiguous heap for task stack (~24 KB)
-    if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < 30000) {
-        Display::setTopBarMessage("LOW HEAP FOR WPA-SEC", 3000);
-        return;
-    }
-
-    // Kick off fetch in a dedicated FreeRTOS task with a larger stack.
-    wpaTaskDone = false;
-    wpaTaskSuccess = false;
-    wpaTaskAction = WpaTaskAction::REFRESH;
-    wpaTaskIndex = selectedIndex;
-    wpaTaskResultMsg[0] = '\0';
-
-    WpaTaskCtx* ctx = new WpaTaskCtx();
-    ctx->action = WpaTaskAction::REFRESH;
-    ctx->pcapPath[0] = '\0';
-    ctx->index = selectedIndex;
-
-    refreshingResults = true;
-    Display::setTopBarMessage("WPA-SEC FETCH...", 0);
-
-    BaseType_t ok = xTaskCreatePinnedToCore(
-        wpaTaskFn,
-        "wpasec_fetch",
-        16384,
-        ctx,
-        1,
-        &wpaTaskHandle,
-        0
-    );
-    if (ok != pdPASS) {
-        wpaTaskHandle = nullptr;
-        refreshingResults = false;
-        delete ctx;
-        Display::setTopBarMessage("WPA-SEC TASK FAIL", 4000);
+    // Title
+    canvas.drawString("WPA-SEC SYNC", centerX, boxY + 6);
+    
+    if (syncState == SyncState::ERROR) {
+        // Error state
+        canvas.drawString("!! ERROR !!", centerX, boxY + 24);
+        canvas.drawString(syncError, centerX, boxY + 42);
+        canvas.drawString("[ENTER] CLOSE", centerX, boxY + 68);
+    } else if (syncState == SyncState::COMPLETE) {
+        // Complete state
+        canvas.drawString("SYNC COMPLETE", centerX, boxY + 24);
+        
+        char stats[48];
+        snprintf(stats, sizeof(stats), "UP:%u FAIL:%u CRACK:%u", 
+                 (unsigned)syncUploaded, (unsigned)syncFailed, (unsigned)syncCracked);
+        canvas.drawString(stats, centerX, boxY + 42);
+        
+        if (syncError[0] != '\0') {
+            canvas.drawString(syncError, centerX, boxY + 54);
+        }
+        
+        canvas.drawString("[ENTER] CLOSE", centerX, boxY + 68);
+    } else {
+        // In progress
+        canvas.drawString(syncStatusText, centerX, boxY + 24);
+        
+        // Progress bar
+        if (syncTotal > 0) {
+            const int barW = 160;
+            const int barH = 10;
+            const int barX = boxX + (boxW - barW) / 2;
+            const int barY = boxY + 42;
+            
+            // Background
+            canvas.fillRect(barX, barY, barW, barH, COLOR_BG);
+            
+            // Fill
+            int fillW = (barW * syncProgress) / syncTotal;
+            if (fillW > 0) {
+                canvas.fillRect(barX, barY, fillW, barH, COLOR_FG);
+            }
+            
+            // Progress text
+            char progText[16];
+            snprintf(progText, sizeof(progText), "%u/%u", (unsigned)syncProgress, (unsigned)syncTotal);
+            canvas.drawString(progText, centerX, barY + barH + 4);
+        } else {
+            // Heap display
+            char heapText[32];
+            snprintf(heapText, sizeof(heapText), "HEAP: %uKB", 
+                     (unsigned)(ESP.getFreeHeap() / 1024));
+            canvas.drawString(heapText, centerX, boxY + 42);
+        }
+        
+        canvas.drawString("[ESC] CANCEL", centerX, boxY + 68);
     }
 }

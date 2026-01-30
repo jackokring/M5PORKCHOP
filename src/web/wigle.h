@@ -13,31 +13,50 @@ enum class WigleUploadStatus {
     COMPLETE
 };
 
+// Sync operation result
+struct WigleSyncResult {
+    bool success;
+    uint8_t uploaded;
+    uint8_t failed;
+    uint8_t skipped;     // Already uploaded
+    bool statsFetched;   // Stats download succeeded
+    char error[48];
+};
+
+// Sync progress callback for UI updates
+typedef void (*WigleProgressCallback)(const char* status, uint8_t progress, uint8_t total);
+
 class WiGLE {
 public:
-    static void init();
-    
-    // WiFi connection (standalone, uses otaSSID/otaPassword from config)
-    static bool connect();
-    static void disconnect();
-    static bool isConnected();
-    
-    // API operations (require WiFi connection)
-    static bool uploadFile(const char* csvPath);  // POST WiGLE CSV file
-    
-    // Upload tracking
-    static bool isUploaded(const char* filename);     // Check if already uploaded
-    static void markUploaded(const char* filename);   // Mark as uploaded
-    static void removeFromUploaded(const char* filename); // Remove from tracking
-    static uint16_t getUploadedCount();               // Total uploads tracked
+    // Sync status
     static bool isBusy();
     
-    // Status
-    static const char* getLastError();
-    static const char* getStatus();
-    
-    // API credentials check
-    static bool hasCredentials();
+    /**
+     * @brief Container for a subset of WiGLE user statistics.
+     *
+     * The UI only needs the user's current rank and total counts of
+     * WiFi, cellular and Bluetooth observations. Additional fields in
+     * the API response are ignored. A `valid` flag indicates whether
+     * the structure was successfully loaded from cache.
+     */
+    struct WigleUserStats {
+        bool valid = false;
+        int64_t rank = 0;
+        uint64_t wifi = 0;
+        uint64_t cell = 0;
+        uint64_t bt = 0;
+    };
+
+    /**
+     * @brief Read the cached WiGLE user statistics from disk.
+     *
+     * If the cache file does not exist or cannot be parsed, the returned
+     * structure will have `valid` set to false. This function does not
+     * attempt any network connections and may be safely called from the UI.
+     *
+     * @return WigleUserStats structure containing cached values
+     */
+    static WigleUserStats getUserStats();
 
     /**
      * @brief Free the uploaded files list from memory.
@@ -50,25 +69,56 @@ public:
      */
     static void freeUploadedListMemory();
     
+    // Upload tracking (offline-only, file-based)
+    static bool isUploaded(const char* filename);     // Check if already uploaded
+    static void markAsUploaded(const char* filename); // Mark file as uploaded
+    static void removeFromUploaded(const char* filename); // Remove from tracking
+    static uint16_t getUploadedCount();               // Total uploads tracked
+    
+    // Batch upload mode (reduces SD writes from N to 1)
+    static void beginBatchUpload();                   // Start batch mode
+    static void endBatchUpload();                     // End batch mode and save
+    
+    // Network operations (require WiFi + sufficient heap)
+    static bool hasCredentials();                     // Check if WiGLE API credentials configured
+    static bool canSync();                            // Check heap requirements (~35KB)
+    static WigleSyncResult syncFiles(WigleProgressCallback cb = nullptr);  // Full sync
+    
+    // Status
+    static const char* getLastError();
+    
+    // Minimum heap required for TLS operations
+    // With setInsecure() (no cert validation), TLS needs ~32-35KB peak.
+    static constexpr size_t MIN_HEAP_FOR_TLS = 35000;
+    
+    // Minimum contiguous block needed for TLS buffer allocation
+    // mbedTLS handshake peak is ~32-35KB contiguous for buffer allocations
+    // Previous 22KB threshold was too low - log showed failures at 31.7KB
+    static constexpr size_t MIN_CONTIGUOUS_FOR_TLS = 35000;
+    
+    // Threshold for proactive heap conditioning (before fragmentation gets critical)
+    static constexpr size_t PROACTIVE_CONDITIONING_THRESHOLD = 45000;
+    
 private:
-    static char lastError[64];
-    static char statusMessage[64];
-
     // Uploaded files tracking
     static std::vector<String> uploadedFiles;
     static bool listLoaded;  // Guard for lazy loading
-    static bool busy;
-    
-    // File paths
-    static constexpr const char* UPLOADED_FILE = "/wigle_uploaded.txt";
+    static volatile bool busy;
+    static char lastError[64];
+    static bool batchMode;  // Batch upload mode flag
     
     // API endpoints
     static constexpr const char* API_HOST = "api.wigle.net";
+    static constexpr uint16_t API_PORT = 443;
     static constexpr const char* UPLOAD_PATH = "/api/v2/file/upload";
+    static constexpr const char* STATS_PATH = "/api/v2/stats/user";
     
     // Helpers
     static bool loadUploadedList();
     static bool saveUploadedList();
     static String getFilenameFromPath(const char* path);
+    
+    // Network helpers (internal)
+    static bool uploadSingleFile(const char* csvPath);
+    static bool fetchStats();
 };
-

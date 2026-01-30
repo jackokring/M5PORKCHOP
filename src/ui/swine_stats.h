@@ -50,7 +50,8 @@ struct BuffState {
 // Tab selection for SWINE STATS
 enum class StatsTab : uint8_t {
     STATS = 0,
-    BOOSTS = 1
+    BOOSTS = 1,
+    WIGLE = 2
 };
 
 class SwineStats {
@@ -99,5 +100,9 @@ private:
     static void drawBuffsTab(M5Canvas& canvas);
     static void drawTabBar(M5Canvas& canvas);
     static void drawStats(M5Canvas& canvas);  // Stat grid helper
-};
 
+    // Draw the WiGLE statistics tab. This tab displays the user's rank
+    // and total observations as read from the WiGLE stats cache. See
+    // WiGLE::getUserStats() for details.
+    static void drawWigleTab(M5Canvas& canvas);
+};

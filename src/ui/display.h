@@ -34,7 +34,7 @@ enum class NoticeChannel : uint8_t {
 };
 
 // Theme count and extern declaration (actual array in display.cpp)
-static const uint8_t THEME_COUNT = 14;
+static const uint8_t THEME_COUNT = 15;
 extern const PorkTheme THEMES[THEME_COUNT];
 
 // Dynamic color getters (use these instead of macros)
@@ -54,17 +54,11 @@ public:
     static void init();
     static void update();
     static void clear();
-    static void suspendSprites();
-    static void resumeSprites();
-    static void requestSuspendSprites();
-    static void requestResumeSprites();
-    static bool waitForSpritesSuspended(uint32_t timeoutMs = 2000);
-    static bool spritesAreSuspended() { return spritesSuspended; }
 
     // Upload progress tracking
     static bool uploadInProgress;
     static uint8_t uploadProgress;
-    static String uploadStatus;
+    static char uploadStatus[64];
     static uint32_t uploadStartTime;
     static void setUploadProgress(bool inProgress, uint8_t progress, const char* status);
     static void clearUploadProgress();
@@ -74,15 +68,9 @@ public:
 
     // Top bar status messaging (single-line)
     static void setTopBarMessage(const String& message, uint32_t durationMs = 0);
+    static void setTopBarMessage(const char* message, uint32_t durationMs = 0);
     static void clearTopBarMessage();
     static void requestTopBarMessage(const char* message, uint32_t durationMs = 0);
-
-    // Sprite resume failure tracking
-    static bool spriteResumeFailed;
-    static uint32_t spriteResumeFailTime;
-    static void setSpriteResumeFailure();
-    static bool shouldShowSpriteResumeError();
-    static void drawSpriteResumeError(M5Canvas& topBar);
 
     // Canvas access for direct drawing
     static M5Canvas& getTopBar() { return topBar; }
@@ -96,7 +84,7 @@ public:
                            const String& line2 = "", bool blocking = true);
     static bool showConfirmBox(const String& title, const String& message);
     static void showProgress(const String& title, uint8_t percent);
-    static void showToast(const String& message);  // Quick non-blocking message
+    static void showToast(const String& message, uint32_t durationMs = 2000);  // Quick non-blocking message
     static void notify(NoticeKind kind, const String& message,
                        uint32_t durationMs = 0,
                        NoticeChannel channel = NoticeChannel::AUTO);
@@ -151,19 +139,17 @@ private:
     static bool snapping;
 
     // Toast state
-    static String toastMessage;
+    static char toastMessage[160];
     static uint32_t toastStartTime;
+    static uint32_t toastDurationMs;
     static bool toastActive;
-    static String topBarMessage;
+    static char topBarMessage[96];
     static uint32_t topBarMessageStart;
     static uint32_t topBarMessageDuration;
     static bool topBarMessageTwoLineActive;
 
     // Bottom bar overlay
-    static String bottomOverlay;
-    static volatile bool spritesSuspended;
-    static volatile bool suspendRequested;
-    static volatile bool resumeRequested;
+    static char bottomOverlay[96];
     static volatile bool pendingTopBarMessage;
     static char pendingTopBarMessageBuf[96];
     static uint32_t pendingTopBarDurationMs;
@@ -180,7 +166,4 @@ public:
     // About screen easter egg handlers (called from porkchop.cpp)
     static void onAboutEnterPressed();
     static void resetAboutState();
-
-    // Minimal progress indicator when sprites are suspended
-    static void showMinimalProgressDuringSuspend(const char* message, uint8_t percent);
 };

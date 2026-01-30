@@ -14,11 +14,16 @@
 #include <sys/time.h>  // Phase 3: settimeofday for RTC sync
 #include "../core/config.h"
 #include "../core/sdlog.h"
+#include "../core/sd_layout.h"
 #include "../core/wifi_utils.h"
+#include "../core/network_recon.h"
 #include "../piglet/mood.h"
 #include "../ui/display.h"
 #include "../modes/warhog.h"
 #include "../modes/oink.h"
+#include "../web/wpasec.h"
+#include "../web/wigle.h"
+
 
 #ifndef PIGSYNC_LOG_ENABLED
 #define PIGSYNC_LOG_ENABLED 0
@@ -394,6 +399,9 @@ static void handleControlAck(const PigSyncHeader* hdr) {
     }
 }
 
+static volatile bool pendingControlAck = false;
+static volatile uint8_t pendingControlAckSeq = 0;
+
 // Upgrade peer to encrypted after RSP_HELLO received
 static void upgradePeerEncryption(const uint8_t* mac, uint8_t channel) {
     if (mac[0] == 0 && mac[1] == 0 && mac[2] == 0) return;
@@ -415,6 +423,7 @@ static void upgradePeerEncryption(const uint8_t* mac, uint8_t channel) {
 static volatile bool pendingRingReceived = false;
 static volatile uint32_t pendingRingAt = 0;
 static volatile bool pendingHelloReceived = false;
+static volatile bool pendingHelloClearControl = false;
 static volatile uint16_t pendingPMKIDCount = 0;
 static volatile uint16_t pendingHSCount = 0;
 static volatile uint8_t pendingDialogueId = 0;
@@ -423,6 +432,9 @@ static volatile uint16_t pendingSessionId = 0;  // 16-bit session
 static volatile uint8_t pendingDataChannel = PIGSYNC_DISCOVERY_CHANNEL;  // Data channel from RSP_HELLO
 
 static volatile bool pendingReadyReceived = false;  // RSP_READY from Sirloin
+static volatile bool pendingReadyClearControl = false;
+
+static portMUX_TYPE pendingMux = portMUX_INITIALIZER_UNLOCKED;
 
 // Name reveal notification for UI
 static volatile bool pendingNameReveal = false;
@@ -440,11 +452,13 @@ struct PendingChunkSlot {
 static PendingChunkSlot pendingChunkQueue[PENDING_CHUNK_QUEUE_SIZE] = {};
 static uint8_t pendingChunkCount = 0;
 static void clearPendingChunkQueue() {
+    taskENTER_CRITICAL(&pendingMux);
     for (uint8_t i = 0; i < PENDING_CHUNK_QUEUE_SIZE; i++) {
         pendingChunkQueue[i].used = false;
     }
     pendingChunkCount = 0;
     pendingChunkReceived = false;
+    taskEXIT_CRITICAL(&pendingMux);
 }
 
 static volatile bool pendingCompleteReceived = false;
@@ -457,8 +471,6 @@ static volatile uint8_t pendingBountyMatches = 0;
 
 static volatile bool pendingErrorReceived = false;
 static volatile uint8_t pendingErrorCode = 0;
-
-static portMUX_TYPE pendingMux = portMUX_INITIALIZER_UNLOCKED;
 
 // Forward declarations for pending device updates
 static volatile bool pendingBeaconReceived = false;
@@ -550,7 +562,12 @@ void pigSyncOnRecv(const uint8_t* mac, const uint8_t* data, int len) {
     }
 
     if (isControlResponse(hdr->type)) {
-        handleControlAck(hdr);
+        if (controlTx.waiting && hdr->ack == controlTx.seq) {
+            taskENTER_CRITICAL(&pendingMux);
+            pendingControlAck = true;
+            pendingControlAckSeq = hdr->ack;
+            taskEXIT_CRITICAL(&pendingMux);
+        }
         if (lastControlRspValid &&
             hdr->seq == lastControlRspSeq &&
             hdr->type == lastControlRspType &&
@@ -592,7 +609,9 @@ void pigSyncOnRecv(const uint8_t* mac, const uint8_t* data, int len) {
             const RspHello* rsp = (const RspHello*)data;
 
             if (controlTx.waiting && controlTx.type == CMD_HELLO) {
-                clearControlTx();
+                taskENTER_CRITICAL(&pendingMux);
+                pendingHelloClearControl = true;
+                taskEXIT_CRITICAL(&pendingMux);
             }
             
             taskENTER_CRITICAL(&pendingMux);
@@ -610,7 +629,9 @@ void pigSyncOnRecv(const uint8_t* mac, const uint8_t* data, int len) {
 
         case RSP_RING: {
             if (controlTx.waiting && controlTx.type == CMD_HELLO) {
-                clearControlTx();
+                taskENTER_CRITICAL(&pendingMux);
+                pendingHelloClearControl = true;
+                taskEXIT_CRITICAL(&pendingMux);
             }
             taskENTER_CRITICAL(&pendingMux);
             pendingRingReceived = true;
@@ -623,6 +644,12 @@ void pigSyncOnRecv(const uint8_t* mac, const uint8_t* data, int len) {
         case RSP_READY: {
             if (len < (int)sizeof(RspReady)) break;
             const RspReady* rsp = (const RspReady*)data;
+
+            if (controlTx.waiting && controlTx.type == CMD_READY) {
+                taskENTER_CRITICAL(&pendingMux);
+                pendingReadyClearControl = true;
+                taskEXIT_CRITICAL(&pendingMux);
+            }
             
             taskENTER_CRITICAL(&pendingMux);
             pendingPMKIDCount = rsp->pmkid_count;
@@ -856,6 +883,9 @@ bool PigSyncMode::ensureEspNowReady() {
 void PigSyncMode::start() {
     if (running) return;
     
+    // Pause NetworkRecon - promiscuous mode conflicts with ESP-NOW
+    NetworkRecon::pause();
+    
     // Disable WiFi first
     WiFi.disconnect(true);
     WiFi.mode(WIFI_STA);
@@ -916,7 +946,8 @@ void PigSyncMode::stop() {
         PIGSYNC_LOGLN("[PIGSYNC-CLI-STATE] DEINIT");
     }
 
-    WiFiUtils::shutdown();
+    // Resume NetworkRecon (restores promiscuous mode)
+    NetworkRecon::resume();
     
     PIGSYNC_LOGLN("[PIGSYNC-CLI-STATE] STOP");
 }
@@ -972,6 +1003,19 @@ void PigSyncMode::update() {
                 controlTx.lastSend = now;
                 esp_now_send(controlTx.mac, controlTx.buf, controlTx.len);
             }
+        }
+    }
+
+    // ==[ PROCESS PENDING CONTROL ACK ]==
+    if (pendingControlAck) {
+        taskENTER_CRITICAL(&pendingMux);
+        uint8_t ackSeq = pendingControlAckSeq;
+        pendingControlAck = false;
+        taskEXIT_CRITICAL(&pendingMux);
+        if (controlTx.waiting) {
+            PigSyncHeader hdr = {};
+            hdr.ack = ackSeq;
+            handleControlAck(&hdr);
         }
     }
     
@@ -1341,8 +1385,14 @@ void PigSyncMode::update() {
         remoteMood = pendingMood;
         sessionId = pendingSessionId;
         dataChannel = pendingDataChannel;
+        bool clearControl = pendingHelloClearControl;
+        pendingHelloClearControl = false;
         pendingHelloReceived = false;
         taskEXIT_CRITICAL(&pendingMux);
+
+        if (clearControl) {
+            clearControlTx();
+        }
 
         PIGSYNC_LOGF("[PIGSYNC-CLI] Processing RSP_HELLO: PMKIDs=%d HS=%d mood=%d sessionId=0x%04X dataChannel=%d\n",
             remotePMKIDCount, remoteHSCount, remoteMood, sessionId, dataChannel);
@@ -1390,8 +1440,14 @@ void PigSyncMode::update() {
     // ==[ PROCESS PENDING READY ]==
     if (pendingReadyReceived && state == State::CONNECTED_WAITING_READY) {
         taskENTER_CRITICAL(&pendingMux);
+        bool clearControl = pendingReadyClearControl;
+        pendingReadyClearControl = false;
         pendingReadyReceived = false;
         taskEXIT_CRITICAL(&pendingMux);
+
+        if (clearControl) {
+            clearControlTx();
+        }
         
         uint32_t handshakeTime = now - readyStartTime;
         PIGSYNC_LOGF("[PIGSYNC-CLI] RSP_READY received, channel handshake complete (%lums)\n", handshakeTime);
@@ -1855,6 +1911,18 @@ bool PigSyncMode::startSync() {
     if (!connected) return false;
     if (remotePMKIDCount == 0 && remoteHSCount == 0) return false;
     
+    // Free caches and suspend sprites for maximum heap before data transfer
+    WPASec::freeCacheMemory();
+    WiGLE::freeUploadedListMemory();
+    delay(200);
+    yield();
+    
+    // Guard: ensure enough contiguous heap for reliable transfer
+    if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < 26000) {
+        strcpy(lastError, "LOW HEAP");
+        return false;
+    }
+    
     state = State::SYNCING;
     dialoguePhase = 1;  // Syncing phase
     currentIndex = 0;
@@ -2131,12 +2199,14 @@ bool PigSyncMode::savePMKID(const uint8_t* data, uint16_t len) {
         return false;
     }
 
-    if (!SD.exists("/handshakes")) {
-        SD.mkdir("/handshakes");
+    const char* handshakesDir = SDLayout::handshakesDir();
+    if (!SD.exists(handshakesDir)) {
+        SD.mkdir(handshakesDir);
     }
 
     char filename[64];
-    snprintf(filename, sizeof(filename), "/handshakes/%02X%02X%02X%02X%02X%02X.22000",
+    snprintf(filename, sizeof(filename), "%s/%02X%02X%02X%02X%02X%02X.22000",
+             handshakesDir,
              pmkid.bssid[0], pmkid.bssid[1], pmkid.bssid[2],
              pmkid.bssid[3], pmkid.bssid[4], pmkid.bssid[5]);
     removeIfExists(filename);
@@ -2145,7 +2215,8 @@ bool PigSyncMode::savePMKID(const uint8_t* data, uint16_t len) {
 
     if (ok) {
         char txtFilename[64];
-        snprintf(txtFilename, sizeof(txtFilename), "/handshakes/%02X%02X%02X%02X%02X%02X_pmkid.txt",
+        snprintf(txtFilename, sizeof(txtFilename), "%s/%02X%02X%02X%02X%02X%02X_pmkid.txt",
+                 handshakesDir,
                  pmkid.bssid[0], pmkid.bssid[1], pmkid.bssid[2],
                  pmkid.bssid[3], pmkid.bssid[4], pmkid.bssid[5]);
         removeIfExists(txtFilename);
@@ -2174,18 +2245,21 @@ bool PigSyncMode::saveHandshake(const uint8_t* data, uint16_t len) {
         return false;
     }
 
-    if (!SD.exists("/handshakes")) {
-        SD.mkdir("/handshakes");
+    const char* handshakesDir = SDLayout::handshakesDir();
+    if (!SD.exists(handshakesDir)) {
+        SD.mkdir(handshakesDir);
     }
 
     char filenamePcap[64];
-    snprintf(filenamePcap, sizeof(filenamePcap), "/handshakes/%02X%02X%02X%02X%02X%02X.pcap",
+    snprintf(filenamePcap, sizeof(filenamePcap), "%s/%02X%02X%02X%02X%02X%02X.pcap",
+             handshakesDir,
              hs.bssid[0], hs.bssid[1], hs.bssid[2],
              hs.bssid[3], hs.bssid[4], hs.bssid[5]);
     removeIfExists(filenamePcap);
 
     char filename22000[64];
-    snprintf(filename22000, sizeof(filename22000), "/handshakes/%02X%02X%02X%02X%02X%02X_hs.22000",
+    snprintf(filename22000, sizeof(filename22000), "%s/%02X%02X%02X%02X%02X%02X_hs.22000",
+             handshakesDir,
              hs.bssid[0], hs.bssid[1], hs.bssid[2],
              hs.bssid[3], hs.bssid[4], hs.bssid[5]);
     removeIfExists(filename22000);
@@ -2195,7 +2269,8 @@ bool PigSyncMode::saveHandshake(const uint8_t* data, uint16_t len) {
 
     if (pcapOk || hs22kOk) {
         char txtFilename[64];
-        snprintf(txtFilename, sizeof(txtFilename), "/handshakes/%02X%02X%02X%02X%02X%02X.txt",
+        snprintf(txtFilename, sizeof(txtFilename), "%s/%02X%02X%02X%02X%02X%02X.txt",
+                 handshakesDir,
                  hs.bssid[0], hs.bssid[1], hs.bssid[2],
                  hs.bssid[3], hs.bssid[4], hs.bssid[5]);
         removeIfExists(txtFilename);

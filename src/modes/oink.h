@@ -7,6 +7,7 @@
 #include <set>
 #include <map>
 #include <FS.h>
+#include "../core/network_recon.h"
 
 // Maximum clients to track per network
 #define MAX_CLIENTS_PER_NETWORK 20  // Dense environment support (conferences, airports)
@@ -99,14 +100,10 @@ public:
     static void update();
     static bool isRunning() { return running; }
     
-    // Seamless switching (preserves WiFi state for OINK <-> DNH)
-    static void startSeamless();
-    static void stopSeamless();
-    
     // Scanning
     static void startScan();
     static void stopScan();
-    static const std::vector<DetectedNetwork>& getNetworks() { return networks; }
+    static const std::vector<DetectedNetwork>& getNetworks() { return NetworkRecon::getNetworks(); }
     
     // Target selection
     static void selectTarget(int index);
@@ -142,7 +139,7 @@ public:
     // Statistics
     static uint32_t getPacketCount() { return packetCount; }
     static uint32_t getDeauthCount() { return deauthCount; }
-    static uint16_t getNetworkCount() { return networks.size(); }
+    static uint16_t getNetworkCount() { return NetworkRecon::getNetworkCount(); }
     static uint16_t getFilteredCount();
     
     // LOCKING state info (for display)
@@ -171,8 +168,9 @@ public:
     // Stress test injection (no RF)
     static void injectTestNetwork(const uint8_t* bssid, const char* ssid, uint8_t channel, int8_t rssi, wifi_auth_mode_t authmode, bool hasPMF);
     
-    // Promiscuous mode callback (public for shared use with DO NO HAM mode)
-    static void promiscuousCallback(void* buf, wifi_promiscuous_pkt_type_t type);
+    // Packet callback for OINK-specific processing (EAPOL/handshakes)
+    // Called by NetworkRecon for mode-specific packet handling
+    static void promiscuousCallback(const wifi_promiscuous_pkt_t* pkt, wifi_promiscuous_pkt_type_t type);
     
 private:
     static bool running;
@@ -183,7 +181,7 @@ private:
     static uint32_t lastHopTime;
     static uint32_t lastScanTime;
     
-    static std::vector<DetectedNetwork> networks;
+    // networks vector moved to NetworkRecon::getNetworks()
     static std::vector<CapturedHandshake> handshakes;
     static std::vector<CapturedPMKID> pmkids;
     static int targetIndex;
@@ -194,13 +192,13 @@ private:
     static bool targetHiddenCache;
     static bool targetCacheValid;
     static int selectionIndex;  // Cursor for network selection
-    static uint32_t packetCount;
+    static volatile uint32_t packetCount;
     static uint32_t deauthCount;
     
     // Beacon frame storage (for PCAP)
     static uint8_t* beaconFrame;
     static uint16_t beaconFrameLen;
-    static bool beaconCaptured;
+    static std::atomic<bool> beaconCaptured;  // Atomic to prevent race between callback and main thread
     
     // Private processing functions (callback dispatches here)
     static void processBeacon(const uint8_t* payload, uint16_t len, int8_t rssi);

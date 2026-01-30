@@ -10,7 +10,8 @@
 // GPS module source selection
 enum class GPSSource : uint8_t {
     GROVE = 0,      // Grove port GPS (G1/G2) - works on all Cardputer models
-    CAP_LORA = 1    // Cap LoRa868 GPS (G15/G13) - Cardputer ADV only
+    CAP_LORA = 1,   // Cap LoRa868 GPS (G15/G13) - Cardputer ADV only
+    CUSTOM = 2      // Custom pins - user-configured
 };
 
 // GPS power management settings
@@ -36,18 +37,29 @@ enum class MLCollectionMode : uint8_t {
 enum class G0Action : uint8_t {
     SCREEN_TOGGLE = 0,
     OINK,
-    DNHAM,
+    DNOHAM,
     SPECTRUM,
-    PIGSYNC
+    PIGSYNC,
+    IDLE
 };
 
-static constexpr uint8_t G0_ACTION_COUNT = 5;
+static constexpr uint8_t G0_ACTION_COUNT = 6;
+
+// Boot mode selection
+enum class BootMode : uint8_t {
+    IDLE = 0,
+    OINK,
+    DNOHAM,
+    WARHOG
+};
+
+static constexpr uint8_t BOOT_MODE_COUNT = 4;
 
 // ML settings
 struct MLConfig {
     bool enabled = true;
     MLCollectionMode collectionMode = MLCollectionMode::ENHANCED;  // Data collection mode
-    String modelPath = "/models/porkchop_model.bin";
+    String modelPath = "/m5porkchop/models/porkchop_model.bin";
     float confidenceThreshold = 0.7f;
     float rogueApThreshold = 0.8f;
     float vulnScorerThreshold = 0.6f;
@@ -61,12 +73,12 @@ struct WiFiConfig {
     uint16_t lockTime = 12000;          // Time to discover clients before attacking (12s optimal, buffed 13s)
     bool enableDeauth = true;
     bool randomizeMAC = true;           // Randomize MAC on mode start for stealth
-    String otaSSID = "";
-    String otaPassword = "";
+    char otaSSID[33];
+    char otaPassword[65];
     bool autoConnect = false;
-    String wpaSecKey = "";              // WPA-SEC.stanev.org user key (32 hex chars)
-    String wigleApiName = "";           // WiGLE API Name (from wigle.net/account)
-    String wigleApiToken = "";          // WiGLE API Token (from wigle.net/account)
+    char wpaSecKey[33];                 // WPA-SEC.stanev.org user key (32 hex chars)
+    char wigleApiName[65];              // WiGLE API Name (from wigle.net/account)
+    char wigleApiToken[65];             // WiGLE API Token (from wigle.net/account)
 };
 
 // BLE settings for PIGGY BLUES mode
@@ -89,6 +101,7 @@ struct PersonalityConfig {
     uint16_t dimTimeout = 30;           // Seconds before dimming (0 = never)
     uint8_t themeIndex = 0;             // Color theme (0-13, see THEMES array)
     G0Action g0Action = G0Action::SCREEN_TOGGLE;
+    BootMode bootMode = BootMode::IDLE;
 };
 
 class Config {
@@ -99,8 +112,8 @@ public:
     static bool loadPersonality();
     static bool isSDAvailable();
     static bool reinitSD();  // Try to (re)initialize SD card at runtime
-    static bool loadWpaSecKeyFromFile();  // Load key from /wpasec_key.txt and delete file
-    static bool loadWigleKeyFromFile();   // Load keys from /wigle_key.txt and delete file
+    static bool loadWpaSecKeyFromFile();  // Load key from /m5porkchop/wpa-sec/wpasec_key.txt (legacy /wpasec_key.txt)
+    static bool loadWigleKeyFromFile();   // Load keys from /m5porkchop/wigle/wigle_key.txt (legacy /wigle_key.txt)
     
     // Getters
     static GPSConfig& gps() { return gpsConfig; }

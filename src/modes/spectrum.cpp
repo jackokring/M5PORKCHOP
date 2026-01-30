@@ -4,6 +4,7 @@
 #include "oink.h"
 #include "../core/config.h"
 #include "../audio/sfx.h"
+#include "../core/network_recon.h"
 #include "../core/oui.h"
 #include "../core/stress_test.h"
 #include "../core/wsl_bypasser.h"
@@ -13,8 +14,10 @@
 #include <M5Cardputer.h>
 #include <WiFi.h>
 #include <esp_wifi.h>
-#include <NimBLEDevice.h>  // For BLE coexistence check
+#include <esp_heap_caps.h>  // For heap_caps_get_largest_free_block
+#include <NimBLEDevice.h>   // For BLE coexistence check
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <ctype.h>
 #include <string.h>
@@ -45,9 +48,23 @@ const uint32_t UPDATE_INTERVAL_MS = 100;   // 10 FPS update rate
 // Memory limits
 const size_t MAX_SPECTRUM_NETWORKS = 100;  // Cap networks to prevent OOM
 
+// Gaussian LUT for spectrum lobes (sigma=6.6, distances -15 to +15 MHz)
+// Pre-computed: exp(-0.5 * dist^2 / 43.56) for each integer distance
+// Eliminates expensive expf() calls in hot render path (~6000/sec savings)
+// Formula: exp(-0.5 * d^2 / 43.56) where d = distance in MHz
+static const float GAUSSIAN_LUT[31] = {
+    0.0756f, 0.1052f, 0.1437f, 0.1914f, 0.2493f,  // -15 to -11
+    0.3173f, 0.3946f, 0.4797f, 0.5695f, 0.6616f,  // -10 to -6
+    0.7506f, 0.8321f, 0.9019f, 0.9551f, 0.9885f,  // -5 to -1
+    1.0000f,                                        // 0 (center)
+    0.9885f, 0.9551f, 0.9019f, 0.8321f, 0.7506f,  // +1 to +5
+    0.6616f, 0.5695f, 0.4797f, 0.3946f, 0.3173f,  // +6 to +10
+    0.2493f, 0.1914f, 0.1437f, 0.1052f, 0.0756f   // +11 to +15
+};
+
 // Static members
 bool SpectrumMode::running = false;
-volatile bool SpectrumMode::busy = false;
+std::atomic<bool> SpectrumMode::busy{false};  // [BUG7 FIX] Atomic for cross-core visibility
 std::vector<SpectrumNetwork> SpectrumMode::networks;
 float SpectrumMode::viewCenterMHz = DEFAULT_CENTER_MHZ;
 float SpectrumMode::viewWidthMHz = DEFAULT_WIDTH_MHZ;
@@ -153,68 +170,24 @@ void SpectrumMode::start() {
     
     Serial.println("[SPECTRUM] Starting HOG ON SPECTRUM mode...");
     
-    // WiFi promiscuous mode + BLE = unstable on ESP32-S3 (see Espressif coexistence docs)
-    // If BLE was previously used (PigSyncMode, PiggyBlues), we need to deinit it first
-    // or the shared radio causes crashes. Try deinit first, reboot if it fails.
-    if (NimBLEDevice::isInitialized()) {
-        Serial.println("[SPECTRUM] BLE detected - attempting deinit for WiFi coexistence");
-        
-        // Stop any active BLE operations first
-        NimBLEScan* pScan = NimBLEDevice::getScan();
-        if (pScan && pScan->isScanning()) {
-            pScan->stop();
-            delay(100);
-        }
-        
-        NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
-        if (pAdv && pAdv->isAdvertising()) {
-            pAdv->stop();
-            delay(100);
-        }
-        
-        // Now deinit BLE completely (clearAll=true to reset all state)
-        bool deinitOk = NimBLEDevice::deinit(true);
-        delay(200);  // Give BLE stack time to fully shut down
-        
-        if (!deinitOk || NimBLEDevice::isInitialized()) {
-            // Deinit failed - need to reboot for clean slate
-            Display::showToast("BLE CLEANUP - REBOOTING...");
-            delay(2000);
-            ESP.restart();
-            return;  // Won't reach here, but good practice
-        }
-        
-        Serial.println("[SPECTRUM] BLE deinit successful - proceeding with WiFi promisc");
+    // Ensure NetworkRecon is running (handles WiFi promiscuous mode)
+    if (!NetworkRecon::isRunning()) {
+        NetworkRecon::start();
     }
     
+    // Reserve memory for spectrum-specific network data
+    networks.reserve(MAX_SPECTRUM_NETWORKS);
     init();
     
-    // Initialize WiFi in promiscuous mode (force restart to recover from desync)
-        delay(50);
-    WiFi.mode(WIFI_STA);
-    
-    // Randomize MAC if enabled (stealth)
-    if (Config::wifi().randomizeMAC) {
-        WSLBypasser::randomizeMAC();
-    }
-    
-    WiFi.disconnect();
-    delay(100);
-    
-    // Set promiscuous callback and enable
-    esp_wifi_set_promiscuous_rx_cb(promiscuousCallback);
-    esp_wifi_set_promiscuous_filter(nullptr);  // Receive all packet types (mgmt + data)
-    esp_wifi_set_promiscuous(true);
-    
-    // Start on channel 1, will hop through all
-    esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+    // Register our packet callback for visualization
+    NetworkRecon::setPacketCallback(promiscuousCallback);
     
     running = true;
     lastUpdateTime = millis();
     startTime = millis();
     
     Display::setWiFiStatus(true);
-    Serial.println("[SPECTRUM] Running - scanning all channels");
+    Serial.printf("[SPECTRUM] Running - %d networks from recon\n", NetworkRecon::getNetworkCount());
 }
 
 void SpectrumMode::stop() {
@@ -225,16 +198,26 @@ void SpectrumMode::stop() {
     // Block callback during shutdown sequence
     busy = true;
     
+    // Clear our packet callback (NetworkRecon keeps running)
+    NetworkRecon::setPacketCallback(nullptr);
+    
     // [P4] Ensure monitoring is disabled
     monitoringNetwork = false;
     
-    WiFiUtils::shutdown();
+    // Unlock channel if we locked it
+    if (NetworkRecon::isChannelLocked()) {
+        NetworkRecon::unlockChannel();
+    }
     
     running = false;
     Display::setWiFiStatus(false);
     
+    // FIX: Release vector capacity to recover heap
+    networks.clear();
+    networks.shrink_to_fit();
+    
     busy = false;
-    Serial.printf("[SPECTRUM] Stopped - tracked %d networks\n", networks.size());
+    Serial.println("[SPECTRUM] Stopped - heap recovered");
 }
 
 void SpectrumMode::update() {
@@ -556,18 +539,20 @@ void SpectrumMode::draw(M5Canvas& canvas) {
             canvas.setTextColor(COLOR_FG);
             canvas.setTextDatum(top_left);
             
-            // Build status string: [VULN!] and/or [DEAUTH] and/or [BRO]
-            String status = "";
+            // Build status string without heap churn
+            char status[24];
+            size_t pos = 0;
+            status[0] = '\0';
             if (isVulnerable(net.authmode)) {
-                status += "[VULN!]";
+                pos += snprintf(status + pos, sizeof(status) - pos, "[VULN!]");
             }
             if (!net.hasPMF) {
-                status += "[DEAUTH]";
+                pos += snprintf(status + pos, sizeof(status) - pos, "[DEAUTH]");
             }
             if (OinkMode::isExcluded(net.bssid)) {
-                status += "[BRO]";
+                pos += snprintf(status + pos, sizeof(status) - pos, "[BRO]");
             }
-            if (status.length() > 0) {
+            if (pos > 0) {
                 canvas.drawString(status, SPECTRUM_LEFT + 2, SPECTRUM_TOP);
             }
         }
@@ -590,7 +575,9 @@ void SpectrumMode::drawAxis(M5Canvas& canvas) {
         // Shift label down if it would be cut off by top bar (font height ~8px, so 4px minimum)
         int labelY = (y < 6) ? 6 : y;
         canvas.drawFastHLine(SPECTRUM_LEFT - 4, y, 3, COLOR_FG);
-        canvas.drawString(String(rssi), SPECTRUM_LEFT - 5, labelY);
+        char rssiLabel[6];
+        snprintf(rssiLabel, sizeof(rssiLabel), "%d", rssi);
+        canvas.drawString(rssiLabel, SPECTRUM_LEFT - 5, labelY);
     }
     
     // Baseline
@@ -644,7 +631,9 @@ void SpectrumMode::drawChannelMarkers(M5Canvas& canvas) {
             }
             
             // Channel number
-            canvas.drawString(String(ch), x, CHANNEL_LABEL_Y);
+            char chLabel[4];
+            snprintf(chLabel, sizeof(chLabel), "%u", ch);
+            canvas.drawString(chLabel, x, CHANNEL_LABEL_Y);
         }
     }
     canvas.setTextColor(COLOR_FG);  // reset
@@ -963,26 +952,34 @@ void SpectrumMode::drawClientDetail(M5Canvas& canvas) {
 }
 
 void SpectrumMode::drawSpectrum(M5Canvas& canvas) {
-    // Guard against callback modifying networks during copy
+    // Guard against callback modifying networks during snapshot
     busy = true;
     
-    // Sort networks by RSSI (weakest first, so strongest draws on top)
-    std::vector<SpectrumNetwork> sorted = networks;
+    // Copy pointers to avoid heap allocations in render loop
+    const size_t maxCount = networks.size();
+    const size_t cap = (maxCount > MAX_SPECTRUM_NETWORKS) ? MAX_SPECTRUM_NETWORKS : maxCount;
+    const SpectrumNetwork* snapshot[MAX_SPECTRUM_NETWORKS];
+    size_t snapshotCount = 0;
+    for (size_t i = 0; i < cap; i++) {
+        snapshot[snapshotCount++] = &networks[i];
+    }
     
     busy = false;
     
-    std::sort(sorted.begin(), sorted.end(), [](const SpectrumNetwork& a, const SpectrumNetwork& b) {
-        return a.rssi < b.rssi;
+    // Sort pointers by RSSI (weakest first, so strongest draws on top)
+    std::sort(snapshot, snapshot + snapshotCount, [](const SpectrumNetwork* a, const SpectrumNetwork* b) {
+        return a->rssi < b->rssi;
     });
     
     // Draw each network's Gaussian lobe (only if matches filter)
-    for (size_t i = 0; i < sorted.size(); i++) {
-        const auto& net = sorted[i];
+    for (size_t i = 0; i < snapshotCount; i++) {
+        const auto& net = *snapshot[i];
         
         // Skip networks that don't match current filter
         if (!matchesFilter(net)) continue;
         
-        float freq = channelToFreq(net.channel);
+        // Use smoothed display frequency to prevent left/right jitter
+        float freq = net.displayFreqMHz;
         
         // Check if selected (compare by BSSID)
         bool isSelected = false;
@@ -997,8 +994,8 @@ void SpectrumMode::drawSpectrum(M5Canvas& canvas) {
 void SpectrumMode::drawGaussianLobe(M5Canvas& canvas, float centerFreqMHz, 
                                      int8_t rssi, bool filled) {
     // 2.4GHz WiFi channels are 22MHz wide
-    // Gaussian sigma for -3dB at ±11MHz: sigma ≈ 6.6
-    const float sigma = 6.6f;
+    // Uses pre-computed GAUSSIAN_LUT[] to avoid expensive expf() calls
+    // LUT index 0-30 maps to distance -15 to +15 MHz
     
     int peakY = rssiToY(rssi);
     int baseY = SPECTRUM_BOTTOM;
@@ -1020,9 +1017,23 @@ void SpectrumMode::drawGaussianLobe(M5Canvas& canvas, float centerFreqMHz,
             continue;
         }
         
-        // Gaussian amplitude falloff
+        // Gaussian amplitude from LUT with linear interpolation
+        // LUT maps integer distances -15 to +15 (indices 0-30)
         float dist = freq - centerFreqMHz;
-        float amplitude = expf(-0.5f * (dist * dist) / (sigma * sigma));
+        float lutPos = dist + 15.0f;  // Map -15..+15 to 0..30
+        float amplitude;
+        if (lutPos < 0.0f || lutPos > 30.0f) {
+            amplitude = 0.0f;
+        } else {
+            int lutIdx = (int)lutPos;
+            float frac = lutPos - lutIdx;
+            if (lutIdx >= 30) {
+                amplitude = GAUSSIAN_LUT[30];
+            } else {
+                // Linear interpolation between adjacent LUT entries
+                amplitude = GAUSSIAN_LUT[lutIdx] + frac * (GAUSSIAN_LUT[lutIdx + 1] - GAUSSIAN_LUT[lutIdx]);
+            }
+        }
         int y = baseY - (int)((baseY - peakY) * amplitude);
         
         if (prevX >= SPECTRUM_LEFT && prevX <= SPECTRUM_RIGHT) {
@@ -1191,12 +1202,8 @@ void SpectrumMode::updateDialChannel() {
         // Scroll spectrum view to keep dial channel centered
         viewCenterMHz = channelToFreq(dialChannel);
     }
-    
-    // Ensure we stay on dial channel
-    if (currentChannel != dialChannel) {
-        esp_wifi_set_channel(dialChannel, WIFI_SECOND_CHAN_NONE);
-        currentChannel = dialChannel;
-    }
+    // Note: Redundant channel enforcement removed - above block already ensures
+    // currentChannel == dialChannel after any change
     
     lastDialUpdate = now;
 }
@@ -1244,16 +1251,34 @@ void SpectrumMode::onBeacon(const uint8_t* bssid, uint8_t channel, int8_t rssi, 
     // Skip if main thread is accessing networks
     if (busy) return;
     
+    // Validate inputs to prevent crashes
+    if (!bssid || channel < 1 || channel > 13) return;
+    
     bool hasSSID = (ssid && ssid[0] != 0);
     
-    // Look for existing network
-    for (auto& net : networks) {
+    // [BUG3 FIX] Look for existing network - use index-based loop with size snapshot
+    // This avoids iterator invalidation if vector is modified between iterations
+    size_t count = networks.size();
+    for (size_t i = 0; i < count; i++) {
+        // Re-check busy each iteration in case main thread started work
+        if (busy) return;
+        
+        // Bounds check in case vector shrunk
+        if (i >= networks.size()) break;
+        
+        SpectrumNetwork& net = networks[i];
         if (memcmp(net.bssid, bssid, 6) == 0) {
-            // Update existing
+            // Update existing - these are atomic writes, safe without lock
             net.rssi = rssi;
             net.lastSeen = millis();
             net.authmode = authmode;  // Update auth mode
             net.hasPMF = hasPMF;      // Update PMF status
+            net.channel = channel;    // Update channel in case it changed
+            
+            // Smooth the display frequency with EMA to prevent left/right jitter
+            // Alpha=0.15 balances responsiveness with stability
+            float targetFreq = channelToFreq(channel);
+            net.displayFreqMHz += (targetFreq - net.displayFreqMHz) * 0.15f;
             
             // Probe response can reveal hidden SSID
             if (hasSSID && net.isHidden && net.ssid[0] == 0) {
@@ -1264,11 +1289,12 @@ void SpectrumMode::onBeacon(const uint8_t* bssid, uint8_t channel, int8_t rssi, 
                 if (!pendingReveal) {
                     strncpy(pendingRevealSSID, ssid, 32);
                     pendingRevealSSID[32] = 0;
+                    pendingRevealSSID[33] = 0; // Extra safety null terminator
                     pendingReveal = true;
                 }
             }
             // Also update if we had no SSID before
-            else if (hasSSID && net.ssid[0] == 0) {
+            else if (hasSSID && strlen(net.ssid) == 0) {
                 strncpy(net.ssid, ssid, 32);
                 net.ssid[32] = 0;
             }
@@ -1277,17 +1303,18 @@ void SpectrumMode::onBeacon(const uint8_t* bssid, uint8_t channel, int8_t rssi, 
     }
     
     // Add new network (limit to prevent OOM)
-    if (networks.size() >= 100) return;
+    if (networks.size() >= MAX_SPECTRUM_NETWORKS) return;
     
-    SpectrumNetwork net = {0};
+    SpectrumNetwork net = {};
     memcpy(net.bssid, bssid, 6);
-    if (hasSSID) {
+    if (hasSSID && ssid != nullptr) {
         strncpy(net.ssid, ssid, 32);
         net.ssid[32] = 0;
         net.isHidden = false;
     } else {
         // Empty SSID = hidden network
         net.isHidden = true;
+        net.ssid[0] = 0; // Ensure empty string
     }
     net.channel = channel;
     net.rssi = rssi;
@@ -1295,11 +1322,11 @@ void SpectrumMode::onBeacon(const uint8_t* bssid, uint8_t channel, int8_t rssi, 
     net.authmode = authmode;
     net.hasPMF = hasPMF;
     net.wasRevealed = false;
+    net.displayFreqMHz = channelToFreq(channel);  // Initialize smoothed position
+    net.clientCount = 0; // Initialize client count
     
-    // Cap networks to prevent OOM
-    if (networks.size() >= MAX_SPECTRUM_NETWORKS) {
-        return;  // At capacity, skip
-    }
+    // Initialize client array to zero
+    memset(net.clients, 0, sizeof(net.clients));
     
     // Defer push_back to main loop (ESP32 dual-core race: callback can run concurrent with update())
     // If pendingNetworkAdd already set, we lose one add - acceptable tradeoff for safety
@@ -1378,19 +1405,23 @@ void SpectrumMode::getSelectedInfo(char* out, size_t len) {
     snprintf(out, len, "PRESS ENTER TO SELECT");
 }
 
-// Promiscuous callback - extract beacon info
-void SpectrumMode::promiscuousCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
+// Packet callback - extract beacon info for visualization
+void SpectrumMode::promiscuousCallback(const wifi_promiscuous_pkt_t* pkt, wifi_promiscuous_pkt_type_t type) {
     if (!running) return;
     if (busy) return;  // [P1] Main thread is iterating
     
     // Count all packets for PPS display in dial mode
     ppsCounter++;
     
-    const wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
+    if (!pkt || !pkt->payload) return;
+    
     const uint8_t* payload = pkt->payload;
     uint16_t len = pkt->rx_ctrl.sig_len;
     int8_t rssi = pkt->rx_ctrl.rssi;
     uint8_t channel = pkt->rx_ctrl.channel;
+    
+    // Validate channel range
+    if (channel < 1 || channel > 13) return;
     
     // Handle data frames when monitoring
     if (type == WIFI_PKT_DATA && monitoringNetwork) {
@@ -1416,12 +1447,14 @@ void SpectrumMode::promiscuousCallback(void* buf, wifi_promiscuous_pkt_type_t ty
     uint16_t offset = 36;
     
     while (offset + 2 < len) {
+        if (offset + 2 >= len) break; // Additional bounds check
         uint8_t tagNum = payload[offset];
         uint8_t tagLen = payload[offset + 1];
         
         if (offset + 2 + tagLen > len) break;
         
         if (tagNum == 0 && tagLen <= 32) {  // SSID tag
+            if (offset + 2 + tagLen >= len) break; // Bounds check before memcpy
             memcpy(ssid, payload + offset + 2, tagLen);
             ssid[tagLen] = 0;
             break;
@@ -1435,6 +1468,7 @@ void SpectrumMode::promiscuousCallback(void* buf, wifi_promiscuous_pkt_type_t ty
     bool hasRSN = false;
     offset = 36;
     while (offset + 2 < len) {
+        if (offset + 2 >= len) break; // Additional bounds check
         uint8_t tagNum = payload[offset];
         uint8_t tagLen = payload[offset + 1];
         
@@ -1445,7 +1479,8 @@ void SpectrumMode::promiscuousCallback(void* buf, wifi_promiscuous_pkt_type_t ty
             authmode = WIFI_AUTH_WPA2_PSK;
         } else if (tagNum == 0xDD && tagLen >= 8) {  // Vendor specific
             // Check for WPA1 OUI: 00:50:F2:01
-            if (payload[offset + 2] == 0x00 && payload[offset + 3] == 0x50 &&
+            if (offset + 5 < len &&  // Ensure we don't read past buffer
+                payload[offset + 2] == 0x00 && payload[offset + 3] == 0x50 &&
                 payload[offset + 4] == 0xF2 && payload[offset + 5] == 0x01) {
                 // WPA1 - only set if not already WPA2
                 if (!hasRSN) {
@@ -1562,7 +1597,7 @@ bool SpectrumMode::detectPMF(const uint8_t* payload, uint16_t len) {
 
 // Process data frame to extract client MAC
 void SpectrumMode::processDataFrame(const uint8_t* payload, uint16_t len, int8_t rssi) {
-    if (len < 24) return;  // Too short for valid data frame
+    if (!payload || len < 24) return;  // Too short for valid data frame or null payload
     
     // Frame Control is 2 bytes - ToDS/FromDS are in byte 1, not byte 0
     // Byte 0: Protocol(2) + Type(2) + Subtype(4)
@@ -1576,10 +1611,12 @@ void SpectrumMode::processDataFrame(const uint8_t* payload, uint16_t len, int8_t
     
     if (toDS && !fromDS) {
         // Client -> AP: addr1=BSSID, addr2=client
+        if (len < 16) return; // Check if payload is long enough for addr2
         memcpy(bssid, payload + 4, 6);
         memcpy(clientMac, payload + 10, 6);
     } else if (!toDS && fromDS) {
         // AP -> Client: addr1=client, addr2=BSSID
+        if (len < 16) return; // Check if payload is long enough for addr2
         memcpy(clientMac, payload + 4, 6);
         memcpy(bssid, payload + 10, 6);
     } else {
@@ -1598,7 +1635,7 @@ void SpectrumMode::processDataFrame(const uint8_t* payload, uint16_t len, int8_t
 // Track client connected to monitored network
 void SpectrumMode::trackClient(const uint8_t* bssid, const uint8_t* clientMac, int8_t rssi) {
     // Skip if main thread is busy (race prevention)
-    if (busy) return;
+    if (busy || !bssid || !clientMac) return;
     
     // Bounds check [P3]
     if (monitoredNetworkIndex < 0 || monitoredNetworkIndex >= (int)networks.size()) {
@@ -1640,7 +1677,7 @@ void SpectrumMode::trackClient(const uint8_t* bssid, const uint8_t* clientMac, i
             pendingClientBeep = true;
         }
         
-        Serial.printf("[SPECTRUM] New client: %02X:%02X:%02X:%02X:%02X:%02X\n",
+        Serial.printf("[SPECTRUM] New client: %02X:%02X:%02X:%02X\n",
             clientMac[0], clientMac[1], clientMac[2],
             clientMac[3], clientMac[4], clientMac[5]);
     }

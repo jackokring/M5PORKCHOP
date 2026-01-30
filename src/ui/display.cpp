@@ -24,7 +24,7 @@
 #include "../modes/spectrum.h"
 #include "../modes/pigsync_client.h"
 #include "../modes/pigsync_protocol.h"
-#include "../modes/marco.h"
+#include "../modes/bacon.h"
 #include "../gps/gps.h"
 #include "../web/fileserver.h"
 #include "menu.h"
@@ -35,30 +35,33 @@
 #include "achievements_menu.h"
 #include "swine_stats.h"
 #include "boar_bros_menu.h"
+#include "../core/sd_layout.h"
 #include "wigle_menu.h"
 #include "unlockables_menu.h"
 #include "bounty_status_menu.h"
+#include "sd_format_menu.h"
 
 // Theme color getters - read from config
 // Theme definitions
 const PorkTheme THEMES[THEME_COUNT] = {
-    // Dark modes - colored text on black
-    {"P1NK",      0xFD75, 0x0000},  // Default piglet pink
-    {"CYB3R",     0x07FF, 0x0000},  // Cyan/tron
-    {"PCMDR64",   0xCD9F, 0x28C8},  // Porkchop Commandor 64
-    {"MSD0SEXE", 0xFFE0, 0x001F},  // Classic MS-DOS yellow on blue
-    {"AMB3R",     0xFD20, 0x0000},  // Amber terminal
-    {"BL00D",     0xF800, 0x0000},  // Red
-    {"GH0ST",     0xFFFF, 0x0000},  // White mono
-    {"N0STR0M0",  0x39E7, 0x0000},  // Alien terminal gray
-    // Inverted modes - black text on colored bg
-    {"PAP3R",     0x0000, 0xFFFF},  // Black on white
-    {"BUBBLEGUM", 0x0000, 0xFD75},  // Black on pink
-    {"M1NT",      0x0000, 0x07FF},  // Black on cyan
-    {"SUNBURN",   0x0000, 0xFD20},  // Black on amber
-    // Retro modes
-    {"L1TTL3M1XY", 0x0B80, 0x9DE7}, // OG Game Boy LCD
-    {"B4NSH33",   0x37E0, 0x0000},  // P1 phosphor green CRT
+    // Dark modes - colored text on black (RGB332-compatible)
+    {"P1NK",      0xF92A, 0x0000},  // Default piglet pink - RGB332-quantized
+    {"CYB3R",     0x07E0, 0x0000},  // Cyan/tron - RGB332-quantized
+    {"PCMDR64",   0xDED5, 0x4A4A},  // Porkchop Commandor 64 - RGB332-quantized
+    {"MSD0SEXE", 0xFFE0, 0x001F},  // Classic MS-DOS yellow on blue - RGB332-quantized
+    {"AMB3R",     0xFDA0, 0x0000},  // Amber terminal - RGB332-quantized
+    {"BL00D",     0xF800, 0x0000},  // Red - RGB332-quantized
+    {"GH0ST",     0xFFFF, 0x0000},  // White mono - RGB332-quantized
+    {"N0STR0M0",  0x4A4A, 0x0000},  // Alien terminal gray - RGB332-quantized
+    // Inverted modes - black text on colored bg (RGB332-compatible)
+    {"PAP3R",     0x0000, 0xFFFF},  // Black on white - RGB332-quantized
+    {"BUBBLEGUM", 0x0000, 0xF92A},  // Black on pink - RGB332-quantized
+    {"M1NT",      0x0000, 0x07E0},  // Black on cyan - RGB332-quantized
+    {"SUNBURN",   0x0000, 0xFDA0},  // Black on amber - RGB332-quantized
+    // Retro modes (RGB332-compatible)
+    {"L1TTL3M1XY", 0x0360, 0x95AA}, // OG Game Boy LCD - RGB332-quantized
+    {"B4NSH33",   0x27E0, 0x0000},  // P1 phosphor green CRT - RGB332-quantized
+    {"M1XYL1TTL3", 0x95AA, 0x0360}, // Inverted Game Boy LCD - RGB332-quantized
 };
 
 uint16_t getColorFG() {
@@ -103,17 +106,15 @@ uint32_t Display::lastActivityTime = 0;
 bool Display::dimmed = false;
 bool Display::screenForcedOff = false;
 bool Display::snapping = false;
-String Display::toastMessage = "";
+char Display::toastMessage[160] = {0};
 uint32_t Display::toastStartTime = 0;
+uint32_t Display::toastDurationMs = 2000;
 bool Display::toastActive = false;
-String Display::topBarMessage = "";
+char Display::topBarMessage[96] = {0};
 uint32_t Display::topBarMessageStart = 0;
 uint32_t Display::topBarMessageDuration = 0;
 bool Display::topBarMessageTwoLineActive = false;
-String Display::bottomOverlay = "";
-volatile bool Display::spritesSuspended = false;
-volatile bool Display::suspendRequested = false;
-volatile bool Display::resumeRequested = false;
+char Display::bottomOverlay[96] = {0};
 volatile bool Display::pendingTopBarMessage = false;
 char Display::pendingTopBarMessageBuf[96] = {0};
 uint32_t Display::pendingTopBarDurationMs = 0;
@@ -121,37 +122,44 @@ uint32_t Display::pendingTopBarDurationMs = 0;
 // Upload progress tracking
 bool Display::uploadInProgress = false;
 uint8_t Display::uploadProgress = 0;
-String Display::uploadStatus = "";
+char Display::uploadStatus[64] = {0};
 uint32_t Display::uploadStartTime = 0;
 
-// Sprite resume failure tracking
-bool Display::spriteResumeFailed = false;
-uint32_t Display::spriteResumeFailTime = 0;
-static const uint32_t SPRITE_RESUME_FAIL_DISPLAY_MS = 10000;  // Show error for 10 seconds
 
 // PWNED banner state, persists until reboot
-static String lootSSID = "";
+static char lootSSID[20] = {0};
 
 void Display::showLoot(const String& ssid) {
-    lootSSID = ssid;
+    if (ssid.length() == 0) {
+        lootSSID[0] = '\0';
+        return;
+    }
+    strncpy(lootSSID, ssid.c_str(), sizeof(lootSSID) - 1);
+    lootSSID[sizeof(lootSSID) - 1] = '\0';
 }
 
 extern Porkchop porkchop;
 
 void Display::init() {
     M5.Display.setRotation(1);
+    
+    // CRITICAL: Set 8-bit mode for display AND sprites to avoid color conversion crashes
+    // Must explicitly set sprite color depth - they don't inherit from display
+    // 8-bit RGB332 saves ~50% memory: 240×135×3 sprites × 1 byte = ~97KB vs ~194KB
+    M5.Display.setColorDepth(8);
+    
     M5.Display.fillScreen(COLOR_BG);
     M5.Display.setTextColor(COLOR_FG);
     
-    // Create canvas sprites
-    // Use 8-bit sprites to cut RAM use ~50% (helps WiFi init on no-PSRAM boards)
-    topBar.setColorDepth(8);
-    mainCanvas.setColorDepth(8);
-    bottomBar.setColorDepth(8);
+    // Create canvas sprites - then explicitly set them to 8-bit RGB332
     topBar.createSprite(DISPLAY_W, TOP_BAR_H);
+    topBar.setColorDepth(8);
+    
     mainCanvas.createSprite(DISPLAY_W, MAIN_H);
+    mainCanvas.setColorDepth(8);
+    
     bottomBar.createSprite(DISPLAY_W, BOTTOM_BAR_H);
-    spritesSuspended = false;
+    bottomBar.setColorDepth(8);
     
     topBar.setTextSize(1);
     mainCanvas.setTextSize(1);
@@ -183,41 +191,9 @@ void Display::update() {
     }
     portEXIT_CRITICAL(&displayMux);
     if (hasPending) {
-        setTopBarMessage(String(pendingMsg), pendingDuration);
+        setTopBarMessage(pendingMsg, pendingDuration);
     }
 
-    // Handle sprite suspend/resume requests (thread-safe)
-    bool doSuspend = false;
-    bool doResume = false;
-    portENTER_CRITICAL(&displayMux);
-    if (suspendRequested) {
-        suspendRequested = false;
-        doSuspend = true;
-    }
-    if (resumeRequested) {
-        resumeRequested = false;
-        doResume = true;
-    }
-    portEXIT_CRITICAL(&displayMux);
-
-    if (doSuspend && !spritesSuspended) {
-        suspendSprites();
-    }
-
-    // If sprites are suspended, attempt resume on request or periodically when heap allows
-    if (spritesSuspended) {
-        static uint32_t lastResumeAttempt = 0;
-        if (doResume) {
-            resumeSprites();
-        } else if (millis() - lastResumeAttempt > 1000) {
-            lastResumeAttempt = millis();
-            // Try only when a reasonable largest block is available
-            if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) > 30000) {
-                resumeSprites();
-            }
-        }
-        if (spritesSuspended) return;
-    }
     // Check for screen dimming
     updateDimming();
     
@@ -229,7 +205,7 @@ void Display::update() {
         mode == PorkchopMode::DNH_MODE ||
         mode == PorkchopMode::WARHOG_MODE ||
         mode == PorkchopMode::PIGGYBLUES_MODE ||
-        mode == PorkchopMode::MARCO_MODE);
+        mode == PorkchopMode::BACON_MODE);
 
     // Draw main content based on mode - reset all canvas state
     // Thunder flash inverts the background color, FG becomes BG
@@ -340,16 +316,19 @@ void Display::update() {
             BountyStatusMenu::draw(mainCanvas);
             break;
             
-        case PorkchopMode::MARCO_MODE:
-            MarcoMode::draw(mainCanvas);
+        case PorkchopMode::BACON_MODE:
+            BaconMode::draw(mainCanvas);
+            break;
+        case PorkchopMode::SD_FORMAT:
+            SdFormatMenu::draw(mainCanvas);
             break;
     }
     
     // Draw toast if active and not expired (show for 2 seconds)
-    if (toastActive && (millis() - toastStartTime < 2000)) {
+    if (toastActive && (millis() - toastStartTime < toastDurationMs)) {
         // Count lines in message
         int lineCount = 1;
-        for (size_t i = 0; i < toastMessage.length(); i++) {
+        for (size_t i = 0; toastMessage[i] != '\0'; i++) {
             if (toastMessage[i] == '\n') lineCount++;
         }
 
@@ -371,15 +350,18 @@ void Display::update() {
 
         // Draw each line centered
         char buf[128];
-        strncpy(buf, toastMessage.c_str(), sizeof(buf) - 1);
-        buf[sizeof(buf) - 1] = '\0';
+        // SAFETY: Reserve space for strtok modifications
+        if (sizeof(buf) > strlen(toastMessage)) {
+            strncpy(buf, toastMessage, sizeof(buf) - 1);
+            buf[sizeof(buf) - 1] = '\0';
 
-        int y = boxY + 6;
-        char* line = strtok(buf, "\n");
-        while (line) {
-            mainCanvas.drawString(line, DISPLAY_W / 2, y);
-            y += lineH;
-            line = strtok(nullptr, "\n");
+            int y = boxY + 6;
+            char* line = strtok(buf, "\n");
+            while (line) {
+                mainCanvas.drawString(line, DISPLAY_W / 2, y);
+                y += lineH;
+                line = strtok(nullptr, "\n");
+            }
         }
         mainCanvas.setTextDatum(TL_DATUM);
     } else if (toastActive) {
@@ -389,76 +371,6 @@ void Display::update() {
 
     drawBottomBar();
     pushAll();
-}
-
-void Display::suspendSprites() {
-    if (spritesSuspended) return;
-    topBar.deleteSprite();
-    mainCanvas.deleteSprite();
-    bottomBar.deleteSprite();
-    spritesSuspended = true;
-}
-
-void Display::resumeSprites() {
-    if (!spritesSuspended) return;
-
-    size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-    if (largest <= 20000) {
-        Serial.printf("[DISPLAY] Low heap on resume (largest=%u); keeping sprites suspended\n",
-                      (unsigned int)largest);
-        setSpriteResumeFailure();
-        return;
-    }
-
-    // Recreate sprites in 8-bit to reduce heap pressure.
-    topBar.setColorDepth(8);
-    mainCanvas.setColorDepth(8);
-    bottomBar.setColorDepth(8);
-
-    bool ok1 = topBar.createSprite(DISPLAY_W, TOP_BAR_H);
-    bool ok2 = false;
-    bool ok3 = false;
-
-    ok2 = mainCanvas.createSprite(DISPLAY_W, MAIN_H);
-    ok3 = bottomBar.createSprite(DISPLAY_W, BOTTOM_BAR_H);
-
-    if (!ok1 || !ok2 || !ok3) {
-        Serial.printf("[DISPLAY] resumeSprites FAILED (ok1=%d ok2=%d ok3=%d) heap=%u psram=%u\n",
-            ok1, ok2, ok3, ESP.getFreeHeap(), ESP.getFreePsram());
-        // Clean up any partially created sprites to avoid fragmentation
-        topBar.deleteSprite();
-        mainCanvas.deleteSprite();
-        bottomBar.deleteSprite();
-        // Set error flag to show in top bar
-        setSpriteResumeFailure();
-        // Stay suspended to prevent further issues
-        return;
-    }
-
-    topBar.setTextSize(1);
-    mainCanvas.setTextSize(1);
-    bottomBar.setTextSize(1);
-    spritesSuspended = false;
-}
-
-void Display::requestSuspendSprites() {
-    portENTER_CRITICAL(&displayMux);
-    suspendRequested = true;
-    portEXIT_CRITICAL(&displayMux);
-}
-
-void Display::requestResumeSprites() {
-    portENTER_CRITICAL(&displayMux);
-    resumeRequested = true;
-    portEXIT_CRITICAL(&displayMux);
-}
-
-bool Display::waitForSpritesSuspended(uint32_t timeoutMs) {
-    uint32_t start = millis();
-    while (!spritesSuspended && (millis() - start) < timeoutMs) {
-        delay(1);
-    }
-    return spritesSuspended;
 }
 
 void Display::requestTopBarMessage(const char* message, uint32_t durationMs) {
@@ -492,17 +404,12 @@ void Display::pushAll() {
 
 void Display::drawTopBar() {
     topBarMessageTwoLineActive = false;
-    // Check for sprite resume error first (highest priority)
-    if (shouldShowSpriteResumeError()) {
-        drawSpriteResumeError(topBar);
-        return;
-    }
 
-    // Show 2-line top bar message (highest priority after errors)
-    if (topBarMessage.length() > 0) {
+    // Show 2-line top bar message (highest priority)
+    if (topBarMessage[0] != '\0') {
         if (topBarMessageDuration > 0 && (millis() - topBarMessageStart) > topBarMessageDuration) {
-            topBarMessage = "";
-        } else if (topBarMessage.indexOf('\n') >= 0) {
+            topBarMessage[0] = '\0';
+        } else if (strchr(topBarMessage, '\n')) {
             topBarMessageTwoLineActive = true;
             topBar.fillSprite(COLOR_FG);
             return;
@@ -524,17 +431,16 @@ void Display::drawTopBar() {
     }
 
     // Show custom top bar message if present (and not expired)
-    if (topBarMessage.length() > 0) {
+    if (topBarMessage[0] != '\0') {
         if (topBarMessageDuration > 0 && (millis() - topBarMessageStart) > topBarMessageDuration) {
-            topBarMessage = "";
+            topBarMessage[0] = '\0';
         } else {
             topBar.fillSprite(COLOR_FG);
             topBar.setTextColor(COLOR_BG);
             topBar.setTextSize(1);
             topBar.setTextDatum(top_left);
-
             char msgBuf[96];
-            strncpy(msgBuf, topBarMessage.c_str(), sizeof(msgBuf) - 1);
+            strncpy(msgBuf, topBarMessage, sizeof(msgBuf) - 1);
             msgBuf[sizeof(msgBuf) - 1] = '\0';
             size_t len = strlen(msgBuf);
             int maxWidth = DISPLAY_W - 4;
@@ -565,7 +471,7 @@ void Display::drawTopBar() {
             snprintf(modeBuf, sizeof(modeBuf), "IDLE");
             break;
         case PorkchopMode::OINK_MODE:
-            snprintf(modeBuf, sizeof(modeBuf), "OINK");
+            snprintf(modeBuf, sizeof(modeBuf), "OINKS");
             modeColor = COLOR_ACCENT;
             break;
         case PorkchopMode::DNH_MODE:
@@ -591,17 +497,17 @@ void Display::drawTopBar() {
             snprintf(modeBuf, sizeof(modeBuf), "CONFIG");
             break;
         case PorkchopMode::ABOUT:
-            snprintf(modeBuf, sizeof(modeBuf), "ABOUT");
+            snprintf(modeBuf, sizeof(modeBuf), "ABOUTPIG");
             break;
         case PorkchopMode::FILE_TRANSFER:
             snprintf(modeBuf, sizeof(modeBuf), "XFER");
             modeColor = COLOR_SUCCESS;
             break;
         case PorkchopMode::CRASH_VIEWER:
-            snprintf(modeBuf, sizeof(modeBuf), "CRASHES");
+            snprintf(modeBuf, sizeof(modeBuf), "COREDUMP");
             break;
         case PorkchopMode::DIAGNOSTICS:
-            snprintf(modeBuf, sizeof(modeBuf), "DIAG");
+            snprintf(modeBuf, sizeof(modeBuf), "DIAGDATA");
             break;
         case PorkchopMode::CAPTURES:
             snprintf(modeBuf, sizeof(modeBuf), "L00T (%u)", (unsigned)CapturesMenu::getCount());
@@ -632,9 +538,13 @@ void Display::drawTopBar() {
             snprintf(modeBuf, sizeof(modeBuf), "B0UNT13S");
             modeColor = COLOR_ACCENT;
             break;
-        case PorkchopMode::MARCO_MODE:
+        case PorkchopMode::BACON_MODE:
             snprintf(modeBuf, sizeof(modeBuf), "BACON");
             modeColor = COLOR_ACCENT;
+            break;
+        case PorkchopMode::SD_FORMAT:
+            snprintf(modeBuf, sizeof(modeBuf), "SD FORMAT");
+            modeColor = COLOR_WARNING;
             break;
     }
     
@@ -649,10 +559,10 @@ void Display::drawTopBar() {
     
     // Build final mode string with fixed buffer to prevent heap fragmentation
     char finalModeBuf[80];  // Ample size for mode + mood + PWNED + SSID
-    if (mode == PorkchopMode::OINK_MODE && lootSSID.length() > 0) {
+    if (mode == PorkchopMode::OINK_MODE && lootSSID[0] != '\0') {
         // Include PWNED banner - truncate SSID if needed to fit
         char upperLoot[20];  // Truncate SSID to 16 chars max for display
-        strncpy(upperLoot, lootSSID.c_str(), sizeof(upperLoot) - 1);
+        strncpy(upperLoot, lootSSID, sizeof(upperLoot) - 1);
         upperLoot[sizeof(upperLoot) - 1] = '\0';
         for (int i = 0; upperLoot[i]; i++) upperLoot[i] = toupper(upperLoot[i]);
         snprintf(finalModeBuf, sizeof(finalModeBuf), "%s %s PWNED %s", 
@@ -704,9 +614,9 @@ void Display::drawTopBar() {
 }
 
 void Display::drawTopBarMessageTwoLineDirect() {
-    if (topBarMessage.length() == 0) return;
+    if (topBarMessage[0] == '\0') return;
 
-    const char* msg = topBarMessage.c_str();
+    const char* msg = topBarMessage;
     const char* newline = strchr(msg, '\n');
     if (!newline) return;
 
@@ -770,7 +680,7 @@ void Display::drawBottomBar() {
     bottomBar.setTextDatum(top_left);
 
     // Check for overlay message, used during confirmation dialogs
-    if (bottomOverlay.length() > 0) {
+    if (bottomOverlay[0] != '\0') {
         bottomBar.setTextDatum(top_center);
         bottomBar.drawString(bottomOverlay, DISPLAY_W / 2, 3);
         return;
@@ -826,6 +736,8 @@ void Display::drawBottomBar() {
     } else if (mode == PorkchopMode::DIAGNOSTICS) {
         // DIAGNOSTICS: show controls
         statsStr = "[ENT]SAVE [R]WIFI [H]HEAP [G]GC";
+    } else if (mode == PorkchopMode::SD_FORMAT) {
+        statsStr = "ENTER=ARM  BKSP=EXIT";
     } else if (mode == PorkchopMode::OINK_MODE) {
         // OINK: show Networks, Handshakes, Deauths, Channel, and optionally BRO count
         // PWNED banner is shown in top bar
@@ -872,9 +784,9 @@ void Display::drawBottomBar() {
         strncpy(statsBuf, buf, sizeof(statsBuf) - 1);
         statsBuf[sizeof(statsBuf) - 1] = '\0';
         statsStr = statsBuf;
-    } else if (mode == PorkchopMode::MARCO_MODE) {
-        // MARCO: session time, SSID, channel (uptime shown on right separately)
-        uint32_t sessionTime = MarcoMode::getSessionTime();
+    } else if (mode == PorkchopMode::BACON_MODE) {
+        // BACON: session time, SSID, channel (uptime shown on right separately)
+        uint32_t sessionTime = BaconMode::getSessionTime();
         
         char buf[64];
         snprintf(buf, sizeof(buf), "%02lu:%02lu USSID FATHERSHIP CH:06",
@@ -952,6 +864,7 @@ void Display::drawBottomBar() {
                mode == PorkchopMode::WIGLE_MENU ||
                mode == PorkchopMode::UNLOCKABLES ||
                mode == PorkchopMode::BOUNTY_STATUS ||
+               mode == PorkchopMode::SD_FORMAT ||
                mode == PorkchopMode::OINK_MODE || 
                mode == PorkchopMode::DNH_MODE) {
         // No uptime on menu and submenu screens
@@ -1038,6 +951,7 @@ bool Display::showConfirmBox(const String& title, const String& message) {
             }
         }
         delay(20);  // TCA8418 I2C throttle
+        yield();  // Feed watchdog during blocking wait
     }
     return false;  // Timeout = No
 }
@@ -1070,8 +984,12 @@ void Display::showChallenges() {
     int lineH = 16;
     uint16_t totalXP = 0;
     
-    for (uint8_t i = 0; i < Challenges::getActiveCount(); i++) {
-        const ActiveChallenge& ch = Challenges::get(i);
+    uint8_t activeCount = Challenges::getActiveCount();
+    for (uint8_t i = 0; i < activeCount; i++) {
+        ActiveChallenge ch = {};
+        if (!Challenges::getSnapshot(i, ch)) {
+            continue;
+        }
         
         // Status checkbox
         const char* statusBox;
@@ -1153,10 +1071,12 @@ void Display::showChallenges() {
                 M5.update();
                 M5Cardputer.update();
                 delay(20);
+                yield();  // Feed watchdog
             }
             break;
         }
         delay(20);  // TCA8418 I2C throttle
+        yield();  // Feed watchdog during blocking wait
     }
 }
 
@@ -1173,6 +1093,10 @@ static void bootSplashDelay(uint32_t ms) {
 
 // Boot splash - 3 screens: OINK OINK, MY NAME IS, PORKCHOP
 void Display::showBootSplash() {
+    // Ensure splash uses 8-bit RGB332 to match sprite palette and avoid 16-bit conversion costs.
+    // Splash draws directly to the display (no sprite heap allocation), but color depth still matters.
+    M5.Display.setColorDepth(8);
+
     // Screen 1: OINK OINK
     M5.Display.fillScreen(COLOR_BG);
     M5.Display.setTextColor(COLOR_FG);
@@ -1202,8 +1126,12 @@ void Display::showBootSplash() {
     M5.Display.setTextSize(1);
     M5.Display.drawString("BASICALLY YOU, BUT AS AN ASCII PIG.", DISPLAY_W / 2, DISPLAY_H / 2 + 20);
     M5.Display.drawString("IDENTITY CRISIS EDITION.", DISPLAY_W / 2, DISPLAY_H / 2 + 35);
-    
+
     bootSplashDelay(1200);
+
+    // Reset display state for main UI compatibility
+    M5.Display.setTextDatum(top_left);
+    M5.Display.setTextSize(1);
 }
 
 
@@ -1227,14 +1155,19 @@ void Display::showProgress(const String& title, uint8_t percent) {
     
     // Percentage text
     mainCanvas.setTextSize(1);
-    mainCanvas.drawString(String(percent) + "%", DISPLAY_W / 2, barY + barH + 10);
+    char percentBuf[8];
+    snprintf(percentBuf, sizeof(percentBuf), "%u%%", percent);
+    mainCanvas.drawString(percentBuf, DISPLAY_W / 2, barY + barH + 10);
     
     pushAll();
 }
 
-void Display::showToast(const String& message) {
-    toastMessage = message;
+void Display::showToast(const String& message, uint32_t durationMs) {
+    if (message.length() == 0) return;
+    strncpy(toastMessage, message.c_str(), sizeof(toastMessage) - 1);
+    toastMessage[sizeof(toastMessage) - 1] = '\0';
     toastStartTime = millis();
+    toastDurationMs = (durationMs > 0) ? durationMs : 2000;
     toastActive = true;
 }
 
@@ -1255,7 +1188,7 @@ void Display::notify(NoticeKind kind, const String& message, uint32_t durationMs
     if (message.length() == 0) return;
     
     if (channel == NoticeChannel::TOAST) {
-        showToast(message);
+        showToast(message, durationMs);
         return;
     }
     if (channel == NoticeChannel::TOP_BAR) {
@@ -1280,13 +1213,29 @@ void Display::notify(NoticeKind kind, const String& message, uint32_t durationMs
 }
 
 void Display::setTopBarMessage(const String& message, uint32_t durationMs) {
-    topBarMessage = message;
+    if (message.length() == 0) {
+        clearTopBarMessage();
+        return;
+    }
+    strncpy(topBarMessage, message.c_str(), sizeof(topBarMessage) - 1);
+    topBarMessage[sizeof(topBarMessage) - 1] = '\0';
+    topBarMessageStart = millis();
+    topBarMessageDuration = durationMs;
+}
+
+void Display::setTopBarMessage(const char* message, uint32_t durationMs) {
+    if (!message) {
+        clearTopBarMessage();
+        return;
+    }
+    strncpy(topBarMessage, message, sizeof(topBarMessage) - 1);
+    topBarMessage[sizeof(topBarMessage) - 1] = '\0';
     topBarMessageStart = millis();
     topBarMessageDuration = durationMs;
 }
 
 void Display::clearTopBarMessage() {
-    topBarMessage = "";
+    topBarMessage[0] = '\0';
     topBarMessageDuration = 0;
 }
 
@@ -2403,11 +2352,16 @@ void Display::drawPigSyncDeviceSelect(M5Canvas& canvas) {
 }
 
 void Display::setBottomOverlay(const String& message) {
-    bottomOverlay = message;
+    if (message.length() == 0) {
+        bottomOverlay[0] = '\0';
+        return;
+    }
+    strncpy(bottomOverlay, message.c_str(), sizeof(bottomOverlay) - 1);
+    bottomOverlay[sizeof(bottomOverlay) - 1] = '\0';
 }
 
 void Display::clearBottomOverlay() {
-    bottomOverlay = "";
+    bottomOverlay[0] = '\0';
 }
 
 void Display::setGPSStatus(bool hasFix) {
@@ -2437,12 +2391,20 @@ void Display::drawModeInfo(M5Canvas& canvas, PorkchopMode mode) {
         // Show current target being attacked
         if (target) {
             canvas.setTextColor(COLOR_SUCCESS);
-            String ssid = String(target->ssid);
-            if (ssid.length() == 0) ssid = "<HIDDEN>";
-            ssid.toUpperCase();
+            char ssidBuf[17];
+            if (target->ssid[0] == '\0') {
+                strncpy(ssidBuf, "<HIDDEN>", sizeof(ssidBuf) - 1);
+                ssidBuf[sizeof(ssidBuf) - 1] = '\0';
+            } else {
+                strncpy(ssidBuf, target->ssid, sizeof(ssidBuf) - 1);
+                ssidBuf[sizeof(ssidBuf) - 1] = '\0';
+                for (size_t i = 0; ssidBuf[i]; ++i) {
+                    if (ssidBuf[i] >= 'a' && ssidBuf[i] <= 'z') ssidBuf[i] = static_cast<char>(ssidBuf[i] - ('a' - 'A'));
+                }
+            }
             canvas.drawString("ATTACKING:", 2, 2);
             canvas.setTextColor(COLOR_ACCENT);
-            canvas.drawString(ssid.substring(0, 16), 2, 14);
+            canvas.drawString(ssidBuf, 2, 14);
             
             char info[32];
             snprintf(info, sizeof(info), "CH:%02d %ddB", target->channel, target->rssi);
@@ -2568,9 +2530,13 @@ void Display::drawAboutScreen(M5Canvas& canvas) {
     // Commit hash, uppercase the value
     canvas.setTextColor(COLOR_ACCENT);
     char commitBuf[32];
-    String commitStr = BUILD_COMMIT;
-    commitStr.toUpperCase();
-    snprintf(commitBuf, sizeof(commitBuf), "COMMIT: %s", commitStr.c_str());
+    char commitStr[16];
+    strncpy(commitStr, BUILD_COMMIT, sizeof(commitStr) - 1);
+    commitStr[sizeof(commitStr) - 1] = '\0';
+    for (size_t i = 0; commitStr[i]; ++i) {
+        if (commitStr[i] >= 'a' && commitStr[i] <= 'z') commitStr[i] = static_cast<char>(commitStr[i] - ('a' - 'A'));
+    }
+    snprintf(commitBuf, sizeof(commitBuf), "COMMIT: %s", commitStr);
     canvas.drawString(commitBuf, DISPLAY_W / 2, 64);
     
     // Random quote
@@ -2595,45 +2561,64 @@ void Display::drawFileTransferScreen(M5Canvas& canvas) {
     canvas.setTextSize(1);
     canvas.setTextColor(COLOR_FG);
 
-    String line1;
-    String line2;
-    String line3;
+    char line1[64] = {0};
+    char line2[64] = {0};
+    char line3[64] = {0};
+    bool hasLine2 = false;
+    bool hasLine3 = false;
 
     if (FileServer::isConnecting()) {
-        line1 = "STATE: CONNECTING";
-        line2 = "SSID: " + Config::wifi().otaSSID;
-        line3 = FileServer::getStatus();
+        strncpy(line1, "STATE: CONNECTING", sizeof(line1) - 1);
+        snprintf(line2, sizeof(line2), "SSID: %s", Config::wifi().otaSSID);
+        snprintf(line3, sizeof(line3), "%s", FileServer::getStatus());
+        hasLine2 = true;
+        hasLine3 = true;
     } else if (FileServer::isRunning() && FileServer::isConnected()) {
-        line1 = "STATE: CONNECTED";
-        String ip = FileServer::getIP();
-        ip.toUpperCase();
-        line2 = "HTTP://" + ip;
-        line3 = "HTTP://PORKCHOP.LOCAL";
+        strncpy(line1, "STATE: CONNECTED", sizeof(line1) - 1);
+        char ipBuf[32];
+        IPAddress ip = WiFi.localIP();
+        snprintf(ipBuf, sizeof(ipBuf), "%u.%u.%u.%u",
+                 ip[0], ip[1], ip[2], ip[3]);
+        snprintf(line2, sizeof(line2), "HTTP://%s", ipBuf);
+        strncpy(line3, "HTTP://PORKCHOP.LOCAL", sizeof(line3) - 1);
+        hasLine2 = true;
+        hasLine3 = true;
     } else if (FileServer::isRunning()) {
-        line1 = "STATE: LINK DEAD";
-        line2 = "RETRY HACK";
-        line3 = FileServer::getStatus();
+        strncpy(line1, "STATE: LINK DEAD", sizeof(line1) - 1);
+        strncpy(line2, "RETRY HACK", sizeof(line2) - 1);
+        snprintf(line3, sizeof(line3), "%s", FileServer::getStatus());
+        hasLine2 = true;
+        hasLine3 = true;
     } else {
-        String ssid = Config::wifi().otaSSID;
-        if (ssid.length() > 0) {
-            line1 = "STATE: FAILED";
-            line2 = "SSID: " + ssid;
-            line3 = FileServer::getStatus();
+        if (Config::wifi().otaSSID[0] != '\0') {
+            strncpy(line1, "STATE: FAILED", sizeof(line1) - 1);
+            snprintf(line2, sizeof(line2), "SSID: %s", Config::wifi().otaSSID);
+            snprintf(line3, sizeof(line3), "%s", FileServer::getStatus());
+            hasLine2 = true;
+            hasLine3 = true;
         } else {
-            line1 = "STATE: NO CREDS";
-            line2 = "SET SSID IN SETTINGS";
+            strncpy(line1, "STATE: NO CREDS", sizeof(line1) - 1);
+            strncpy(line2, "SET SSID IN SETTINGS", sizeof(line2) - 1);
+            hasLine2 = true;
         }
     }
 
-    line1.toUpperCase();
-    line2.toUpperCase();
-    line3.toUpperCase();
+    auto toUpperInPlace = [](char* s) {
+        if (!s) return;
+        for (size_t i = 0; s[i]; ++i) {
+            if (s[i] >= 'a' && s[i] <= 'z') s[i] = static_cast<char>(s[i] - ('a' - 'A'));
+        }
+    };
+
+    toUpperInPlace(line1);
+    toUpperInPlace(line2);
+    toUpperInPlace(line3);
 
     canvas.drawString(line1, DISPLAY_W / 2, 28);
-    if (line2.length() > 0) {
+    if (hasLine2 && line2[0] != '\0') {
         canvas.drawString(line2, DISPLAY_W / 2, 40);
     }
-    if (line3.length() > 0) {
+    if (hasLine3 && line3[0] != '\0') {
         canvas.drawString(line3, DISPLAY_W / 2, 52);
     }
 
@@ -2749,7 +2734,8 @@ static const int SCREENSHOT_RETRY_DELAY_MS = 10;
 static uint16_t getNextScreenshotNumber() {
     uint16_t maxNum = 0;
     
-    File dir = SD.open("/screenshots");
+    const char* shotsDir = SDLayout::screenshotsDir();
+    File dir = SD.open(shotsDir);
     if (!dir || !dir.isDirectory()) {
         return 1;
     }
@@ -2777,21 +2763,22 @@ bool Display::takeScreenshot() {
     
     // Check SD availability
     if (!Config::isSDAvailable()) {
-        showToast("NO SD CARD!");
+        showToast("NO SD CARD");
         return false;
     }
     
     snapping = true;
     
     // Ensure screenshots directory exists
-    if (!SD.exists("/screenshots")) {
-        SD.mkdir("/screenshots");
+    const char* shotsDir = SDLayout::screenshotsDir();
+    if (!SD.exists(shotsDir)) {
+        SD.mkdir(shotsDir);
     }
     
     // Find next available number
     uint16_t num = getNextScreenshotNumber();
     char path[48];
-    snprintf(path, sizeof(path), "/screenshots/screenshot%03d.bmp", num);
+    snprintf(path, sizeof(path), "%s/screenshot%03d.bmp", shotsDir, num);
     
     Serial.printf("[DISPLAY] Taking screenshot: %s\n", path);
     
@@ -2805,7 +2792,7 @@ bool Display::takeScreenshot() {
     
     if (!file) {
         Serial.println("[DISPLAY] Failed to open screenshot file");
-        showToast("SD WRITE FAILED!");
+        showToast("SD WRITE FAILED");
         snapping = false;
         return false;
     }
@@ -2885,14 +2872,18 @@ bool Display::takeScreenshot() {
 void Display::setUploadProgress(bool inProgress, uint8_t progress, const char* status) {
     uploadInProgress = inProgress;
     uploadProgress = progress;
-    uploadStatus = status ? status : "";
+    if (status) {
+        strncpy(uploadStatus, status, sizeof(uploadStatus) - 1);
+        uploadStatus[sizeof(uploadStatus) - 1] = '\0';
+    } else {
+        uploadStatus[0] = '\0';
+    }
     uploadStartTime = millis();
 }
 
 bool Display::shouldShowUploadProgress() {
-    // Show upload progress while upload is in progress AND sprites are NOT suspended
-    // This ensures it only shows when the topBar canvas exists
-    return uploadInProgress && !spritesSuspended && (millis() - uploadStartTime) < 60000;  // 60 seconds
+    // Show upload progress while upload is in progress
+    return uploadInProgress && (millis() - uploadStartTime) < 60000;  // 60 seconds
 }
 
 void Display::drawUploadProgress(M5Canvas& topBar) {
@@ -2954,50 +2945,5 @@ void Display::drawUploadProgressDirect() {
 void Display::clearUploadProgress() {
     uploadInProgress = false;
     uploadProgress = 0;
-    uploadStatus = "";
-}
-
-void Display::setSpriteResumeFailure() {
-    spriteResumeFailed = true;
-    spriteResumeFailTime = millis();
-
-    // If sprites are suspended, draw error message directly to physical display
-    if (spritesSuspended) {
-        // Draw error message directly to physical display
-        M5Cardputer.Display.fillRect(0, 0, DISPLAY_W, TOP_BAR_H, getColorFG());  // Background
-        M5Cardputer.Display.setTextColor(getColorBG(), getColorFG());  // Inverted colors
-        M5Cardputer.Display.setTextSize(1);
-        M5Cardputer.Display.setCursor(2, 3);
-        // Shorten to fit top bar
-        M5Cardputer.Display.print("HEAP WHACKED - REBOOT");
-    }
-
-    // Also set a persistent top-bar message so user sees it when sprites resume later
-    setTopBarMessage("HEAP WHACKED - REBOOT", 0);
-}
-
-bool Display::shouldShowSpriteResumeError() {
-    // Show sprite resume error for 10 seconds after failure
-    return spriteResumeFailed && (millis() - spriteResumeFailTime) < SPRITE_RESUME_FAIL_DISPLAY_MS;
-}
-
-void Display::drawSpriteResumeError(M5Canvas& topBar) {
-    // Draw error message in top bar with inverted colors (like XP notification)
-    topBar.fillSprite(COLOR_FG);  // Use FG color as background (inverted)
-    topBar.setTextColor(COLOR_BG);  // Use BG color as text
-    topBar.setTextSize(1);
-    topBar.setTextDatum(top_left);
-
-    // Draw error message
-    topBar.drawString("HEAP WHACKED - REBOOT", 2, 3);
-}
-
-void Display::showMinimalProgressDuringSuspend(const char* message, uint8_t percent) {
-    if (!spritesSuspended) return;
-
-    // Update upload progress tracking
-    setUploadProgress(true, percent, message);
-
-    // Draw progress directly to physical display when sprites are suspended
-    drawUploadProgressDirect();
+    uploadStatus[0] = '\0';
 }

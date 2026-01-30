@@ -1,6 +1,6 @@
-// Porkchop - ML-Enhanced Piglet Security Companion
+// m5porkchop
 // Main entry point
-// Author: 0ct0
+// by 0ct0
 
 #include <M5Cardputer.h>
 #include <M5Unified.h>
@@ -8,9 +8,14 @@
 #include <WiFi.h>              // <-- PATCH: init WiFi early (before heap fragmentation)
 #include <esp_core_dump.h>
 #include <esp_partition.h>
+#include <esp_heap_caps.h>     // For heap conditioning
+#include <string.h>            // For memset
 #include "core/porkchop.h"
 #include "core/config.h"
+#include "core/sd_layout.h"
 #include "core/sdlog.h"
+#include "core/wifi_utils.h"
+#include "core/network_recon.h"
 #include "ui/display.h"
 #include "gps/gps.h"
 #include "piglet/avatar.h"
@@ -77,14 +82,15 @@ static void exportCoreDumpToSD() {
         return;
     }
 
-    if (!SD.exists("/crash")) {
-        SD.mkdir("/crash");
+    const char* crashDir = SDLayout::crashDir();
+    if (!SD.exists(crashDir)) {
+        SD.mkdir(crashDir);
     }
 
     uint32_t stamp = millis();
     char dumpPath[64];
-    snprintf(dumpPath, sizeof(dumpPath), "/crash/coredump_%lu.elf",
-             static_cast<unsigned long>(stamp));
+    snprintf(dumpPath, sizeof(dumpPath), "%s/coredump_%lu.elf",
+             crashDir, static_cast<unsigned long>(stamp));
 
     File out = SD.open(dumpPath, FILE_WRITE);
     if (!out) {
@@ -96,6 +102,7 @@ static void exportCoreDumpToSD() {
     uint8_t buf[kChunkSize];
     size_t remaining = size;
     size_t offset = 0;
+    uint8_t yieldCounter = 0;
 
     while (remaining > 0) {
         size_t toRead = remaining > kChunkSize ? kChunkSize : remaining;
@@ -106,6 +113,12 @@ static void exportCoreDumpToSD() {
         out.write(buf, toRead);
         remaining -= toRead;
         offset += toRead;
+        
+        // Yield every 8 chunks (4KB) to prevent WDT timeout
+        if (++yieldCounter >= 8) {
+            yieldCounter = 0;
+            yield();
+        }
     }
     out.close();
 
@@ -116,8 +129,8 @@ static void exportCoreDumpToSD() {
         esp_core_dump_summary_t summary;
         if (esp_core_dump_get_summary(&summary) == ESP_OK) {
             char sumPath[64];
-            snprintf(sumPath, sizeof(sumPath), "/crash/coredump_%lu.txt",
-                     static_cast<unsigned long>(stamp));
+                snprintf(sumPath, sizeof(sumPath), "%s/coredump_%lu.txt",
+                     crashDir, static_cast<unsigned long>(stamp));
             File sum = SD.open(sumPath, FILE_WRITE);
             if (sum) {
                 sum.printf("task=%s\n", summary.exc_task);
@@ -140,6 +153,121 @@ static void exportCoreDumpToSD() {
     } else {
         Serial.println("[COREDUMP] Export incomplete, keeping core dump in flash");
     }
+}
+
+// Perform gentle heap conditioning to create larger contiguous blocks for TLS
+// This addresses the issue where TLS operations fail due to fragmented heap after boot
+void performBootHeapConditioning() {
+    Serial.println("[BOOT] Performing aggressive heap conditioning...");
+
+    // Log initial heap state
+    size_t initialLargest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    size_t initialFree = ESP.getFreeHeap();
+    Serial.printf("[BOOT] Initial heap: free=%u largest=%u\n", initialFree, initialLargest);
+
+    // Phase 1: Create fragmentation pattern (mimics Oink mode startup)
+    const size_t FRAG_BLOCKS = 50;
+    const size_t FRAG_SIZE = 1024; // 1KB blocks
+    void* fragBlocks[FRAG_BLOCKS] = {nullptr};
+    size_t fragAllocated = 0;
+
+    Serial.println("[BOOT] Phase 1: Creating fragmentation...");
+    for (int i = 0; i < FRAG_BLOCKS; i++) {
+        fragBlocks[i] = malloc(FRAG_SIZE);
+        if (fragBlocks[i]) {
+            memset(fragBlocks[i], 0xAA, FRAG_SIZE);
+            fragAllocated++;
+        }
+        if (i % 10 == 0) delay(2); // Periodic yield
+    }
+    Serial.printf("[BOOT] Fragmentation: %u/%u blocks (%uKB)\n", fragAllocated, FRAG_BLOCKS, (fragAllocated * FRAG_SIZE) / 1024);
+
+    // Phase 2: Add larger blocks (like network structures in Oink)
+    const size_t STRUCT_BLOCKS = 20;
+    const size_t STRUCT_SIZE = 3072; // ~3KB (like DetectedNetwork + clients)
+    void* structBlocks[STRUCT_BLOCKS] = {nullptr};
+    size_t structAllocated = 0;
+
+    Serial.println("[BOOT] Phase 2: Adding structure blocks...");
+    for (int i = 0; i < STRUCT_BLOCKS; i++) {
+        structBlocks[i] = malloc(STRUCT_SIZE);
+        if (structBlocks[i]) {
+            memset(structBlocks[i], 0xBB, STRUCT_SIZE);
+            structAllocated++;
+        }
+        delay(1);
+    }
+    Serial.printf("[BOOT] Structures: %u/%u blocks (%uKB)\n", structAllocated, STRUCT_BLOCKS, (structAllocated * STRUCT_SIZE) / 1024);
+
+    // Phase 3: Free in consolidation-friendly pattern
+    Serial.println("[BOOT] Phase 3: Consolidating memory...");
+
+    // Free structure blocks first (creates large holes)
+    for (int i = 0; i < STRUCT_BLOCKS; i++) {
+        if (structBlocks[i]) {
+            free(structBlocks[i]);
+            structBlocks[i] = nullptr;
+        }
+    }
+
+    // Free fragmentation blocks in mixed order
+    for (int i = FRAG_BLOCKS - 1; i >= 0; i -= 2) { // Free every other block backwards
+        if (fragBlocks[i]) {
+            free(fragBlocks[i]);
+            fragBlocks[i] = nullptr;
+        }
+        delay(1);
+    }
+
+    // Free remaining fragmentation blocks
+    for (int i = 0; i < FRAG_BLOCKS; i++) {
+        if (fragBlocks[i]) {
+            free(fragBlocks[i]);
+            fragBlocks[i] = nullptr;
+        }
+    }
+
+    // Phase 4: Test TLS-sized allocations
+    Serial.println("[BOOT] Phase 4: Testing TLS compatibility...");
+    const size_t TLS_SIZES[] = {26624, 32768, 40960}; // 26KB, 32KB, 40KB
+    const char* TLS_NAMES[] = {"26KB", "32KB", "40KB"};
+
+    for (int i = 0; i < 3; i++) {
+        void* tlsTest = malloc(TLS_SIZES[i]);
+        if (tlsTest) {
+            memset(tlsTest, 0xCC, TLS_SIZES[i]);
+            Serial.printf("[BOOT] ✓ %s allocation successful\n", TLS_NAMES[i]);
+            free(tlsTest);
+        } else {
+            Serial.printf("[BOOT] ❌ %s allocation failed\n", TLS_NAMES[i]);
+        }
+        delay(1);
+    }
+
+    // Phase 5: Final consolidation with longer delay
+    Serial.println("[BOOT] Phase 5: Final consolidation...");
+    delay(200);
+    yield();
+
+    // Log final heap state
+    size_t finalLargest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    size_t finalFree = ESP.getFreeHeap();
+    float improvement = finalLargest > initialLargest ? (float)finalLargest / initialLargest : 1.0f;
+
+    Serial.printf("[BOOT] Final heap: free=%u largest=%u (%.2fx improvement)\n",
+                  finalFree, finalLargest, improvement);
+
+    // Check TLS compatibility
+    if (finalLargest >= 26624) { // 26KB
+        Serial.println("[BOOT] ✓ Heap conditioning successful - TLS operations should work");
+    } else if (improvement > 1.0f) {
+        Serial.printf("[BOOT] ⚠ Partial improvement - largest block=%u (need 26624 for TLS)\n", finalLargest);
+    } else {
+        Serial.printf("[BOOT] ❌ No improvement - largest block=%u (need 26624 for TLS)\n", finalLargest);
+    }
+
+    Serial.printf("[BOOT] Total conditioned: ~%u KB\n",
+                  (fragAllocated * FRAG_SIZE + structAllocated * STRUCT_SIZE) / 1024);
 }
 
 void setup() {
@@ -169,6 +297,12 @@ void setup() {
     // Export any stored core dump to SD (if present)
     exportCoreDumpToSD();
 
+    // Perform heap conditioning to consolidate memory (like Oink mode does)
+    // This creates larger contiguous blocks needed for TLS operations
+    performBootHeapConditioning();
+
+    // TLS reserve disabled: browser handles TLS, keep heap for UI/file transfer.
+
     // Init display system
     Display::init();
 
@@ -194,6 +328,11 @@ void setup() {
                 Serial.println("[GPS] WARNING: Cap LoRa868 GPS selected but hardware is not Cardputer ADV!");
                 Serial.println("[GPS] Cap LoRa868 requires Cardputer ADV EXT bus. Check config.");
             }
+            // FIX: Deselect Cap LoRa868 SPI CS to prevent SD card bus conflicts
+            // GPIO 5 is the LoRa chip select - must be HIGH to avoid SPI contention
+            pinMode(5, OUTPUT);
+            digitalWrite(5, HIGH);
+            Serial.println("[GPS] Cap LoRa868 SPI CS (GPIO5) deasserted");
         }
         GPS::init(Config::gps().rxPin, Config::gps().txPin, Config::gps().baudRate);
     }
@@ -209,10 +348,33 @@ void setup() {
 
     Serial.println("=== PORKCHOP READY ===");
     Serial.printf("Piglet: %s\n", Config::personality().name);
+    
+    // #region agent log
+    // [DEBUG] H1: Log heap after init to check static pool impact (~13KB expected reduction)
+    Serial.printf("[DBG-HEAP] After init: free=%u largest=%u\n", 
+                  (unsigned)ESP.getFreeHeap(), 
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    // #endregion
+    
+    // Start background network reconnaissance service
+    // This stabilizes heap by running WiFi promiscuous mode early
+    // and provides shared network data for OINK/DONOHAM/SPECTRUM modes
+    NetworkRecon::start();
 }
 
 void loop() {
     M5Cardputer.update();
+    
+    // #region agent log
+    // [DEBUG] H1/H3: Periodic heap monitoring (every 5 seconds)
+    static uint32_t lastHeapLog = 0;
+    if (millis() - lastHeapLog > 5000) {
+        lastHeapLog = millis();
+        Serial.printf("[DBG-HEAP-LOOP] free=%u largest=%u\n",
+                      (unsigned)ESP.getFreeHeap(),
+                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    }
+    // #endregion
 
     // Update GPS
     if (Config::gps().enabled) {

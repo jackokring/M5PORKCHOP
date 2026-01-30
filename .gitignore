@@ -1,12 +1,15 @@
-.pio
+﻿.pio
 .vscode/
+.cache
+.z*
+.con*/
+.cu*
 *.csv
-src/build_info.h
-m5porkchop_builds/
-porkchop_*.bins
-secret/
-release_notes/
-# like the build pipeline will change lol
-temp/
+*.md
+*.txt
+*.bin
+**/build_info.h
+*_builds/
 docs/
-m5sirloin/
+compile_commands.json
+scripts/heap_analyzer.py
