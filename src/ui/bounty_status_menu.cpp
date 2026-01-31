@@ -16,6 +16,19 @@ bool BountyStatusMenu::keyWasPressed = false;
 
 // Cached bounty list (refreshed each draw cycle to avoid 5x redundant calls)
 static std::vector<uint64_t> cachedBounties;
+static const uint32_t BOUNTY_CACHE_REFRESH_MS = 1000;
+static uint32_t lastCacheRefreshMs = 0;
+static bool cacheDirty = true;
+
+static void refreshBountyCache(bool force) {
+    uint32_t now = millis();
+    if (!force && !cacheDirty && (now - lastCacheRefreshMs) < BOUNTY_CACHE_REFRESH_MS) {
+        return;
+    }
+    cachedBounties = WarhogMode::getUnclaimedBSSIDs();
+    lastCacheRefreshMs = now;
+    cacheDirty = false;
+}
 
 // Format uint64_t BSSID to string
 static void formatBSSID(uint64_t bssid, char* out, size_t len) {
@@ -39,16 +52,22 @@ void BountyStatusMenu::show() {
     selectedIndex = 0;
     scrollOffset = 0;
     keyWasPressed = true;  // Ignore the Enter that opened us
+    cacheDirty = true;
+    lastCacheRefreshMs = 0;
+    refreshBountyCache(true);
 }
 
 void BountyStatusMenu::hide() {
     active = false;
     cachedBounties.clear();
     cachedBounties.shrink_to_fit();  // FIX: Return capacity to heap, avoid fragmentation
+    cacheDirty = true;
+    lastCacheRefreshMs = 0;
 }
 
 void BountyStatusMenu::getSelectedInfo(char* out, size_t len) {
     if (!out || len == 0) return;
+    refreshBountyCache(false);
     size_t readyCount = cachedBounties.size();
     
     // Get sync stats for bottom bar
@@ -109,8 +128,8 @@ void BountyStatusMenu::draw(M5Canvas& canvas) {
     canvas.setTextColor(COLOR_FG);
     canvas.setTextSize(1);
     
-    // Refresh cache once per frame (avoids redundant getUnclaimedBSSIDs calls)
-    cachedBounties = WarhogMode::getUnclaimedBSSIDs();
+    // Refresh cache on a timer to avoid per-frame allocations
+    refreshBountyCache(false);
     
     if (cachedBounties.empty()) {
         drawEmpty(canvas);

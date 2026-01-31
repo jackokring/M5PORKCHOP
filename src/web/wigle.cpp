@@ -22,6 +22,8 @@ volatile bool WiGLE::busy = false;
 char WiGLE::lastError[64] = "";
 bool WiGLE::batchMode = false;
 
+static const size_t WIGLE_MAX_UPLOADED = 200;
+
 // RAII helper for busy flag
 struct BusyScope {
     volatile bool& flag;
@@ -45,7 +47,7 @@ bool WiGLE::loadUploadedList() {
     if (listLoaded) return true;
 
     uploadedFiles.clear();
-    uploadedFiles.reserve(200);
+    uploadedFiles.reserve(WIGLE_MAX_UPLOADED);
 
     const char* uploadedPath = SDLayout::wigleUploadedPath();
     if (!SD.exists(uploadedPath)) {
@@ -56,7 +58,7 @@ bool WiGLE::loadUploadedList() {
     File f = SD.open(uploadedPath, FILE_READ);
     if (!f) return false;
 
-    while (f.available() && uploadedFiles.size() < 200) {
+    while (f.available() && uploadedFiles.size() < WIGLE_MAX_UPLOADED) {
         String line = f.readStringUntil('\n');
         line.trim();
         if (!line.isEmpty() && line.length() < 100) {
@@ -124,6 +126,10 @@ void WiGLE::markAsUploaded(const char* filename) {
         if (f.equals(baseName)) return;
     }
     
+    if (uploadedFiles.size() >= WIGLE_MAX_UPLOADED) {
+        // Cap in-memory list to avoid unbounded heap growth.
+        return;
+    }
     uploadedFiles.push_back(baseName);
     if (!batchMode) {
         saveUploadedList();  // Only save immediately if not in batch mode
@@ -748,7 +754,9 @@ WigleSyncResult WiGLE::syncFiles(WigleProgressCallback cb) {
                     if (f.equals(baseName)) { found = true; break; }
                 }
                 if (!found) {
-                    uploadedFiles.push_back(baseName);
+                    if (uploadedFiles.size() < WIGLE_MAX_UPLOADED) {
+                        uploadedFiles.push_back(baseName);
+                    }
                 }
             }
         }
