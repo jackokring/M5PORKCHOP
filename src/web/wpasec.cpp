@@ -18,6 +18,7 @@ static const char* WPASEC_HOST = "wpa-sec.stanev.org";
 static const uint16_t WPASEC_PORT = 443;
 static const char* WPASEC_UPLOAD_PATH = "/";
 static const char* WPASEC_POTFILE_PATH = "/?api&dl=1";
+static const size_t WPASEC_MAX_CACHE_ENTRIES = 500;
 
 // Static member initialization
 bool WPASec::cacheLoaded = false;
@@ -74,7 +75,7 @@ bool WPASec::loadUploadedList() {
 
     String line;
     line.reserve(64);  // Pre-allocate to reduce heap fragmentation
-    while (f.available() && uploadedCache.size() < 500) {
+    while (f.available() && uploadedCache.size() < WPASEC_MAX_CACHE_ENTRIES) {
         line = f.readStringUntil('\n');  // Reuses existing capacity
         line.trim();
         if (!line.isEmpty()) {
@@ -109,7 +110,7 @@ bool WPASec::loadCache() {
         // Cap at 500 entries to prevent memory exhaustion
         String line;
         line.reserve(128);  // Pre-allocate to reduce heap fragmentation
-        while (f.available() && crackedCache.size() < 500) {
+        while (f.available() && crackedCache.size() < WPASEC_MAX_CACHE_ENTRIES) {
             line = f.readStringUntil('\n');  // Reuses existing capacity
             line.trim();
             if (line.isEmpty()) continue;
@@ -224,6 +225,11 @@ void WPASec::markAsUploaded(const char* bssid) {
     loadCache();
     String key = normalizeBSSID(bssid);
     if (!key.isEmpty()) {
+        if (uploadedCache.find(key) == uploadedCache.end() &&
+            uploadedCache.size() >= WPASEC_MAX_CACHE_ENTRIES) {
+            // Cap in-memory cache to avoid unbounded heap growth.
+            return;
+        }
         uploadedCache[key] = true;
         if (!batchMode) {
             saveUploadedList();  // Only save immediately if not in batch mode

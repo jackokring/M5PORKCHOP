@@ -56,6 +56,9 @@ public:
 
     // Internal helpers
     static void clearBeaconFeatures();
+    static void resetBeaconQueue();
+    static bool enqueueBeaconFeature(uint64_t key, const WiFiFeatures& features);
+    static void processBeaconQueue();
     
 private:
     static bool running;
@@ -80,6 +83,15 @@ private:
     static std::map<uint64_t, WiFiFeatures> beaconFeatures;
     static std::atomic<uint32_t> beaconCount;  // Atomic for thread-safe access from callback + main
     static volatile bool beaconMapBusy;
+    static constexpr uint16_t kBeaconQueueSize = 64;
+    struct PendingBeaconFeature {
+        uint64_t key;
+        WiFiFeatures features;
+    };
+    static PendingBeaconFeature beaconQueue[kBeaconQueueSize];
+    static std::atomic<uint16_t> beaconQueueHead;
+    static std::atomic<uint16_t> beaconQueueTail;
+    static std::atomic<uint32_t> beaconQueueDropped;
     // Background scan task
     static TaskHandle_t scanTaskHandle;
     static volatile int scanResult;

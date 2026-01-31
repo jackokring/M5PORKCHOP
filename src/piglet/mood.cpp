@@ -9,6 +9,8 @@
 #include "../modes/oink.h"
 #include "../audio/sfx.h"
 #include <Preferences.h>
+#include <ctype.h>
+#include <string.h>
 
 extern Porkchop porkchop;
 
@@ -51,10 +53,103 @@ static bool isBoredState = false;
 // Dialogue lock - prevents automatic phrase selection during BLE sync dialogue
 static bool dialogueLocked = false;
 
+static char bubblePhraseRaw[128] = "";
+static char bubblePhraseUpper[128] = "";
+static char bubbleLines[5][33] = {};
+static uint8_t bubbleLineCount = 1;
+static uint8_t bubbleLongestLine = 1;
+
 // Force trigger a mood peek (for significant events like handshake capture)
 static void forceMoodPeek() {
     moodPeekActive = true;
     moodPeekStartTime = millis();
+}
+
+static void rebuildBubbleCache(const char* phrase) {
+    if (!phrase) phrase = "";
+
+    size_t len = 0;
+    while (phrase[len] && len < sizeof(bubblePhraseRaw) - 1) {
+        bubblePhraseRaw[len] = phrase[len];
+        bubblePhraseUpper[len] = (char)toupper((unsigned char)phrase[len]);
+        len++;
+    }
+    bubblePhraseRaw[len] = '\0';
+    bubblePhraseUpper[len] = '\0';
+
+    const int maxCharsPerLine = 16;
+    bubbleLineCount = 0;
+    bubbleLongestLine = 1;
+
+    size_t i = 0;
+    while (i < len && bubbleLineCount < 5) {
+        while (i < len && bubblePhraseUpper[i] == ' ') {
+            i++;
+        }
+        if (i >= len) break;
+
+        size_t lineStart = i;
+        size_t lineEnd = len;
+        size_t remaining = len - i;
+
+        if (remaining > (size_t)maxCharsPerLine) {
+            bool hasLastSpace = false;
+            size_t lastSpace = 0;
+            size_t limit = i + (size_t)maxCharsPerLine;
+            for (size_t j = i; j < limit && j < len; j++) {
+                if (bubblePhraseUpper[j] == ' ') {
+                    hasLastSpace = true;
+                    lastSpace = j;
+                }
+            }
+
+            if (hasLastSpace && lastSpace > i) {
+                lineEnd = lastSpace;
+            } else {
+                bool hasNextSpace = false;
+                size_t nextSpace = 0;
+                for (size_t j = limit; j < len; j++) {
+                    if (bubblePhraseUpper[j] == ' ') {
+                        hasNextSpace = true;
+                        nextSpace = j;
+                        break;
+                    }
+                }
+                if (hasNextSpace && nextSpace > i) {
+                    lineEnd = nextSpace;
+                } else {
+                    lineEnd = limit;
+                }
+            }
+        }
+
+        size_t lineLen = (lineEnd > lineStart) ? (lineEnd - lineStart) : 0;
+        if (lineLen == 0) break;
+        if (lineLen > 32) lineLen = 32;
+
+        memcpy(bubbleLines[bubbleLineCount], bubblePhraseUpper + lineStart, lineLen);
+        bubbleLines[bubbleLineCount][lineLen] = '\0';
+
+        if (lineLen > bubbleLongestLine) {
+            bubbleLongestLine = (uint8_t)lineLen;
+        }
+
+        bubbleLineCount++;
+        i = (lineEnd < len && bubblePhraseUpper[lineEnd] == ' ') ? (lineEnd + 1) : lineEnd;
+    }
+
+    if (bubbleLineCount == 0) {
+        bubbleLines[0][0] = '\0';
+        bubbleLineCount = 1;
+        bubbleLongestLine = 1;
+    }
+}
+
+static void ensureBubbleCache() {
+    const char* current = Mood::getCurrentPhrase().c_str();
+    if (strcmp(bubblePhraseRaw, current) != 0) {
+        rebuildBubbleCache(current);
+    }
 }
 
 // --- Mood Momentum Implementation ---
@@ -1535,42 +1630,9 @@ void Mood::draw(M5Canvas& canvas) {
     
     // Calculate bubble size based on ACTUAL word-wrapped content
     // Dynamic width: fits content tightly, min 50px, max 116px
-    String phrase = currentPhrase;
-    phrase.toUpperCase();  // UPPERCASE for visibility
-    int maxCharsPerLine = 16;  // Max chars before wrap
-    
-    // First pass: simulate word wrap, count lines AND track longest line
-    int numLines = 0;
-    int longestLineChars = 0;
-    String simRemaining = phrase;
-    
-    while (simRemaining.length() > 0 && numLines < 5) {
-        int lineLen;
-        if ((int)simRemaining.length() <= maxCharsPerLine) {
-            // Last line - use remaining length
-            lineLen = simRemaining.length();
-            simRemaining = "";
-        } else {
-            // Find word break point
-            int splitPos = simRemaining.lastIndexOf(' ', maxCharsPerLine);
-            if (splitPos < 1) {
-                splitPos = simRemaining.indexOf(' ', maxCharsPerLine);
-                if (splitPos < 0) {
-                    splitPos = maxCharsPerLine;
-                }
-            }
-            lineLen = splitPos;
-            simRemaining = (splitPos < (int)simRemaining.length()) ? simRemaining.substring(splitPos + 1) : "";
-        }
-        
-        // Track longest line for dynamic width
-        if (lineLen > longestLineChars) {
-            longestLineChars = lineLen;
-        }
-        numLines++;
-    }
-    if (numLines == 0) numLines = 1;
-    if (longestLineChars == 0) longestLineChars = 1;
+    ensureBubbleCache();
+    int numLines = bubbleLineCount;
+    int longestLineChars = bubbleLongestLine;
     
     // === DYNAMIC BUBBLE WIDTH ===
     // Width based on longest line: chars * 6px + padding (10px)
@@ -1690,23 +1752,10 @@ void Mood::draw(M5Canvas& canvas) {
     int textX = bubbleX + 5;
     int textY = bubbleY + 4;
     
-    // Second pass: actually render the text with word wrapping
-    String remaining = phrase;
+    // Second pass: render cached lines (uppercase)
     int lineNum = 0;
-    while (remaining.length() > 0 && lineNum < 5) {
-        String line;
-        if ((int)remaining.length() <= maxCharsPerLine) {
-            line = remaining;
-            remaining = "";
-        } else {
-            int splitPos = remaining.lastIndexOf(' ', maxCharsPerLine);
-            if (splitPos < 1) {
-                splitPos = remaining.indexOf(' ', maxCharsPerLine);
-                if (splitPos < 0) splitPos = maxCharsPerLine;
-            }
-            line = remaining.substring(0, splitPos);
-            remaining = (splitPos < (int)remaining.length()) ? remaining.substring(splitPos + 1) : "";
-        }
+    while (lineNum < numLines && lineNum < 5) {
+        const char* line = bubbleLines[lineNum];
         
         int lineY = textY + lineNum * lineHeight;
         

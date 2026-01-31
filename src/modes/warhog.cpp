@@ -124,6 +124,10 @@ bool WarhogMode::enhancedMode = false;
 std::map<uint64_t, WiFiFeatures> WarhogMode::beaconFeatures;
 std::atomic<uint32_t> WarhogMode::beaconCount{0};  // Atomic for thread-safe callback + main access
 volatile bool WarhogMode::beaconMapBusy = false;
+WarhogMode::PendingBeaconFeature WarhogMode::beaconQueue[WarhogMode::kBeaconQueueSize] = {};
+std::atomic<uint16_t> WarhogMode::beaconQueueHead{0};
+std::atomic<uint16_t> WarhogMode::beaconQueueTail{0};
+std::atomic<uint32_t> WarhogMode::beaconQueueDropped{0};
 
 // Background scan task statics
 TaskHandle_t WarhogMode::scanTaskHandle = NULL;
@@ -180,8 +184,66 @@ static void seedCapturedFromOink() {
     }
 }
 
+void WarhogMode::resetBeaconQueue() {
+    beaconQueueHead.store(0);
+    beaconQueueTail.store(0);
+    beaconQueueDropped.store(0);
+}
+
+bool WarhogMode::enqueueBeaconFeature(uint64_t key, const WiFiFeatures& features) {
+    uint16_t head = beaconQueueHead.load();
+    uint16_t tail = beaconQueueTail.load();
+    uint16_t next = (uint16_t)((head + 1) % kBeaconQueueSize);
+    if (next == tail) {
+        beaconQueueDropped.fetch_add(1);
+        return false;  // Queue full
+    }
+
+    beaconQueue[head].key = key;
+    beaconQueue[head].features = features;
+    beaconQueueHead.store(next);
+    return true;
+}
+
+void WarhogMode::processBeaconQueue() {
+    if (!running || !enhancedMode) return;
+    if (!beaconMutex || beaconMapBusy) return;
+
+    if (xSemaphoreTake(beaconMutex, pdMS_TO_TICKS(5)) != pdTRUE) {
+        return;
+    }
+
+    uint16_t head = beaconQueueHead.load();
+    uint16_t tail = beaconQueueTail.load();
+    uint16_t processed = 0;
+
+    while (tail != head && processed < 24) {
+        const PendingBeaconFeature& item = beaconQueue[tail];
+
+        // Limit beaconFeatures size to prevent memory exhaustion
+        if (beaconFeatures.size() < 500) {
+            auto it = beaconFeatures.find(item.key);
+            if (it != beaconFeatures.end()) {
+                it->second.beaconCount++;
+            } else {
+                WiFiFeatures features = item.features;
+                features.beaconCount = 1;
+                beaconFeatures[item.key] = features;
+            }
+            beaconCount++;
+        }
+
+        tail = (uint16_t)((tail + 1) % kBeaconQueueSize);
+        processed++;
+    }
+
+    beaconQueueTail.store(tail);
+    xSemaphoreGive(beaconMutex);
+}
+
 void WarhogMode::clearBeaconFeatures() {
     beaconMapBusy = true;
+    resetBeaconQueue();
     // Ensure we're not stuck waiting indefinitely for the mutex
     if (beaconMutex) {
         if (xSemaphoreTake(beaconMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -446,6 +508,9 @@ void WarhogMode::update() {
         }
         lastHeapCheck = now;
     }
+
+    // Drain queued beacon features (deferred from promiscuous callback)
+    processBeaconQueue();
     
     // Periodic beacon map cleanup to prevent unbounded growth (every 10s - Phase 3B fix)
     // Clear stale beacon features to reclaim heap before it becomes critical
@@ -454,6 +519,7 @@ void WarhogMode::update() {
         // Only clear if map is getting large (>200 entries = ~25KB)
         if (beaconFeatures.size() > 200) {
             beaconMapBusy = true;
+            resetBeaconQueue();
             if (beaconMutex && xSemaphoreTake(beaconMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                 beaconFeatures.clear();
                 beaconCount = 0;
@@ -1136,28 +1202,13 @@ void WarhogMode::promiscuousCallback(void* buf, wifi_promiscuous_pkt_type_t type
     uint64_t key = bssidToKey(bssid);
     
     WiFiFeatures features = FeatureExtractor::extractFromBeacon(frame, len, rssi);
-
-    // Use timeout for mutex to prevent blocking indefinitely in interrupt context
-    if (beaconMutex && xSemaphoreTake(beaconMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-        // Limit beaconFeatures size to prevent memory exhaustion
-        if (beaconFeatures.size() < 500) {
-            auto it = beaconFeatures.find(key);
-            if (it != beaconFeatures.end()) {
-                it->second.beaconCount++;
-            } else {
-                features.beaconCount = 1;
-                beaconFeatures[key] = features;
-            }
-            beaconCount++;
-        }
-        xSemaphoreGive(beaconMutex);
-    }
-    // If mutex unavailable, skip adding to map (safe fallback)
+    enqueueBeaconFeature(key, features);
 }
 
 void WarhogMode::startEnhancedCapture() {
     beaconFeatures.clear();
     beaconCount = 0;
+    resetBeaconQueue();
     
     wifi_promiscuous_filter_t filter = {
         .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT
@@ -1170,4 +1221,5 @@ void WarhogMode::startEnhancedCapture() {
 
 void WarhogMode::stopEnhancedCapture() {
     WiFiUtils::stopPromiscuous();
+    resetBeaconQueue();
 }

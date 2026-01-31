@@ -3436,6 +3436,8 @@ void FileServer::startServer() {
         FS_LOGLN("[DBG-H2] ERROR: WebServer allocation failed!");
         // #endregion
         strcpy(statusMessage, "Server alloc fail");
+        MDNS.end();
+        WiFiUtils::shutdown();
         state = FileServerState::IDLE;
         return;
     }
