@@ -10,6 +10,7 @@
 
 // Client monitoring constants
 #define MAX_SPECTRUM_CLIENTS 8
+#define MAX_SPECTRUM_NETWORKS 100  // Cap networks to prevent OOM
 #define CLIENT_STALE_TIMEOUT_MS 30000  // 30s before client considered gone
 #define VISIBLE_CLIENTS 4              // How many fit on screen
 #define SIGNAL_LOST_TIMEOUT_MS 15000   // 15s no beacon = signal lost
@@ -37,6 +38,38 @@ struct SpectrumNetwork {
     // Client tracking (only populated when monitoring THIS network)
     SpectrumClient clients[MAX_SPECTRUM_CLIENTS];
     uint8_t clientCount;
+};
+
+// Render snapshot (heap-safe, no vector pointers)
+struct SpectrumRenderNet {
+    uint8_t bssid[6];
+    uint8_t channel;
+    int8_t rssi;
+    wifi_auth_mode_t authmode;
+    bool hasPMF;
+    bool isHidden;
+    float displayFreqMHz;
+};
+
+struct SpectrumRenderSelected {
+    bool valid;
+    uint8_t bssid[6];
+    char ssid[33];
+    uint8_t channel;
+    int8_t rssi;
+    wifi_auth_mode_t authmode;
+    bool hasPMF;
+    bool wasRevealed;
+};
+
+struct SpectrumRenderMonitor {
+    bool valid;
+    uint8_t bssid[6];
+    char ssid[33];
+    uint8_t channel;
+    int8_t rssi;
+    uint8_t clientCount;
+    SpectrumClient clients[MAX_SPECTRUM_CLIENTS];
 };
 
 // MAC comparison helper [P8]
@@ -77,6 +110,10 @@ private:
     static bool running;
     static std::atomic<bool> busy;   // Guard against callback race (atomic for cross-core visibility)
     static std::vector<SpectrumNetwork> networks;
+    static SpectrumRenderNet renderNets[MAX_SPECTRUM_NETWORKS];
+    static uint16_t renderCount;
+    static SpectrumRenderSelected renderSelected;
+    static SpectrumRenderMonitor renderMonitor;
     static float viewCenterMHz;      // Center of visible spectrum
     static float viewWidthMHz;       // Visible bandwidth
     static int selectedIndex;        // Currently highlighted network
@@ -172,6 +209,8 @@ private:
     static const char* authModeToShortString(wifi_auth_mode_t mode);
     static bool detectPMF(const uint8_t* payload, uint16_t len);
     static bool matchesFilter(const SpectrumNetwork& net);  // Check if network passes filter
+    static bool matchesFilterRender(const SpectrumRenderNet& net);
+    static void updateRenderSnapshot();
     
     // Packet callback for visualization (called by NetworkRecon)
     static void promiscuousCallback(const wifi_promiscuous_pkt_t* pkt, wifi_promiscuous_pkt_type_t type);

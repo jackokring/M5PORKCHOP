@@ -46,9 +46,6 @@ const float PAN_STEP_MHZ = 5.0f;           // One channel per pan
 const uint32_t STALE_TIMEOUT_MS = 5000;    // Remove networks after 5s silence
 const uint32_t UPDATE_INTERVAL_MS = 100;   // 10 FPS update rate
 
-// Memory limits
-const size_t MAX_SPECTRUM_NETWORKS = 100;  // Cap networks to prevent OOM
-
 // Gaussian LUT for spectrum lobes (sigma=6.6, distances -15 to +15 MHz)
 // Pre-computed: exp(-0.5 * dist^2 / 43.56) for each integer distance
 // Eliminates expensive expf() calls in hot render path (~6000/sec savings)
@@ -67,6 +64,10 @@ static const float GAUSSIAN_LUT[31] = {
 bool SpectrumMode::running = false;
 std::atomic<bool> SpectrumMode::busy{false};  // [BUG7 FIX] Atomic for cross-core visibility
 std::vector<SpectrumNetwork> SpectrumMode::networks;
+SpectrumRenderNet SpectrumMode::renderNets[MAX_SPECTRUM_NETWORKS] = {};
+uint16_t SpectrumMode::renderCount = 0;
+SpectrumRenderSelected SpectrumMode::renderSelected = {};
+SpectrumRenderMonitor SpectrumMode::renderMonitor = {};
 float SpectrumMode::viewCenterMHz = DEFAULT_CENTER_MHZ;
 float SpectrumMode::viewWidthMHz = DEFAULT_WIDTH_MHZ;
 int SpectrumMode::selectedIndex = -1;
@@ -123,6 +124,10 @@ uint32_t SpectrumMode::lastRevealBurst = 0;
 void SpectrumMode::init() {
     networks.clear();
     networks.shrink_to_fit();  // Release vector capacity
+    renderCount = 0;
+    memset(renderNets, 0, sizeof(renderNets));
+    memset(&renderSelected, 0, sizeof(renderSelected));
+    memset(&renderMonitor, 0, sizeof(renderMonitor));
     viewCenterMHz = DEFAULT_CENTER_MHZ;
     viewWidthMHz = DEFAULT_WIDTH_MHZ;
     selectedIndex = -1;
@@ -216,6 +221,10 @@ void SpectrumMode::stop() {
     // FIX: Release vector capacity to recover heap
     networks.clear();
     networks.shrink_to_fit();
+    renderCount = 0;
+    memset(renderNets, 0, sizeof(renderNets));
+    memset(&renderSelected, 0, sizeof(renderSelected));
+    memset(&renderMonitor, 0, sizeof(renderMonitor));
     
     busy = false;
     Serial.println("[SPECTRUM] Stopped - heap recovered");
@@ -354,6 +363,67 @@ void SpectrumMode::update() {
             Display::showToast("THE ETHER DEAUTHS BACK");
         }
     }
+
+    // Build render snapshot (heap-safe, avoids vector pointer races during draw)
+    updateRenderSnapshot();
+}
+
+void SpectrumMode::updateRenderSnapshot() {
+    busy = true;
+
+    size_t count = networks.size();
+    if (count > MAX_SPECTRUM_NETWORKS) count = MAX_SPECTRUM_NETWORKS;
+    renderCount = (uint16_t)count;
+    for (size_t i = 0; i < count; i++) {
+        const SpectrumNetwork& net = networks[i];
+        SpectrumRenderNet& out = renderNets[i];
+        memcpy(out.bssid, net.bssid, 6);
+        out.channel = net.channel;
+        out.rssi = net.rssi;
+        out.authmode = net.authmode;
+        out.hasPMF = net.hasPMF;
+        out.isHidden = net.isHidden;
+        out.displayFreqMHz = net.displayFreqMHz;
+    }
+
+    // Selected snapshot for status bar + highlight
+    renderSelected.valid = false;
+    if (selectedIndex >= 0 && selectedIndex < (int)networks.size()) {
+        const SpectrumNetwork& net = networks[selectedIndex];
+        renderSelected.valid = true;
+        memcpy(renderSelected.bssid, net.bssid, 6);
+        strncpy(renderSelected.ssid, net.ssid, 32);
+        renderSelected.ssid[32] = 0;
+        renderSelected.channel = net.channel;
+        renderSelected.rssi = net.rssi;
+        renderSelected.authmode = net.authmode;
+        renderSelected.hasPMF = net.hasPMF;
+        renderSelected.wasRevealed = net.wasRevealed;
+    }
+
+    // Monitored snapshot for client overlay (no live vector access in draw)
+    renderMonitor.valid = false;
+    renderMonitor.clientCount = 0;
+    if (monitoringNetwork &&
+        monitoredNetworkIndex >= 0 &&
+        monitoredNetworkIndex < (int)networks.size() &&
+        macEqual(networks[monitoredNetworkIndex].bssid, monitoredBSSID)) {
+        const SpectrumNetwork& net = networks[monitoredNetworkIndex];
+        renderMonitor.valid = true;
+        memcpy(renderMonitor.bssid, net.bssid, 6);
+        strncpy(renderMonitor.ssid, net.ssid, 32);
+        renderMonitor.ssid[32] = 0;
+        renderMonitor.channel = net.channel;
+        renderMonitor.rssi = net.rssi;
+        uint8_t countClients = net.clientCount;
+        if (countClients > MAX_SPECTRUM_CLIENTS) countClients = MAX_SPECTRUM_CLIENTS;
+        renderMonitor.clientCount = countClients;
+        if (countClients > 0) {
+            memcpy(renderMonitor.clients, net.clients, countClients * sizeof(SpectrumClient));
+        }
+    }
+
+    busy = false;
 }
 
 void SpectrumMode::handleInput() {
@@ -558,8 +628,7 @@ void SpectrumMode::draw(M5Canvas& canvas) {
         drawDialInfo(canvas);
         
         // Draw status indicators if network is selected
-        if (selectedIndex >= 0 && selectedIndex < (int)networks.size()) {
-            const auto& net = networks[selectedIndex];
+        if (renderSelected.valid) {
             canvas.setTextSize(1);
             canvas.setTextColor(COLOR_FG);
             canvas.setTextDatum(top_left);
@@ -568,13 +637,13 @@ void SpectrumMode::draw(M5Canvas& canvas) {
             char status[24];
             size_t pos = 0;
             status[0] = '\0';
-            if (isVulnerable(net.authmode)) {
+            if (isVulnerable(renderSelected.authmode)) {
                 pos += snprintf(status + pos, sizeof(status) - pos, "[VULN!]");
             }
-            if (!net.hasPMF) {
+            if (!renderSelected.hasPMF) {
                 pos += snprintf(status + pos, sizeof(status) - pos, "[DEAUTH]");
             }
-            if (OinkMode::isExcluded(net.bssid)) {
+            if (OinkMode::isExcluded(renderSelected.bssid)) {
                 pos += snprintf(status + pos, sizeof(status) - pos, "[BRO]");
             }
             if (pos > 0) {
@@ -768,14 +837,13 @@ void SpectrumMode::drawClientOverlay(M5Canvas& canvas) {
     canvas.setTextColor(COLOR_FG, COLOR_BG);
     
     // Bounds check [P3]
-    if (monitoredNetworkIndex < 0 || 
-        monitoredNetworkIndex >= (int)networks.size()) {
+    if (!renderMonitor.valid) {
         canvas.setTextDatum(middle_center);
         canvas.drawString("NETWORK LOST", 120, 45);
         return;
     }
     
-    SpectrumNetwork& net = networks[monitoredNetworkIndex];
+    const SpectrumRenderMonitor& net = renderMonitor;
     
     // Header: SSID or <hidden> [P15] - CH removed (shown in bottom bar)
     char header[40];
@@ -810,7 +878,7 @@ void SpectrumMode::drawClientOverlay(M5Canvas& canvas) {
         // Bounds check [P3]
         if (clientIdx >= net.clientCount) break;
         
-        SpectrumClient& client = net.clients[clientIdx];
+        const SpectrumClient& client = net.clients[clientIdx];
         
         int y = START_Y + (i * LINE_HEIGHT);
         bool selected = (clientIdx == selectedClientIndex);
@@ -900,13 +968,12 @@ void SpectrumMode::drawClientOverlay(M5Canvas& canvas) {
 // Draw client detail popup - modal overlay with full client info
 void SpectrumMode::drawClientDetail(M5Canvas& canvas) {
     // Bounds validation - close popup if client no longer exists
-    if (monitoredNetworkIndex < 0 || 
-        monitoredNetworkIndex >= (int)networks.size()) {
+    if (!renderMonitor.valid) {
         clientDetailActive = false;
         return;
     }
     
-    const SpectrumNetwork& net = networks[monitoredNetworkIndex];
+    const SpectrumRenderMonitor& net = renderMonitor;
     
     if (selectedClientIndex < 0 || selectedClientIndex >= net.clientCount) {
         clientDetailActive = false;
@@ -977,22 +1044,17 @@ void SpectrumMode::drawClientDetail(M5Canvas& canvas) {
 }
 
 void SpectrumMode::drawSpectrum(M5Canvas& canvas) {
-    // Guard against callback modifying networks during snapshot
-    busy = true;
-    
     // Copy pointers to avoid heap allocations in render loop
-    const size_t maxCount = networks.size();
+    const size_t maxCount = renderCount;
     const size_t cap = (maxCount > MAX_SPECTRUM_NETWORKS) ? MAX_SPECTRUM_NETWORKS : maxCount;
-    const SpectrumNetwork* snapshot[MAX_SPECTRUM_NETWORKS];
+    const SpectrumRenderNet* snapshot[MAX_SPECTRUM_NETWORKS];
     size_t snapshotCount = 0;
     for (size_t i = 0; i < cap; i++) {
-        snapshot[snapshotCount++] = &networks[i];
+        snapshot[snapshotCount++] = &renderNets[i];
     }
-    
-    busy = false;
-    
+ 
     // Sort pointers by RSSI (weakest first, so strongest draws on top)
-    std::sort(snapshot, snapshot + snapshotCount, [](const SpectrumNetwork* a, const SpectrumNetwork* b) {
+    std::sort(snapshot, snapshot + snapshotCount, [](const SpectrumRenderNet* a, const SpectrumRenderNet* b) {
         return a->rssi < b->rssi;
     });
     
@@ -1001,15 +1063,15 @@ void SpectrumMode::drawSpectrum(M5Canvas& canvas) {
         const auto& net = *snapshot[i];
         
         // Skip networks that don't match current filter
-        if (!matchesFilter(net)) continue;
+        if (!matchesFilterRender(net)) continue;
         
         // Use smoothed display frequency to prevent left/right jitter
         float freq = net.displayFreqMHz;
         
         // Check if selected (compare by BSSID)
         bool isSelected = false;
-        if (selectedIndex >= 0 && selectedIndex < (int)networks.size()) {
-            isSelected = (memcmp(net.bssid, networks[selectedIndex].bssid, 6) == 0);
+        if (renderSelected.valid) {
+            isSelected = (memcmp(net.bssid, renderSelected.bssid, 6) == 0);
         }
         
         drawGaussianLobe(canvas, freq, net.rssi, isSelected);
@@ -1365,38 +1427,29 @@ void SpectrumMode::onBeacon(const uint8_t* bssid, uint8_t channel, int8_t rssi, 
 
 void SpectrumMode::getSelectedInfo(char* out, size_t len) {
     if (!out || len == 0) return;
-    // Guard against callback race
-    if (busy) {
-        snprintf(out, len, "SCANNING...");
-        return;
-    }
-    
     // [P8] Client monitoring mode - show client count and channel (SSID in header)
     if (monitoringNetwork) {
-        if (monitoredNetworkIndex >= 0 && monitoredNetworkIndex < (int)networks.size()) {
-            const auto& net = networks[monitoredNetworkIndex];
+        if (renderMonitor.valid) {
             // SSID already shown in header - no duplication needed
-            snprintf(out, len, "MON C:%02d CH:%02d", net.clientCount, net.channel);
+            snprintf(out, len, "MON C:%02d CH:%02d", renderMonitor.clientCount, renderMonitor.channel);
             return;
         }
         snprintf(out, len, "MONITORING...");
         return;
     }
     
-    if (selectedIndex >= 0 && selectedIndex < (int)networks.size()) {
-        const auto& net = networks[selectedIndex];
-        
+    if (renderSelected.valid) {
         // Bottom bar: ~33 chars available (240px - margins - uptime)
         // Fixed part: " -XXdB CH:XX YYYY" = ~16 chars worst case
         // SSID gets max 15 chars + ".." if truncated
         const size_t MAX_SSID_DISPLAY = 15;
         
         char ssidBuf[32];
-        if (net.ssid[0]) {
-            if (net.wasRevealed) {
-                snprintf(ssidBuf, sizeof(ssidBuf), "*%s", net.ssid);
+        if (renderSelected.ssid[0]) {
+            if (renderSelected.wasRevealed) {
+                snprintf(ssidBuf, sizeof(ssidBuf), "*%s", renderSelected.ssid);
             } else {
-                strncpy(ssidBuf, net.ssid, sizeof(ssidBuf) - 1);
+                strncpy(ssidBuf, renderSelected.ssid, sizeof(ssidBuf) - 1);
                 ssidBuf[sizeof(ssidBuf) - 1] = '\0';
             }
         } else {
@@ -1419,11 +1472,12 @@ void SpectrumMode::getSelectedInfo(char* out, size_t len) {
         
         snprintf(out, len, "%s %ddB CH:%02d %s",
                  ssidBuf,
-                 net.rssi, net.channel,
-                 authModeToShortString(net.authmode));
+                 renderSelected.rssi,
+                 renderSelected.channel,
+                 authModeToShortString(renderSelected.authmode));
         return;
     }
-    if (networks.empty()) {
+    if (renderCount == 0) {
         snprintf(out, len, "SCANNING...");
         return;
     }
@@ -1545,6 +1599,20 @@ bool SpectrumMode::isVulnerable(wifi_auth_mode_t mode) {
 
 // Check if network passes current filter
 bool SpectrumMode::matchesFilter(const SpectrumNetwork& net) {
+    switch (filter) {
+        case SpectrumFilter::VULN:
+            return isVulnerable(net.authmode);
+        case SpectrumFilter::SOFT:
+            return !net.hasPMF;
+        case SpectrumFilter::HIDDEN:
+            return net.isHidden;
+        case SpectrumFilter::ALL:
+        default:
+            return true;
+    }
+}
+
+bool SpectrumMode::matchesFilterRender(const SpectrumRenderNet& net) {
     switch (filter) {
         case SpectrumFilter::VULN:
             return isVulnerable(net.authmode);
