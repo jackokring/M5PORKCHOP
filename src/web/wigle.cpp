@@ -10,6 +10,7 @@
 #include <base64.h>
 #include "../core/config.h"
 #include "../core/sd_layout.h"
+#include "../core/heap_gates.h"
 #include "../core/wifi_utils.h"
 #include "../core/network_recon.h"
 #include "../core/sdlog.h"
@@ -235,30 +236,15 @@ bool WiGLE::hasCredentials() {
 bool WiGLE::canSync() {
     // Free uploaded list to maximize available heap
     freeUploadedListMemory();
-    
-    size_t freeHeap = ESP.getFreeHeap();
-    size_t largestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-    
-    Serial.printf("[WIGLE] canSync: %u free, %u contiguous (need %u/%u)\n", 
-                  (unsigned int)freeHeap, (unsigned int)largestBlock,
+
+    HeapGates::TlsGateStatus tls = HeapGates::checkTlsGates();
+
+    Serial.printf("[WIGLE] canSync: %u free, %u contiguous (need %u/%u)\n",
+                  (unsigned int)tls.freeHeap, (unsigned int)tls.largestBlock,
                   (unsigned int)HeapPolicy::kMinHeapForTls,
                   (unsigned int)HeapPolicy::kMinContigForTls);
-    
-    // Check fragmentation first (more specific error)
-    if (largestBlock < HeapPolicy::kMinContigForTls) {
-        snprintf(lastError, sizeof(lastError), "FRAGMENTED: %uKB", 
-                 (unsigned int)(largestBlock / 1024));
-        return false;
-    }
-    
-    // Then total heap
-    if (freeHeap < HeapPolicy::kMinHeapForTls) {
-        snprintf(lastError, sizeof(lastError), "LOW HEAP: %uKB", 
-                 (unsigned int)(freeHeap / 1024));
-        return false;
-    }
-    
-    return true;
+
+    return HeapGates::canTls(tls, lastError, sizeof(lastError));
 }
 
 bool WiGLE::uploadSingleFile(const char* csvPath) {
@@ -620,14 +606,13 @@ WigleSyncResult WiGLE::syncFiles(WigleProgressCallback cb) {
     
     // Proactive heap conditioning - condition early when heap is marginal
     // This prevents fragmentation from getting critical before TLS attempts
-    size_t largestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-    if (largestBlock < HeapPolicy::kProactiveTlsConditioning &&
-        largestBlock >= HeapPolicy::kMinContigForTls) {
+    HeapGates::TlsGateStatus tls = HeapGates::checkTlsGates();
+    if (HeapGates::shouldProactivelyCondition(tls)) {
         if (cb) {
             cb("OPTIMIZING HEAP", 0, 0);
         }
         Serial.printf("[WIGLE] Proactive conditioning: %u < %u threshold\n",
-                      (unsigned int)largestBlock,
+                      (unsigned int)tls.largestBlock,
                       (unsigned int)HeapPolicy::kProactiveTlsConditioning);
         WiFiUtils::conditionHeapForTLS();
     }

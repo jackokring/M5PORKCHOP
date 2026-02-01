@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 
 namespace HeapPolicy {
     // TLS gating thresholds
@@ -32,6 +33,15 @@ namespace HeapPolicy {
     static constexpr size_t kWarhogHeapCritical = 25000;
     static constexpr size_t kDnhInjectMinHeap = 80000;
     static constexpr size_t kPigSyncMinContig = 26000;
+
+    // Heap health sampling/tuning
+    static constexpr uint32_t kHealthSampleIntervalMs = 1000;
+    static constexpr uint32_t kHealthToastDurationMs = 5000;
+    static constexpr uint8_t kHealthToastMinDelta = 5;
+    static constexpr uint8_t kHealthConditionTriggerPct = 65;
+    static constexpr uint8_t kHealthConditionClearPct = 75;
+    static constexpr uint32_t kHealthConditionCooldownMs = 30000;
+    static constexpr float kHealthFragPenaltyScale = 0.60f;
 
     // Stress test guardrail
     static constexpr size_t kStressMinHeap = 70000;

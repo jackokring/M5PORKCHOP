@@ -19,13 +19,6 @@ static size_t minLargest = 0;
 static bool conditionPending = false;
 static uint32_t lastConditionMs = 0;
 
-static const uint32_t SAMPLE_INTERVAL_MS = 1000;
-static const uint32_t TOAST_DURATION_MS = 5000;  // Match XP top bar duration
-static const uint8_t TOAST_MIN_DELTA = 5;
-static const uint8_t CONDITION_TRIGGER_PCT = 65;
-static const uint8_t CONDITION_CLEAR_PCT = 75;
-static const uint32_t CONDITION_COOLDOWN_MS = 30000;
-
 static uint8_t computePercent(size_t freeHeap, size_t largestBlock, bool updatePeaks) {
     if (updatePeaks) {
         if (freeHeap > peakFree) peakFree = freeHeap;
@@ -45,7 +38,7 @@ static uint8_t computePercent(size_t freeHeap, size_t largestBlock, bool updateP
     if (thresholdNorm < health) health = thresholdNorm;
 
     float fragRatio = freeHeap > 0 ? (float)largestBlock / (float)freeHeap : 0.0f;
-    float fragPenalty = fragRatio / 0.60f;  // Penalize fragmentation when largest << total free
+    float fragPenalty = fragRatio / HeapPolicy::kHealthFragPenaltyScale;  // Penalize fragmentation when largest << total free
     if (fragPenalty < 0.0f) fragPenalty = 0.0f;
     if (fragPenalty > 1.0f) fragPenalty = 1.0f;
     health *= fragPenalty;
@@ -61,7 +54,7 @@ static uint8_t computePercent(size_t freeHeap, size_t largestBlock, bool updateP
 
 void update() {
     uint32_t now = millis();
-    if (now - lastSampleMs < SAMPLE_INTERVAL_MS) {
+    if (now - lastSampleMs < HeapPolicy::kHealthSampleIntervalMs) {
         return;
     }
     lastSampleMs = now;
@@ -81,22 +74,22 @@ void update() {
     heapHealthPct = newPct;
 
     bool contigLow = largestBlock < HeapPolicy::kProactiveTlsConditioning;
-    bool pctLow = newPct <= CONDITION_TRIGGER_PCT;
+    bool pctLow = newPct <= HeapPolicy::kHealthConditionTriggerPct;
     if (!conditionPending) {
         if (pctLow && contigLow &&
-            (lastConditionMs == 0 || (now - lastConditionMs) >= CONDITION_COOLDOWN_MS)) {
+            (lastConditionMs == 0 || (now - lastConditionMs) >= HeapPolicy::kHealthConditionCooldownMs)) {
             conditionPending = true;
         }
     } else {
-        bool pctRecovered = newPct >= CONDITION_CLEAR_PCT;
+        bool pctRecovered = newPct >= HeapPolicy::kHealthConditionClearPct;
         bool contigRecovered = largestBlock >= HeapPolicy::kProactiveTlsConditioning;
         if (pctRecovered && contigRecovered) {
             conditionPending = false;
         }
     }
 
-    if (delta != 0 && deltaAbs >= TOAST_MIN_DELTA) {
-        if (now - lastToastMs >= TOAST_DURATION_MS) {
+    if (delta != 0 && deltaAbs >= HeapPolicy::kHealthToastMinDelta) {
+        if (now - lastToastMs >= HeapPolicy::kHealthToastDurationMs) {
             toastDelta = deltaAbs;
             toastImproved = delta > 0;
             toastActive = true;
@@ -130,7 +123,7 @@ void resetPeaks(bool suppressToast) {
 
 bool shouldShowToast() {
     if (!toastActive) return false;
-    if (millis() - toastStartMs >= TOAST_DURATION_MS) {
+    if (millis() - toastStartMs >= HeapPolicy::kHealthToastDurationMs) {
         toastActive = false;
         return false;
     }
