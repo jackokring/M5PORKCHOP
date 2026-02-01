@@ -61,9 +61,17 @@ namespace HeapPolicy {
     static constexpr uint32_t kConditioningStepMs = 100;
     static constexpr uint32_t kConditioningWarmupMs = 1000;
     static constexpr uint32_t kConditioningLogIntervalMs = 1000;
+    static constexpr uint32_t kConditioningFinalDelayMs = 50;
     static constexpr uint32_t kBrewDefaultDwellMs = 1000;
     static constexpr uint32_t kBrewAutoDwellMs = 1200;
     static constexpr uint32_t kBrewFileServerDwellMs = 2000;
+
+    // WiFi/BLE settle delays used during conditioning/reset
+    static constexpr uint32_t kWiFiModeDelayMs = 50;
+    static constexpr uint32_t kWiFiDisconnectDelayMs = 50;
+    static constexpr uint32_t kWiFiShutdownDelayMs = 80;
+    static constexpr uint32_t kBleStopDelayMs = 50;
+    static constexpr uint32_t kBleDeinitDelayMs = 100;
 
     // Boot conditioning delays
     static constexpr int kBootFragYieldEvery = 10;

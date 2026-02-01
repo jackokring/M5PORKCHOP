@@ -43,7 +43,7 @@ static void preInitWiFiDriverEarly() {
     // No modem sleep to reduce odd timing/latency during TLS + UI load
     WiFi.setSleep(false);
 
-    delay(50);
+    delay(HeapPolicy::kWiFiModeDelayMs);
 }
 
 static void exportCoreDumpToSD() {

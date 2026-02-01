@@ -236,7 +236,7 @@ void hardReset() {
     // wifioff=true causes driver teardown ? RX buffer allocation failure later
     WiFi.disconnect(false, true);
 
-    delay(80);
+    delay(HeapPolicy::kWiFiShutdownDelayMs);
     ensureNvsReady();
 }
 
@@ -272,7 +272,7 @@ void shutdown() {
                   ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     // #endregion
 
-    delay(80);
+    delay(HeapPolicy::kWiFiShutdownDelayMs);
     
     // #region agent log
     Serial.printf("[WIFI-HEAP] shutdown() EXIT (after 80ms delay): free=%u largest=%u\n",
@@ -300,18 +300,18 @@ size_t conditionHeapForTLS() {
         NimBLEScan* pScan = NimBLEDevice::getScan();
         if (pScan && pScan->isScanning()) {
             pScan->stop();
-            delay(50);
+            delay(HeapPolicy::kBleStopDelayMs);
         }
         
         NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
         if (pAdv && pAdv->isAdvertising()) {
             pAdv->stop();
-            delay(50);
+            delay(HeapPolicy::kBleStopDelayMs);
         }
         
         // Deinit BLE completely (clearAll=true to reset all state)
         NimBLEDevice::deinit(true);
-        delay(100);  // Give BLE stack time to fully shut down
+        delay(HeapPolicy::kBleDeinitDelayMs);  // Give BLE stack time to fully shut down
         
         Serial.printf("[HEAP] BLE deinit complete: free=%u largest=%u\n",
                       ESP.getFreeHeap(), 
@@ -339,14 +339,14 @@ size_t conditionHeapForTLS() {
     WiFi.persistent(false);
     WiFi.setSleep(false);
     WiFi.mode(WIFI_STA);
-    delay(50);
+    delay(HeapPolicy::kWiFiModeDelayMs);
     
     Serial.printf("[HEAP] After WiFi.mode(STA): free=%u largest=%u\n",
                   ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     
     // Step 2: Enable promiscuous mode WITH CALLBACK (like OINK does!)
     WiFi.disconnect();
-    delay(50);
+    delay(HeapPolicy::kWiFiDisconnectDelayMs);
     esp_wifi_set_promiscuous_rx_cb(brewPromiscuousCallback);  // ← Critical: set callback!
     esp_wifi_set_promiscuous_filter(nullptr);                  // ← Critical: receive all packets!
     esp_wifi_set_promiscuous(true);
@@ -395,14 +395,14 @@ size_t conditionHeapForTLS() {
     esp_wifi_set_promiscuous_rx_cb(nullptr);
     WiFi.disconnect(false, true);
     WiFi.mode(WIFI_STA);
-    delay(80);
+    delay(HeapPolicy::kWiFiShutdownDelayMs);
     
     Serial.printf("[HEAP] Brew complete (%ums): free=%u largest=%u\n",
                   millis() - brewStart,
                   ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     
     // Final consolidation delay
-    delay(50);
+    delay(HeapPolicy::kConditioningFinalDelayMs);
     yield();
     
     size_t finalLargest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
@@ -428,25 +428,25 @@ size_t brewHeap(uint32_t dwellMs, bool includeBleCleanup) {
         NimBLEScan* pScan = NimBLEDevice::getScan();
         if (pScan && pScan->isScanning()) {
             pScan->stop();
-            delay(50);
+            delay(HeapPolicy::kBleStopDelayMs);
         }
         NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
         if (pAdv && pAdv->isAdvertising()) {
             pAdv->stop();
-            delay(50);
+            delay(HeapPolicy::kBleStopDelayMs);
         }
         NimBLEDevice::deinit(true);
-        delay(100);
+        delay(HeapPolicy::kBleDeinitDelayMs);
     }
 
     brewPacketCount = 0;
     WiFi.persistent(false);
     WiFi.setSleep(false);
     WiFi.mode(WIFI_STA);
-    delay(50);
+    delay(HeapPolicy::kWiFiModeDelayMs);
 
     WiFi.disconnect();
-    delay(50);
+    delay(HeapPolicy::kWiFiDisconnectDelayMs);
     esp_wifi_set_promiscuous_rx_cb(brewPromiscuousCallback);
     esp_wifi_set_promiscuous_filter(nullptr);
     esp_wifi_set_promiscuous(true);
@@ -466,7 +466,7 @@ size_t brewHeap(uint32_t dwellMs, bool includeBleCleanup) {
     esp_wifi_set_promiscuous_rx_cb(nullptr);
     WiFi.disconnect(false, true);
     WiFi.mode(WIFI_STA);
-    delay(80);
+    delay(HeapPolicy::kWiFiShutdownDelayMs);
 
     size_t finalLargest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
     size_t finalFree = ESP.getFreeHeap();
