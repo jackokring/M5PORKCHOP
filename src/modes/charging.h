@@ -60,6 +60,9 @@ private:
     static bool powerPresent;
     static bool powerSeen;
     static uint32_t lastChargingMs;
+    static float entryVoltage;
+    static float peakVoltage;
+    static bool trendPowerPresent;
     
     // Calculate battery percentage from voltage (more accurate than AXP)
     static uint8_t voltageToPercent(float voltage, bool isCharging);

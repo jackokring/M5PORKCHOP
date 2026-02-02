@@ -39,10 +39,15 @@ bool ChargingMode::wifiWasOn = false;
 bool ChargingMode::powerPresent = false;
 bool ChargingMode::powerSeen = false;
 uint32_t ChargingMode::lastChargingMs = 0;
+float ChargingMode::entryVoltage = 0.0f;
+float ChargingMode::peakVoltage = 0.0f;
+bool ChargingMode::trendPowerPresent = false;
 
 static const uint32_t kChargeHoldMs = 10000;
 static const int16_t kVbusPresentMv = 4000;
 static const uint32_t kUnplugExitDelayMs = 3000;
+static const float kTrendRiseV = 0.010f;
+static const float kTrendDropV = 0.030f;
 
 // Li-ion voltage curves (approximate)
 // Discharge curve is different from charge curve due to internal resistance
@@ -52,6 +57,14 @@ static const uint8_t kDischargePercents[] = {0, 5, 10, 20, 30, 40, 50, 60, 70, 8
 // Charging curve - voltage reads higher due to charge current
 static const float kChargeVoltages[] = {3.50f, 3.70f, 3.85f, 3.95f, 4.05f, 4.10f, 4.15f, 4.18f, 4.20f, 4.20f, 4.20f};
 static const uint8_t kChargePercents[] = {0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100};
+
+static bool isUsbConnected() {
+#if ARDUINO_USB_MODE
+    return static_cast<bool>(Serial);
+#else
+    return false;
+#endif
+}
 
 void ChargingMode::init() {
     running = false;
@@ -70,6 +83,9 @@ void ChargingMode::init() {
     powerPresent = false;
     powerSeen = false;
     lastChargingMs = 0;
+    entryVoltage = 0.0f;
+    peakVoltage = 0.0f;
+    trendPowerPresent = false;
     
     memset(voltageHistory, 0, sizeof(voltageHistory));
     voltageHistoryIdx = 0;
@@ -133,6 +149,9 @@ void ChargingMode::start() {
     powerPresent = false;
     powerSeen = false;
     lastChargingMs = 0;
+    entryVoltage = 0.0f;
+    peakVoltage = 0.0f;
+    trendPowerPresent = false;
     
     // Initialize voltage history
     memset(voltageHistory, 0, sizeof(voltageHistory));
@@ -250,16 +269,9 @@ void ChargingMode::updateBattery() {
         lastChargingMs = now;
     }
     int16_t vbusMv = M5.Power.getVBUSVoltage();
-    bool vbusPresent = (vbusMv >= kVbusPresentMv);
-    if (vbusMv <= 0) {
-        vbusPresent = false;  // Not supported or invalid reading
-    }
-    powerPresent = vbusPresent ||
-                   isCharging ||
-                   (lastChargingMs != 0 && (now - lastChargingMs) < kChargeHoldMs);
-    if (powerPresent) {
-        powerSeen = true;
-    }
+    bool vbusSupported = (vbusMv >= 0);
+    bool vbusPresent = vbusSupported && (vbusMv >= kVbusPresentMv);
+    bool usbConnected = isUsbConnected();
     
     // Average with previous readings for stability
     voltageHistory[voltageHistoryIdx] = voltage;
@@ -277,6 +289,39 @@ void ChargingMode::updateBattery() {
         avgVoltage /= validCount;
     } else {
         avgVoltage = voltage;
+    }
+
+    if (entryVoltage == 0.0f) {
+        entryVoltage = avgVoltage;
+        peakVoltage = avgVoltage;
+    } else if (avgVoltage > peakVoltage) {
+        peakVoltage = avgVoltage;
+    }
+
+    bool powerNow = vbusPresent ||
+                    isCharging ||
+                    (lastChargingMs != 0 && (now - lastChargingMs) < kChargeHoldMs) ||
+                    usbConnected;
+
+    bool chargeUnknown = (chargeState == m5::Power_Class::is_charging_t::charge_unknown);
+    bool useTrendFallback = (!vbusSupported && chargeUnknown && !usbConnected);
+    if (useTrendFallback) {
+        if (!trendPowerPresent && (avgVoltage - entryVoltage) >= kTrendRiseV) {
+            trendPowerPresent = true;
+        }
+        if (trendPowerPresent && (peakVoltage - avgVoltage) >= kTrendDropV) {
+            trendPowerPresent = false;
+        }
+        if (trendPowerPresent) {
+            powerNow = true;
+        }
+    } else {
+        trendPowerPresent = false;
+    }
+
+    powerPresent = powerNow;
+    if (powerPresent) {
+        powerSeen = true;
     }
     
     batteryVoltage = avgVoltage;
