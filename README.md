@@ -171,7 +171,7 @@
     THE MEMORY WAR:
     ESP32-S3FN8 has 512KB SRAM + 8KB RTC. no PSRAM.
     (the "N" in FN8 means "no PSRAM". we work with what we have.)
-    TLS requires ~38KB contiguous. WiFi requires contiguous blocks.
+    TLS requires ~35KB contiguous. WiFi requires contiguous blocks.
     the heap fragments like your attention span.
 
     so we invented HEAP CONDITIONING.
@@ -184,8 +184,12 @@
     why? esp_wifi_init() fails if allocated after. we learned this.
     we learned this the hard way. the crash dumps remember.
 
-    OINK bounce: switching OINK → IDLE can reclaim heap.
+    OINK bounce: switching OINK -> IDLE can reclaim heap.
     it's percussive maintenance. for memory. valid.
+    
+    this feeds the HEALTH BAR. (see section 3.4).
+    if health drops, the pig can't talk to the cloud.
+    fragmentation is damage. entropy is the enemy.
 
     THE EVENT BUS:
     porkchop.cpp runs an event system. max 32 queued events.
@@ -395,6 +399,12 @@
         - dial mode (tilt to tune - accelerometer channel select)
           (Cardputer-Adv only - requires BMI270 IMU. original lacks tilt.)
 
+    CONTROLS:
+        - [,] and [/] to pan frequency view left/right
+        - [;] and [.] to cycle selected network
+        - [F] cycle filter (ALL / VULN / SOFT / HIDDEN)
+        - [SPACE] toggle dial lock (in dial mode)
+
     CLIENT MONITOR (press [ENTER] on a network):
         - shows connected clients
         - vendor guess from OUI database
@@ -598,6 +608,30 @@
     we have problems.
     the pig has weather.
     these statements are related.
+
+
+----[ 3.4 - PIG HEALTH (THE HEAP)
+
+    that heart bar at the bottom?
+    it's not love. it's RAM.
+    
+    specifically, it's HEAP HEALTH.
+    100% = memory is defragmented. contiguous blocks available.
+    0%   = memory looks like swiss cheese. TLS will fail.
+    
+    WHY IT FLUCTUATES:
+    - entropy. using the device fragments memory.
+    - web server / file transfer eats contiguous blocks.
+    - wifi driver reallocations create holes.
+    
+    HOW TO HEAL:
+    - run OINK mode. the channel hopping forces wifi buffer cleanup.
+    - cycle promiscuous mode. percussive maintenance.
+    - reboot. (the nuclear option. always valid.)
+    
+    if health is low, cloud uploads will fail.
+    the pig needs a clean brain to talk to the internet.
+    keep the pig healthy. defrag the pig.
 
 ------------------------------------------------------------------------
 
@@ -839,7 +873,7 @@
 
 ----[ 5.3 - IF UPLOADS FAIL
 
-    TLS needs ~38KB heap. if tight:
+    TLS needs ~35KB heap. if tight:
     - stop promiscuous mode first
     - check DIAGNOSTICS for heap status
     - see section 1.4 for the memory war details
@@ -1345,7 +1379,7 @@
 
     "WPA-SEC says 'Not Enough Heap'"
         → stop promiscuous mode first.
-        → the TLS handshake needs ~38KB.
+        → the TLS handshake needs ~35KB.
         → the pig tried. the ESP32 limits the pig.
 
     "the pig looks sad"
