@@ -75,7 +75,6 @@ int SpectrumMode::selectedIndex = -1;
 uint32_t SpectrumMode::lastUpdateTime = 0;
 bool SpectrumMode::keyWasPressed = false;
 uint8_t SpectrumMode::currentChannel = 1;
-uint32_t SpectrumMode::lastHopTime = 0;
 uint32_t SpectrumMode::startTime = 0;
 SpectrumFilter SpectrumMode::filter = SpectrumFilter::ALL;
 volatile bool SpectrumMode::pendingReveal = false;
@@ -134,7 +133,6 @@ void SpectrumMode::init() {
     selectedIndex = -1;
     keyWasPressed = false;
     currentChannel = 1;
-    lastHopTime = 0;
     startTime = 0;
     busy = false;
     pendingReveal = false;
@@ -329,18 +327,14 @@ void SpectrumMode::update() {
     
     // Handle input
     handleInput();
+
+    // Sync local channel state from NetworkRecon (sole channel owner).
+    currentChannel = NetworkRecon::getCurrentChannel();
     
     // Update dial mode (tilt-to-tune when upright)
     updateDialChannel();
     
-    // Channel hopping - skip when monitoring a specific network OR in dial mode
-    if (!monitoringNetwork && !dialMode) {
-        if (now - lastHopTime > 100) {  // 100ms per channel = ~1.3s full sweep
-            currentChannel = (currentChannel % 13) + 1;
-            esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
-            lastHopTime = now;
-        }
-    }
+    // Channel hopping is handled by NetworkRecon; Spectrum only locks when needed.
     
     // Prune stale networks periodically (only when NOT monitoring)
     if (!monitoringNetwork && now - lastUpdateTime > UPDATE_INTERVAL_MS) {
@@ -1178,7 +1172,7 @@ void SpectrumMode::updateDialChannel() {
     
     // Skip if in client monitor mode
     if (monitoringNetwork) return;
-    
+
     uint32_t now = millis();
     
     // ==[ PPS UPDATE ]== once per second
@@ -1216,7 +1210,10 @@ void SpectrumMode::updateDialChannel() {
         // But only after 200ms debounce to prevent flicker
         if (dialMode && (now - dialModeEntryTime >= 200)) {
             dialMode = false;
-            // Don't change channel - let normal hopping resume
+            // Release lock so NetworkRecon can resume hopping.
+            if (NetworkRecon::isChannelLocked()) {
+                NetworkRecon::unlockChannel();
+            }
         }
         return;  // No dial update when flat
     } else {
@@ -1229,6 +1226,7 @@ void SpectrumMode::updateDialChannel() {
             dialPositionSmooth = (float)currentChannel;
             dialPositionTarget = dialPositionSmooth;
             dialChannel = currentChannel;
+            NetworkRecon::lockChannel(dialChannel);
         }
     }
     
@@ -1236,7 +1234,7 @@ void SpectrumMode::updateDialChannel() {
     if (dialLocked) {
         // Keep channel locked
         if (currentChannel != dialChannel) {
-            esp_wifi_set_channel(dialChannel, WIFI_SECOND_CHAN_NONE);
+            NetworkRecon::lockChannel(dialChannel);
             currentChannel = dialChannel;
         }
         return;
@@ -1285,7 +1283,7 @@ void SpectrumMode::updateDialChannel() {
     // ==[ UPDATE CHANNEL IF CHANGED ]==
     if (newChannel != dialChannel) {
         dialChannel = newChannel;
-        esp_wifi_set_channel(dialChannel, WIFI_SECOND_CHAN_NONE);
+        NetworkRecon::lockChannel(dialChannel);
         currentChannel = dialChannel;
         SFX::play(SFX::CLICK);  // tick sound on channel change
         
@@ -1812,7 +1810,8 @@ void SpectrumMode::enterClientMonitor() {
     firstDeauthTime = 0;
     
     // Lock channel
-    esp_wifi_set_channel(monitoredChannel, WIFI_SECOND_CHAN_NONE);
+    NetworkRecon::lockChannel(monitoredChannel);
+    currentChannel = monitoredChannel;
     
     // Short beep for channel lock - non-blocking
     SFX::play(SFX::CHANNEL_LOCK);
@@ -1846,10 +1845,16 @@ void SpectrumMode::exitClientMonitor() {
     clientDetailActive = false;
     
     Serial.println("[SPECTRUM] Exited client monitor");
+
+    // Restore channel control: dial mode keeps lock, otherwise release.
+    if (dialMode) {
+        NetworkRecon::lockChannel(dialChannel);
+        currentChannel = dialChannel;
+    } else if (NetworkRecon::isChannelLocked()) {
+        NetworkRecon::unlockChannel();
+    }
     
     busy = false;
-    
-    // Channel hopping resumes automatically in next update()
 }
 
 // Prune stale clients [P1] [P3] [P10]

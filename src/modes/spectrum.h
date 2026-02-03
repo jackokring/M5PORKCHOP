@@ -120,7 +120,6 @@ private:
     static uint32_t lastUpdateTime;
     static bool keyWasPressed;
     static uint8_t currentChannel;   // Current hop channel
-    static uint32_t lastHopTime;     // Last channel hop time
     static uint32_t startTime;       // When mode started (for achievement)
     
     // Filter state
