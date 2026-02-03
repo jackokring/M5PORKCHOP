@@ -70,10 +70,14 @@ struct MLConfig {
 
 // WiFi settings for scanning and OTA
 struct WiFiConfig {
-    uint16_t channelHopInterval = 500;
+    uint16_t channelHopInterval = 150;
     uint16_t lockTime = 12000;          // Time to discover clients before attacking (12s optimal, buffed 13s)
     bool enableDeauth = true;
     bool randomizeMAC = true;           // Randomize MAC on mode start for stealth
+    int8_t spectrumMinRssi = -95;       // Spectrum: minimum RSSI to render (dBm)
+    uint8_t spectrumTopN = 0;           // Spectrum: cap visible APs (0 = no cap)
+    uint16_t spectrumStaleMs = 5000;    // Spectrum: stale timeout before drop (ms)
+    bool spectrumCollapseSsid = false;  // Spectrum: merge same-SSID APs
     char otaSSID[33];
     char otaPassword[65];
     bool autoConnect = false;

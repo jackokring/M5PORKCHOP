@@ -41,6 +41,10 @@ enum SettingId : uint8_t {
     SET_LOCK_TIME,
     SET_DEAUTH,
     SET_RND_MAC,
+    SET_SPEC_RSSI,
+    SET_SPEC_TOP,
+    SET_SPEC_STALE,
+    SET_SPEC_COLLAPSE,
     SET_GPS_ENABLED,
     SET_GPS_PWRSAVE,
     SET_GPS_SCAN_INTV,
@@ -110,10 +114,14 @@ static const EntryData kIntegEntries[] = {
 };
 
 static const EntryData kRadioEntries[] = {
-    {SET_CH_HOP, "STREET SW33P", SettingType::VALUE, 100, 2000, 100, "MS", "HOW FAST YOU SWEEP THE BAND"},
+    {SET_CH_HOP, "SWEEP SPD", SettingType::VALUE, 50, 2000, 50, "MS", "HOP SPEED"},
     {SET_LOCK_TIME, "GL4SS ST4R3", SettingType::VALUE, 1000, 10000, 500, "MS", "HOW LONG YOU HOLD A TARGET"},
     {SET_DEAUTH, "DEAUTH", SettingType::TOGGLE, 0, 1, 1, "", "KICK CLIENTS OFF APS"},
-    {SET_RND_MAC, "RND MAC", SettingType::TOGGLE, 0, 1, 1, "", "NEW MAC EACH MODE START"}
+    {SET_RND_MAC, "RND MAC", SettingType::TOGGLE, 0, 1, 1, "", "NEW MAC EACH MODE START"},
+    {SET_SPEC_RSSI, "RSSI CUT", SettingType::VALUE, -95, -30, 5, "DB", "HIDE WEAK APS"},
+    {SET_SPEC_TOP, "TOP APS", SettingType::VALUE, 0, 100, 5, "AP", "0 = NO CAP"},
+    {SET_SPEC_STALE, "STALE SEC", SettingType::VALUE, 1, 20, 1, "S", "DROP QUIET APS"},
+    {SET_SPEC_COLLAPSE, "SSID MERG", SettingType::TOGGLE, 0, 1, 1, "", "MERGE SAME SSID"}
 };
 
 static const EntryData kGpsEntries[] = {
@@ -179,6 +187,10 @@ static bool isConfigSetting(SettingId id) {
         case SET_LOCK_TIME:
         case SET_DEAUTH:
         case SET_RND_MAC:
+        case SET_SPEC_RSSI:
+        case SET_SPEC_TOP:
+        case SET_SPEC_STALE:
+        case SET_SPEC_COLLAPSE:
         case SET_GPS_ENABLED:
         case SET_GPS_PWRSAVE:
         case SET_GPS_SCAN_INTV:
@@ -455,6 +467,14 @@ static int getSettingValue(SettingId id) {
             return Config::wifi().enableDeauth ? 1 : 0;
         case SET_RND_MAC:
             return Config::wifi().randomizeMAC ? 1 : 0;
+        case SET_SPEC_RSSI:
+            return Config::wifi().spectrumMinRssi;
+        case SET_SPEC_TOP:
+            return Config::wifi().spectrumTopN;
+        case SET_SPEC_STALE:
+            return (int)(Config::wifi().spectrumStaleMs / 1000);
+        case SET_SPEC_COLLAPSE:
+            return Config::wifi().spectrumCollapseSsid ? 1 : 0;
         case SET_GPS_ENABLED:
             return Config::gps().enabled ? 1 : 0;
         case SET_GPS_PWRSAVE:
@@ -556,6 +576,39 @@ static bool setSettingValue(SettingId id, int value) {
             bool enabled = value != 0;
             if (Config::wifi().randomizeMAC == enabled) return false;
             Config::wifi().randomizeMAC = enabled;
+            return true;
+        }
+        case SET_SPEC_RSSI: {
+            int newVal = value;
+            if (newVal < -95) newVal = -95;
+            if (newVal > -30) newVal = -30;
+            int8_t rssi = static_cast<int8_t>(newVal);
+            if (Config::wifi().spectrumMinRssi == rssi) return false;
+            Config::wifi().spectrumMinRssi = rssi;
+            return true;
+        }
+        case SET_SPEC_TOP: {
+            int newVal = value;
+            if (newVal < 0) newVal = 0;
+            if (newVal > 100) newVal = 100;
+            uint8_t topN = static_cast<uint8_t>(newVal);
+            if (Config::wifi().spectrumTopN == topN) return false;
+            Config::wifi().spectrumTopN = topN;
+            return true;
+        }
+        case SET_SPEC_STALE: {
+            int newVal = value;
+            if (newVal < 1) newVal = 1;
+            if (newVal > 20) newVal = 20;
+            uint16_t staleMs = static_cast<uint16_t>(newVal * 1000);
+            if (Config::wifi().spectrumStaleMs == staleMs) return false;
+            Config::wifi().spectrumStaleMs = staleMs;
+            return true;
+        }
+        case SET_SPEC_COLLAPSE: {
+            bool enabled = value != 0;
+            if (Config::wifi().spectrumCollapseSsid == enabled) return false;
+            Config::wifi().spectrumCollapseSsid = enabled;
             return true;
         }
         case SET_GPS_ENABLED: {

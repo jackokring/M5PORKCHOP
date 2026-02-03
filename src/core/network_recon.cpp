@@ -41,9 +41,6 @@ static const uint8_t CHANNEL_HOP_ORDER[RECON_CHANNEL_COUNT] = {
     1, 6, 11, 2, 3, 4, 5, 7, 8, 9, 10, 12, 13
 };
 
-// Hop interval in milliseconds
-static const uint32_t HOP_INTERVAL_MS = 150;
-
 // Stale network timeout (remove if not seen for this long)
 static const uint32_t STALE_TIMEOUT_MS = 60000;
 
@@ -52,6 +49,13 @@ static const uint32_t CLEANUP_INTERVAL_MS = 5000;
 
 // Client activity decay (clear bitset after inactivity)
 static const uint32_t CLIENT_BITMAP_RESET_MS = 30000;
+
+static uint32_t getHopIntervalMsInternal() {
+    uint32_t interval = Config::wifi().channelHopInterval;
+    if (interval < 50) interval = 50;
+    if (interval > 2000) interval = 2000;
+    return interval;
+}
 
 // Beacon interval sanity cap (ignore huge gaps for EMA)
 static const uint32_t BEACON_INTERVAL_MAX_MS = 5000;
@@ -896,7 +900,8 @@ void update() {
     processDeferredEvents();
     
     // Channel hopping
-    if (!channelLocked && now - lastHopTime > HOP_INTERVAL_MS) {
+    uint32_t hopInterval = getHopIntervalMsInternal();
+    if (!channelLocked && now - lastHopTime > hopInterval) {
         hopChannel();
         lastHopTime = now;
     }
@@ -935,7 +940,7 @@ uint8_t getCurrentChannel() {
 }
 
 uint32_t getHopIntervalMs() {
-    return HOP_INTERVAL_MS;
+    return getHopIntervalMsInternal();
 }
 
 uint32_t getPacketCount() {

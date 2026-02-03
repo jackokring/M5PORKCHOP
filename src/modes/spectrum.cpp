@@ -44,7 +44,6 @@ const float MAX_CENTER_MHZ = 2472.0f;      // Channel 13
 const float PAN_STEP_MHZ = 5.0f;           // One channel per pan
 
 // Timing
-const uint32_t STALE_TIMEOUT_MS = 5000;    // Remove networks after 5s silence
 const uint32_t UPDATE_INTERVAL_MS = 100;   // 10 FPS update rate
 
 // Gaussian LUT for spectrum lobes (sigma=6.6, distances -15 to +15 MHz)
@@ -368,12 +367,49 @@ void SpectrumMode::update() {
 void SpectrumMode::updateRenderSnapshot() {
     busy = true;
 
-    size_t count = networks.size();
-    if (count > MAX_SPECTRUM_NETWORKS) count = MAX_SPECTRUM_NETWORKS;
-    renderCount = (uint16_t)count;
-    for (size_t i = 0; i < count; i++) {
+    int minRssi = Config::wifi().spectrumMinRssi;
+    if (minRssi < RSSI_MIN) minRssi = RSSI_MIN;
+    if (minRssi > RSSI_MAX) minRssi = RSSI_MAX;
+    bool collapse = Config::wifi().spectrumCollapseSsid;
+
+    static char ssidKeys[MAX_SPECTRUM_NETWORKS][33];
+    size_t count = 0;
+    for (size_t i = 0; i < networks.size(); i++) {
         const SpectrumNetwork& net = networks[i];
-        SpectrumRenderNet& out = renderNets[i];
+        if (net.rssi < minRssi) {
+            continue;
+        }
+
+        bool collapseKey = collapse && !net.isHidden && net.ssid[0] != 0;
+        if (collapseKey) {
+            int existing = -1;
+            for (size_t j = 0; j < count; j++) {
+                if (ssidKeys[j][0] == '\0') continue;
+                if (strncmp(ssidKeys[j], net.ssid, 32) == 0) {
+                    existing = (int)j;
+                    break;
+                }
+            }
+            if (existing >= 0) {
+                if (net.rssi > renderNets[existing].rssi) {
+                    SpectrumRenderNet& out = renderNets[existing];
+                    memcpy(out.bssid, net.bssid, 6);
+                    out.channel = net.channel;
+                    out.rssi = net.rssi;
+                    out.authmode = net.authmode;
+                    out.hasPMF = net.hasPMF;
+                    out.isHidden = net.isHidden;
+                    out.displayFreqMHz = net.displayFreqMHz;
+                }
+                continue;
+            }
+        }
+
+        if (count >= MAX_SPECTRUM_NETWORKS) {
+            continue;
+        }
+
+        SpectrumRenderNet& out = renderNets[count];
         memcpy(out.bssid, net.bssid, 6);
         out.channel = net.channel;
         out.rssi = net.rssi;
@@ -381,7 +417,16 @@ void SpectrumMode::updateRenderSnapshot() {
         out.hasPMF = net.hasPMF;
         out.isHidden = net.isHidden;
         out.displayFreqMHz = net.displayFreqMHz;
+
+        if (collapseKey) {
+            strncpy(ssidKeys[count], net.ssid, 32);
+            ssidKeys[count][32] = 0;
+        } else {
+            ssidKeys[count][0] = '\0';
+        }
+        count++;
     }
+    renderCount = (uint16_t)count;
 
     // Selected snapshot for status bar + highlight
     renderSelected.valid = false;
@@ -1054,23 +1099,35 @@ void SpectrumMode::drawSpectrum(M5Canvas& canvas) {
     std::sort(snapshot, snapshot + snapshotCount, [](const SpectrumRenderNet* a, const SpectrumRenderNet* b) {
         return a->rssi < b->rssi;
     });
-    
-    // Draw each network's Gaussian lobe (only if matches filter)
+
+    const SpectrumRenderNet* visible[MAX_SPECTRUM_NETWORKS];
+    size_t visibleCount = 0;
     for (size_t i = 0; i < snapshotCount; i++) {
-        const auto& net = *snapshot[i];
-        
-        // Skip networks that don't match current filter
-        if (!matchesFilterRender(net)) continue;
-        
+        const SpectrumRenderNet* net = snapshot[i];
+        if (!matchesFilterRender(*net)) continue;
+        visible[visibleCount++] = net;
+    }
+
+    size_t start = 0;
+    size_t topLimit = Config::wifi().spectrumTopN;
+    if (topLimit > MAX_SPECTRUM_NETWORKS) topLimit = MAX_SPECTRUM_NETWORKS;
+    if (topLimit > 0 && visibleCount > topLimit) {
+        start = visibleCount - topLimit;
+    }
+
+    // Draw each network's Gaussian lobe (only if matches filter)
+    for (size_t i = start; i < visibleCount; i++) {
+        const auto& net = *visible[i];
+
         // Use smoothed display frequency to prevent left/right jitter
         float freq = net.displayFreqMHz;
-        
+
         // Check if selected (compare by BSSID)
         bool isSelected = false;
         if (renderSelected.valid) {
             isSelected = (memcmp(net.bssid, renderSelected.bssid, 6) == 0);
         }
-        
+
         drawGaussianLobe(canvas, freq, net.rssi, isSelected);
     }
 }
@@ -1174,6 +1231,9 @@ void SpectrumMode::updateDialChannel() {
     if (monitoringNetwork) return;
 
     uint32_t now = millis();
+    uint32_t staleMs = Config::wifi().spectrumStaleMs;
+    if (staleMs < 1000) staleMs = 1000;
+    if (staleMs > 60000) staleMs = 60000;
     
     // ==[ PPS UPDATE ]== once per second
     if (now - lastPpsUpdate >= 1000) {
@@ -1312,8 +1372,8 @@ void SpectrumMode::pruneStale() {
     // Remove networks not seen recently
     networks.erase(
         std::remove_if(networks.begin(), networks.end(), 
-            [now](const SpectrumNetwork& n) {
-                return (now - n.lastSeen) > STALE_TIMEOUT_MS;
+            [now, staleMs](const SpectrumNetwork& n) {
+                return (now - n.lastSeen) > staleMs;
             }),
         networks.end()
     );

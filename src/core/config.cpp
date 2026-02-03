@@ -263,10 +263,14 @@ bool Config::load() {
 
     // WiFi config
     if (doc["wifi"].is<JsonObject>()) {
-        wifiConfig.channelHopInterval = doc["wifi"]["channelHopInterval"] | 500;
+        wifiConfig.channelHopInterval = doc["wifi"]["channelHopInterval"] | 150;
         wifiConfig.lockTime = doc["wifi"]["lockTime"] | 12000;
         wifiConfig.enableDeauth = doc["wifi"]["enableDeauth"] | true;
         wifiConfig.randomizeMAC = doc["wifi"]["randomizeMAC"] | true;
+        wifiConfig.spectrumMinRssi = doc["wifi"]["spectrumMinRssi"] | -95;
+        wifiConfig.spectrumTopN = doc["wifi"]["spectrumTopN"] | 0;
+        wifiConfig.spectrumStaleMs = doc["wifi"]["spectrumStaleMs"] | 5000;
+        wifiConfig.spectrumCollapseSsid = doc["wifi"]["spectrumCollapseSsid"] | false;
         const char* ssid = doc["wifi"]["otaSSID"] | "";
         strncpy(wifiConfig.otaSSID, ssid, sizeof(wifiConfig.otaSSID) - 1);
         wifiConfig.otaSSID[sizeof(wifiConfig.otaSSID) - 1] = '\0';
@@ -403,6 +407,10 @@ bool Config::save() {
     doc["wifi"]["lockTime"] = wifiConfig.lockTime;
     doc["wifi"]["enableDeauth"] = wifiConfig.enableDeauth;
     doc["wifi"]["randomizeMAC"] = wifiConfig.randomizeMAC;
+    doc["wifi"]["spectrumMinRssi"] = wifiConfig.spectrumMinRssi;
+    doc["wifi"]["spectrumTopN"] = wifiConfig.spectrumTopN;
+    doc["wifi"]["spectrumStaleMs"] = wifiConfig.spectrumStaleMs;
+    doc["wifi"]["spectrumCollapseSsid"] = wifiConfig.spectrumCollapseSsid;
     doc["wifi"]["otaSSID"] = wifiConfig.otaSSID;
     doc["wifi"]["otaPassword"] = wifiConfig.otaPassword;
     doc["wifi"]["autoConnect"] = wifiConfig.autoConnect;
