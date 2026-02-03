@@ -79,6 +79,7 @@ struct WiFiConfig {
     uint8_t spectrumTopN = 0;           // Spectrum: cap visible APs (0 = no cap)
     uint16_t spectrumStaleMs = 5000;    // Spectrum: stale timeout before drop (ms)
     bool spectrumCollapseSsid = false;  // Spectrum: merge same-SSID APs
+    bool spectrumTiltEnabled = true;    // Spectrum: enable tilt-to-tune
     char otaSSID[33];
     char otaPassword[65];
     bool autoConnect = false;

@@ -39,6 +39,7 @@ enum SettingId : uint8_t {
     SET_WIGLE_LOAD,
     SET_CH_HOP,
     SET_SPEC_SWEEP,
+    SET_SPEC_TILT,
     SET_LOCK_TIME,
     SET_DEAUTH,
     SET_RND_MAC,
@@ -117,6 +118,7 @@ static const EntryData kIntegEntries[] = {
 static const EntryData kRadioEntries[] = {
     {SET_CH_HOP, "STREET SW33P", SettingType::VALUE, 50, 2000, 50, "MS", "HOP SPEED"},
     {SET_SPEC_SWEEP, "SWEEP SPD", SettingType::VALUE, 50, 2000, 50, "MS", "SPECTRUM SWEEP"},
+    {SET_SPEC_TILT, "TILT TUNE", SettingType::TOGGLE, 0, 1, 1, "", "TILT TO TUNE"},
     {SET_LOCK_TIME, "GL4SS ST4R3", SettingType::VALUE, 1000, 10000, 500, "MS", "HOW LONG YOU HOLD A TARGET"},
     {SET_DEAUTH, "DEAUTH", SettingType::TOGGLE, 0, 1, 1, "", "KICK CLIENTS OFF APS"},
     {SET_RND_MAC, "RND MAC", SettingType::TOGGLE, 0, 1, 1, "", "NEW MAC EACH MODE START"},
@@ -187,6 +189,7 @@ static bool isConfigSetting(SettingId id) {
         case SET_WIFI_PASS:
         case SET_CH_HOP:
         case SET_SPEC_SWEEP:
+        case SET_SPEC_TILT:
         case SET_LOCK_TIME:
         case SET_DEAUTH:
         case SET_RND_MAC:
@@ -466,6 +469,8 @@ static int getSettingValue(SettingId id) {
             return Config::wifi().channelHopInterval;
         case SET_SPEC_SWEEP:
             return Config::wifi().spectrumHopInterval;
+        case SET_SPEC_TILT:
+            return Config::wifi().spectrumTiltEnabled ? 1 : 0;
         case SET_LOCK_TIME:
             return Config::wifi().lockTime;
         case SET_DEAUTH:
@@ -569,6 +574,12 @@ static bool setSettingValue(SettingId id, int value) {
             uint16_t newVal = static_cast<uint16_t>(value);
             if (Config::wifi().spectrumHopInterval == newVal) return false;
             Config::wifi().spectrumHopInterval = newVal;
+            return true;
+        }
+        case SET_SPEC_TILT: {
+            bool enabled = value != 0;
+            if (Config::wifi().spectrumTiltEnabled == enabled) return false;
+            Config::wifi().spectrumTiltEnabled = enabled;
             return true;
         }
         case SET_LOCK_TIME: {

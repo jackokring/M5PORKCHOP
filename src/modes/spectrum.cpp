@@ -361,6 +361,13 @@ void SpectrumMode::update() {
     if (!running) return;
     
     uint32_t now = millis();
+
+    // ==[ PPS UPDATE ]== once per second
+    if (now - lastPpsUpdate >= 1000) {
+        displayPps = ppsCounter;
+        ppsCounter = 0;
+        lastPpsUpdate = now;
+    }
     
     // Process deferred reveal logging (from callback)
     if (pendingReveal) {
@@ -1057,13 +1064,15 @@ void SpectrumMode::drawFilterBar(M5Canvas& canvas) {
 
 // Draw dial mode info bar (top-right when device upright)
 void SpectrumMode::drawDialInfo(M5Canvas& canvas) {
-    if (!dialMode) return;
+    if (!dialMode && !renderSelected.valid) return;
     
     // Show channel info at top-right, above spectrum
     int infoY = 4;  // top margin
     
     char info[32];
-    uint16_t freq = (uint16_t)channelToFreq(dialChannel);  // MHz as integer
+    uint8_t channel = dialMode ? dialChannel : renderSelected.channel;
+    const char* prefix = dialMode ? (dialLocked ? "LCK" : "CH") : "SEL";
+    uint16_t freq = (uint16_t)channelToFreq(channel);  // MHz as integer
     
     // Format pps
     char ppsStr[8];
@@ -1074,11 +1083,7 @@ void SpectrumMode::drawDialInfo(M5Canvas& canvas) {
     }
     
     // Format: "CH7 2442MHz 42pps" or "LCK7 2442MHz 42pps"
-    if (dialLocked) {
-        snprintf(info, sizeof(info), "LCK%d %dMHz %spps", dialChannel, freq, ppsStr);
-    } else {
-        snprintf(info, sizeof(info), "CH%d %dMHz %spps", dialChannel, freq, ppsStr);
-    }
+    snprintf(info, sizeof(info), "%s%d %dMHz %spps", prefix, channel, freq, ppsStr);
     
     canvas.setTextSize(1);
     canvas.setTextColor(COLOR_FG);
@@ -1667,20 +1672,25 @@ void SpectrumMode::updateDialChannel() {
     // Skip if not Cardputer ADV (no accelerometer on regular Cardputer)
     if (M5.getBoard() != m5::board_t::board_M5CardputerADV) return;
     
+    // Skip if tilt-to-tune is disabled
+    if (!Config::wifi().spectrumTiltEnabled) {
+        if (dialMode) {
+            dialMode = false;
+            dialLocked = false;
+            if (NetworkRecon::isChannelLocked()) {
+                NetworkRecon::unlockChannel();
+            }
+        }
+        return;
+    }
+    
     // Skip if in client monitor mode
     if (monitoringNetwork) return;
-
+    
     uint32_t now = millis();
     uint32_t staleMs = Config::wifi().spectrumStaleMs;
     if (staleMs < 1000) staleMs = 1000;
     if (staleMs > 60000) staleMs = 60000;
-    
-    // ==[ PPS UPDATE ]== once per second
-    if (now - lastPpsUpdate >= 1000) {
-        displayPps = ppsCounter;
-        ppsCounter = 0;
-        lastPpsUpdate = now;
-    }
     
     // ==[ READ IMU ]== accelerometer
     float ax, ay, az;

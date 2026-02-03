@@ -299,6 +299,7 @@ bool Config::load() {
         int staleMs = doc["wifi"]["spectrumStaleMs"] | 5000;
         wifiConfig.spectrumStaleMs = clampU16(staleMs, 1000, 20000);
         wifiConfig.spectrumCollapseSsid = doc["wifi"]["spectrumCollapseSsid"] | false;
+        wifiConfig.spectrumTiltEnabled = doc["wifi"]["spectrumTiltEnabled"] | true;
         const char* ssid = doc["wifi"]["otaSSID"] | "";
         strncpy(wifiConfig.otaSSID, ssid, sizeof(wifiConfig.otaSSID) - 1);
         wifiConfig.otaSSID[sizeof(wifiConfig.otaSSID) - 1] = '\0';
@@ -441,6 +442,7 @@ bool Config::save() {
     doc["wifi"]["spectrumTopN"] = wifiConfig.spectrumTopN;
     doc["wifi"]["spectrumStaleMs"] = wifiConfig.spectrumStaleMs;
     doc["wifi"]["spectrumCollapseSsid"] = wifiConfig.spectrumCollapseSsid;
+    doc["wifi"]["spectrumTiltEnabled"] = wifiConfig.spectrumTiltEnabled;
     doc["wifi"]["otaSSID"] = wifiConfig.otaSSID;
     doc["wifi"]["otaPassword"] = wifiConfig.otaPassword;
     doc["wifi"]["autoConnect"] = wifiConfig.autoConnect;
