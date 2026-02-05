@@ -76,6 +76,7 @@ struct WiFiConfig {
     bool enableDeauth = true;
     bool randomizeMAC = true;           // Randomize MAC on mode start for stealth
     int8_t spectrumMinRssi = -95;       // Spectrum: minimum RSSI to render (dBm)
+    int8_t attackMinRssi = -70;          // OINK/DNH: ignore networks weaker than this (dBm)
     uint8_t spectrumTopN = 0;           // Spectrum: cap visible APs (0 = no cap)
     uint16_t spectrumStaleMs = 5000;    // Spectrum: stale timeout before drop (ms)
     bool spectrumCollapseSsid = false;  // Spectrum: merge same-SSID APs

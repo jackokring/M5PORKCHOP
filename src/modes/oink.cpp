@@ -62,8 +62,10 @@ static volatile bool pendingPMKIDCapture = false;
 static char pendingPMKIDSSID[33] = {0};
 
 // Callback for NetworkRecon new network discovery -> XP events
-static void onNewNetworkDiscovered(wifi_auth_mode_t authmode, bool isHidden, 
+static void onNewNetworkDiscovered(wifi_auth_mode_t authmode, bool isHidden,
                                    const char* ssid, int8_t rssi, uint8_t channel) {
+    // Skip weak networks — not actionable for attack modes
+    if (rssi < Config::wifi().attackMinRssi) return;
     // Queue mood event for main thread (Mood::onNewNetwork triggers XP::addXP)
     if (!pendingNewNetwork) {
         if (ssid) {
@@ -3097,6 +3099,8 @@ static inline bool isEligibleTarget(const DetectedNetwork& net, uint32_t now) {
     if (net.hasHandshake) return false;
     if (net.authmode == WIFI_AUTH_OPEN) return false;
     if (net.attackAttempts >= TARGET_MAX_ATTEMPTS) return false;
+    int8_t rssi = (net.rssiAvg != 0) ? net.rssiAvg : net.rssi;
+    if (rssi < Config::wifi().attackMinRssi) return false;
     return true;
 }
 

@@ -87,7 +87,7 @@ private:
 #if WARHOG_ENABLE_ENHANCED
     static std::map<uint64_t, WiFiFeatures> beaconFeatures;
     static std::atomic<uint32_t> beaconCount;  // Atomic for thread-safe access from callback + main
-    static volatile bool beaconMapBusy;
+    static std::atomic<bool> beaconMapBusy;  // Atomic for cross-core visibility (WiFi task → main loop)
     static constexpr uint16_t kBeaconQueueSize = 64;
     struct PendingBeaconFeature {
         uint64_t key;

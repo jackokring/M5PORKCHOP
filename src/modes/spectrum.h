@@ -130,7 +130,7 @@ private:
     static char pendingRevealSSID[33];
     
     // Deferred network add (avoid push_back in callback - ESP32 dual-core race)
-    static volatile bool pendingNetworkAdd;
+    static std::atomic<bool> pendingNetworkAdd;  // Atomic for cross-core visibility (WiFi task → main loop)
     static SpectrumNetwork pendingNetwork;
     
     // Client monitoring state [P1] [P2]

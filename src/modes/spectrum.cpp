@@ -157,7 +157,7 @@ uint32_t SpectrumMode::startTime = 0;
 SpectrumFilter SpectrumMode::filter = SpectrumFilter::ALL;
 volatile bool SpectrumMode::pendingReveal = false;
 char SpectrumMode::pendingRevealSSID[33] = {0};
-volatile bool SpectrumMode::pendingNetworkAdd = false;
+std::atomic<bool> SpectrumMode::pendingNetworkAdd{false};
 SpectrumNetwork SpectrumMode::pendingNetwork = {0};
 
 // Client monitoring state
@@ -240,7 +240,7 @@ void SpectrumMode::init() {
     busy = false;
     pendingReveal = false;
     pendingRevealSSID[0] = 0;
-    pendingNetworkAdd = false;
+    pendingNetworkAdd.store(false);
     memset(&pendingNetwork, 0, sizeof(pendingNetwork));
     filter = SpectrumFilter::ALL;
     
@@ -394,7 +394,7 @@ void SpectrumMode::update() {
     // Process deferred network add from onBeacon callback (ESP32 dual-core race fix)
     // push_back can reallocate vector, invalidating iterators in concurrent callback
     // [BUG FIX] Technique 4 (reserve pattern) + Technique 7 (recovery) per HEAP_MANAGEMENT.txt
-    if (pendingNetworkAdd) {
+    if (pendingNetworkAdd.load()) {
         // Technique 4: Reserve capacity OUTSIDE busy region
         bool canGrow = (networks.size() < networks.capacity());
         
@@ -402,18 +402,20 @@ void SpectrumMode::update() {
             // Check heap threshold (20KB) before growth operations
             if (HeapGates::canGrow(HeapPolicy::kMinHeapForSpectrumGrowth,
                                    HeapPolicy::kMinFragRatioForGrowth)) {
+                busy = true;  // [BUG8 FIX] Guard reserve - reallocation invalidates callback references
                 networks.reserve(networks.capacity() + 10);  // Grow by 10 slots
+                busy = false;
                 canGrow = true;
             } else {
                 // Technique 7 Level 1: Recovery attempt - prune stale networks first
-                busy = true;
-                pruneStale();  // May free 2-20KB depending on stale count
-                busy = false;
-                
+                pruneStale();  // pruneStale manages its own busy guards internally
+
                 // Re-check heap after recovery
                 if (HeapGates::canGrow(HeapPolicy::kMinHeapForSpectrumGrowth,
                                        HeapPolicy::kMinFragRatioForGrowth)) {
+                    busy = true;  // [BUG8 FIX] Guard reserve after prune
                     networks.reserve(networks.capacity() + 10);
+                    busy = false;
                     canGrow = true;
                 }
                 // else: recovery failed, skip this add (better than crash)
@@ -446,7 +448,7 @@ void SpectrumMode::update() {
         if ((inserted || replaced) && selectedIndex < 0) {
             selectedIndex = 0;
         }
-        pendingNetworkAdd = false;
+        pendingNetworkAdd.store(false);
         busy = false;
     }
     
@@ -1953,9 +1955,9 @@ void SpectrumMode::onBeacon(const uint8_t* bssid, uint8_t channel, bool channelT
     
     // Defer push_back to main loop (ESP32 dual-core race: callback can run concurrent with update())
     // If pendingNetworkAdd already set, we lose one add - acceptable tradeoff for safety
-    if (!pendingNetworkAdd) {
+    if (!pendingNetworkAdd.load()) {
         pendingNetwork = net;
-        pendingNetworkAdd = true;
+        pendingNetworkAdd.store(true);
         // Defer XP to main loop (onBeacon runs in WiFi callback - can't call Display::showLevelUp)
         if (pendingNetworkXP < 255) pendingNetworkXP++;
     }

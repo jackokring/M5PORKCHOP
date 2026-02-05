@@ -105,8 +105,8 @@ static void onNewNetworkDiscovered(wifi_auth_mode_t authmode, bool isHidden,
     (void)authmode;
     (void)isHidden;
     (void)ssid;
-    (void)rssi;
     (void)channel;
+    if (rssi < Config::wifi().attackMinRssi) return;  // Skip weak networks
     XP::addXP(XPEvent::DNH_NETWORK_PASSIVE);
 }
 
@@ -1550,6 +1550,7 @@ void DoNoHamMode::handleProbeResponse(const uint8_t* frame, uint16_t len, int8_t
 void DoNoHamMode::handleEAPOL(const uint8_t* frame, uint16_t len, int8_t rssi) {
     if (!running) return;
     if (dnhBusy) return;  // Skip if update() is processing vectors
+    if (rssi < Config::wifi().attackMinRssi) return;  // Too weak to capture reliably
     
     // Parse 802.11 data frame to find EAPOL
     // Frame: FC(2) + Duration(2) + Addr1(6) + Addr2(6) + Addr3(6) + Seq(2) = 24 bytes

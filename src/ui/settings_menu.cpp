@@ -43,6 +43,7 @@ enum SettingId : uint8_t {
     SET_LOCK_TIME,
     SET_DEAUTH,
     SET_RND_MAC,
+    SET_ATK_RSSI,
     SET_SPEC_RSSI,
     SET_SPEC_TOP,
     SET_SPEC_STALE,
@@ -122,6 +123,7 @@ static const EntryData kRadioEntries[] = {
     {SET_LOCK_TIME, "GL4SS ST4R3", SettingType::VALUE, 1000, 10000, 500, "MS", "HOW LONG YOU HOLD A TARGET"},
     {SET_DEAUTH, "DEAUTH", SettingType::TOGGLE, 0, 1, 1, "", "KICK CLIENTS OFF APS"},
     {SET_RND_MAC, "RND MAC", SettingType::TOGGLE, 0, 1, 1, "", "NEW MAC EACH MODE START"},
+    {SET_ATK_RSSI, "ATK RSSI", SettingType::VALUE, -90, -50, 5, "DB", "SKIP WEAK NETS IN OINK/DNH"},
     {SET_SPEC_RSSI, "RSSI CUT", SettingType::VALUE, -95, -30, 5, "DB", "HIDE WEAK APS"},
     {SET_SPEC_TOP, "TOP APS", SettingType::VALUE, 0, 100, 5, "AP", "0 = NO CAP"},
     {SET_SPEC_STALE, "STALE SEC", SettingType::VALUE, 1, 20, 1, "S", "DROP QUIET APS"},
@@ -193,6 +195,7 @@ static bool isConfigSetting(SettingId id) {
         case SET_LOCK_TIME:
         case SET_DEAUTH:
         case SET_RND_MAC:
+        case SET_ATK_RSSI:
         case SET_SPEC_RSSI:
         case SET_SPEC_TOP:
         case SET_SPEC_STALE:
@@ -477,6 +480,8 @@ static int getSettingValue(SettingId id) {
             return Config::wifi().enableDeauth ? 1 : 0;
         case SET_RND_MAC:
             return Config::wifi().randomizeMAC ? 1 : 0;
+        case SET_ATK_RSSI:
+            return Config::wifi().attackMinRssi;
         case SET_SPEC_RSSI:
             return Config::wifi().spectrumMinRssi;
         case SET_SPEC_TOP:
@@ -598,6 +603,15 @@ static bool setSettingValue(SettingId id, int value) {
             bool enabled = value != 0;
             if (Config::wifi().randomizeMAC == enabled) return false;
             Config::wifi().randomizeMAC = enabled;
+            return true;
+        }
+        case SET_ATK_RSSI: {
+            int newVal = value;
+            if (newVal < -90) newVal = -90;
+            if (newVal > -50) newVal = -50;
+            int8_t rssi = static_cast<int8_t>(newVal);
+            if (Config::wifi().attackMinRssi == rssi) return false;
+            Config::wifi().attackMinRssi = rssi;
             return true;
         }
         case SET_SPEC_RSSI: {

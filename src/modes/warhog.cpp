@@ -126,7 +126,7 @@ bool WarhogMode::enhancedMode = false;
 #if WARHOG_ENABLE_ENHANCED
 std::map<uint64_t, WiFiFeatures> WarhogMode::beaconFeatures;
 std::atomic<uint32_t> WarhogMode::beaconCount{0};  // Atomic for thread-safe callback + main access
-volatile bool WarhogMode::beaconMapBusy = false;
+std::atomic<bool> WarhogMode::beaconMapBusy{false};
 WarhogMode::PendingBeaconFeature WarhogMode::beaconQueue[WarhogMode::kBeaconQueueSize] = {};
 std::atomic<uint16_t> WarhogMode::beaconQueueHead{0};
 std::atomic<uint16_t> WarhogMode::beaconQueueTail{0};
@@ -220,7 +220,7 @@ bool WarhogMode::enqueueBeaconFeature(uint64_t key, const WiFiFeatures& features
 void WarhogMode::processBeaconQueue() {
 #if WARHOG_ENABLE_ENHANCED
     if (!running || !enhancedMode) return;
-    if (!beaconMutex || beaconMapBusy) return;
+    if (!beaconMutex || beaconMapBusy.load()) return;
 
     if (xSemaphoreTake(beaconMutex, pdMS_TO_TICKS(5)) != pdTRUE) {
         return;
@@ -257,7 +257,7 @@ void WarhogMode::processBeaconQueue() {
 
 void WarhogMode::clearBeaconFeatures() {
 #if WARHOG_ENABLE_ENHANCED
-    beaconMapBusy = true;
+    beaconMapBusy.store(true);
     resetBeaconQueue();
     // Ensure we're not stuck waiting indefinitely for the mutex
     if (beaconMutex) {
@@ -272,7 +272,7 @@ void WarhogMode::clearBeaconFeatures() {
         beaconFeatures.clear();
         beaconCount = 0;
     }
-    beaconMapBusy = false;
+    beaconMapBusy.store(false);
 #endif
 }
 
@@ -549,14 +549,14 @@ void WarhogMode::update() {
     if (enhancedMode && now - lastBeaconCleanup > 10000) {
         // Only clear if map is getting large (>200 entries = ~25KB)
         if (beaconFeatures.size() > 200) {
-            beaconMapBusy = true;
+            beaconMapBusy.store(true);
             resetBeaconQueue();
             if (beaconMutex && xSemaphoreTake(beaconMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                 beaconFeatures.clear();
                 beaconCount = 0;
                 xSemaphoreGive(beaconMutex);
             }
-            beaconMapBusy = false;
+            beaconMapBusy.store(false);
         }
         lastBeaconCleanup = now;
     }
@@ -993,7 +993,7 @@ void WarhogMode::processScanResults() {
         // Extract ML features (basic by default)
         WiFiFeatures features = FeatureExtractor::extractBasic(rssi, channel, authmode);
 #if WARHOG_ENABLE_ENHANCED
-        if (enhancedMode && beaconMutex && !beaconMapBusy) {
+        if (enhancedMode && beaconMutex && !beaconMapBusy.load()) {
             bool found = false;
             // Use timeout for mutex to prevent indefinite blocking
             if (xSemaphoreTake(beaconMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -1218,7 +1218,7 @@ String WarhogMode::generateFilename(const char* ext) {
 void WarhogMode::promiscuousCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
 #if WARHOG_ENABLE_ENHANCED
     if (type != WIFI_PKT_MGMT) return;
-    if (beaconMapBusy) return;
+    if (beaconMapBusy.load()) return;
     if (!buf) return;  // Null check for safety
     
     wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;

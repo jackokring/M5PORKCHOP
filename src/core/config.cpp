@@ -52,6 +52,7 @@ static void sanitizeWiFiConfig(WiFiConfig& cfg) {
     cfg.channelHopInterval = clampU16(cfg.channelHopInterval, 50, 2000);
     cfg.spectrumHopInterval = clampU16(cfg.spectrumHopInterval, 50, 2000);
     cfg.spectrumMinRssi = clampI8(cfg.spectrumMinRssi, -95, -30);
+    cfg.attackMinRssi = clampI8(cfg.attackMinRssi, -90, -50);
     if (cfg.spectrumTopN > 100) cfg.spectrumTopN = 100;
     cfg.spectrumStaleMs = clampU16(cfg.spectrumStaleMs, 1000, 20000);
 }
@@ -290,6 +291,8 @@ bool Config::load() {
         wifiConfig.lockTime = doc["wifi"]["lockTime"] | 12000;
         wifiConfig.enableDeauth = doc["wifi"]["enableDeauth"] | true;
         wifiConfig.randomizeMAC = doc["wifi"]["randomizeMAC"] | true;
+        int attackRssi = doc["wifi"]["attackMinRssi"] | -70;
+        wifiConfig.attackMinRssi = clampI8(attackRssi, -90, -50);
         int minRssi = doc["wifi"]["spectrumMinRssi"] | -95;
         wifiConfig.spectrumMinRssi = clampI8(minRssi, -95, -30);
         int topN = doc["wifi"]["spectrumTopN"] | 0;
@@ -438,6 +441,7 @@ bool Config::save() {
     doc["wifi"]["lockTime"] = wifiConfig.lockTime;
     doc["wifi"]["enableDeauth"] = wifiConfig.enableDeauth;
     doc["wifi"]["randomizeMAC"] = wifiConfig.randomizeMAC;
+    doc["wifi"]["attackMinRssi"] = wifiConfig.attackMinRssi;
     doc["wifi"]["spectrumMinRssi"] = wifiConfig.spectrumMinRssi;
     doc["wifi"]["spectrumTopN"] = wifiConfig.spectrumTopN;
     doc["wifi"]["spectrumStaleMs"] = wifiConfig.spectrumStaleMs;
