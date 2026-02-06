@@ -194,8 +194,9 @@ uint8_t* OinkMode::beaconFrame = beaconFrameStorage;
 uint16_t OinkMode::beaconFrameLen = 0;
 std::atomic<bool> OinkMode::beaconCaptured{false};  // Atomic initialization for thread safety
 
-// BOAR BROS - excluded networks
-std::map<uint64_t, String> OinkMode::boarBros;
+// BOAR BROS - excluded networks (fixed array in BSS, zero heap)
+OinkMode::BoarBro OinkMode::boarBros[50] = {};
+uint16_t OinkMode::boarBrosCount = 0;
 static const size_t MAX_BOAR_BROS = 50;  // Max excluded networks
 
 // Channel hop order (most common channels first)
@@ -286,7 +287,7 @@ static bool hasPendingHandshake = false;
 static bool boredStateReset = true;  // Flag to reset on start()
 
 // Last pwned network SSID for display
-static String lastPwnedSSID = "";
+static char lastPwnedSSID[33] = "";
 
 void OinkMode::init() {
     // #region agent log
@@ -355,7 +356,7 @@ void OinkMode::init() {
     stateStartTime = 0;
     attackStartTime = 0;
     lastDeauthTime = 0;
-    lastPwnedSSID = "";
+    lastPwnedSSID[0] = '\0';
     lastMoodUpdate = 0;
     lastRandomSniff = 0;
     checkedForPendingHandshake = false;
@@ -555,7 +556,8 @@ void OinkMode::update() {
     NetworkRecon::exitCritical();
     if (hasPendingHandshakeDone) {
         Mood::onHandshakeCaptured(pendingHandshakeCopy);
-        lastPwnedSSID = String(pendingHandshakeCopy);
+        strncpy(lastPwnedSSID, pendingHandshakeCopy, sizeof(lastPwnedSSID) - 1);
+        lastPwnedSSID[sizeof(lastPwnedSSID) - 1] = '\0';
         Display::showLoot(lastPwnedSSID);  // Show PWNED banner in top bar
     }
     
@@ -572,7 +574,8 @@ void OinkMode::update() {
     NetworkRecon::exitCritical();
     if (hasPendingPMKID) {
         Mood::onPMKIDCaptured(pendingPMKIDCopy);
-        lastPwnedSSID = String(pendingPMKIDCopy);  // PMKID counts as pwned!
+        strncpy(lastPwnedSSID, pendingPMKIDCopy, sizeof(lastPwnedSSID) - 1);
+        lastPwnedSSID[sizeof(lastPwnedSSID) - 1] = '\0';
         Display::showLoot(lastPwnedSSID);  // Show PWNED banner in top bar
         SDLog::log("OINK", "PMKID captured: %s", pendingPMKIDCopy);
         
@@ -3206,11 +3209,15 @@ uint64_t OinkMode::bssidToUint64(const uint8_t* bssid) {
 }
 
 bool OinkMode::isExcluded(const uint8_t* bssid) {
-    return boarBros.count(bssidToUint64(bssid)) > 0;
+    uint64_t key = bssidToUint64(bssid);
+    for (uint16_t i = 0; i < boarBrosCount; i++) {
+        if (boarBros[i].bssid == key) return true;
+    }
+    return false;
 }
 
 uint16_t OinkMode::getExcludedCount() {
-    return boarBros.size();
+    return boarBrosCount;
 }
 
 uint16_t OinkMode::getFilteredCount() {
@@ -3218,7 +3225,8 @@ uint16_t OinkMode::getFilteredCount() {
 }
 
 bool OinkMode::loadBoarBros() {
-    boarBros.clear();
+    boarBrosCount = 0;
+    memset(boarBros, 0, sizeof(boarBros));
 
     const char* boarPath = SDLayout::boarBrosPath();
     if (!SD.exists(boarPath)) {
@@ -3229,45 +3237,58 @@ bool OinkMode::loadBoarBros() {
     if (!f) {
         return false;
     }
-    
-    String line;
-    line.reserve(128);  // Pre-allocate to reduce heap fragmentation
-    while (f.available() && boarBros.size() < MAX_BOAR_BROS) {
-        line = f.readStringUntil('\n');  // Reuses existing capacity
-        line.trim();
-        
+
+    char lineBuf[128];
+    while (f.available() && boarBrosCount < MAX_BOAR_BROS) {
+        // Read line manually into stack buffer
+        int pos = 0;
+        while (f.available() && pos < (int)sizeof(lineBuf) - 1) {
+            char c = f.read();
+            if (c == '\n') break;
+            if (c != '\r') lineBuf[pos++] = c;
+        }
+        lineBuf[pos] = '\0';
+
+        // Trim leading spaces
+        char* line = lineBuf;
+        while (*line == ' ' || *line == '\t') line++;
+
         // Skip empty lines and comments
-        if (line.length() == 0 || line.startsWith("#")) continue;
-        
+        if (line[0] == '\0' || line[0] == '#') continue;
+
         // Format: AABBCCDDEEFF  Optional SSID comment
         // Parse first 12 hex chars as BSSID
-        if (line.length() >= 12) {
-            String hexBssid = line.substring(0, 12);
-            hexBssid.toUpperCase();
-            
+        int lineLen = strlen(line);
+        if (lineLen >= 12) {
             uint64_t bssid = 0;
             bool valid = true;
             for (int i = 0; i < 12; i++) {
-                char c = hexBssid.charAt(i);
+                char c = toupper((unsigned char)line[i]);
                 uint8_t nibble;
                 if (c >= '0' && c <= '9') nibble = c - '0';
                 else if (c >= 'A' && c <= 'F') nibble = c - 'A' + 10;
                 else { valid = false; break; }
                 bssid = (bssid << 4) | nibble;
             }
-            
+
             if (valid) {
+                boarBros[boarBrosCount].bssid = bssid;
                 // Extract SSID from rest of line (after space)
-                String ssid = "";
-                if (line.length() > 13) {
-                    ssid = line.substring(13);
-                    ssid.trim();
+                if (lineLen > 13) {
+                    char* ssidStart = line + 13;
+                    while (*ssidStart == ' ' || *ssidStart == '\t') ssidStart++;
+                    // Trim trailing spaces
+                    int ssidLen = strlen(ssidStart);
+                    while (ssidLen > 0 && (ssidStart[ssidLen-1] == ' ' || ssidStart[ssidLen-1] == '\t')) ssidLen--;
+                    if (ssidLen > 32) ssidLen = 32;
+                    memcpy(boarBros[boarBrosCount].ssid, ssidStart, ssidLen);
+                    boarBros[boarBrosCount].ssid[ssidLen] = '\0';
                 }
-                boarBros[bssid] = ssid;
+                boarBrosCount++;
             }
         }
     }
-    
+
     f.close();
     return true;
 }
@@ -3294,11 +3315,10 @@ bool OinkMode::saveBoarBros() {
         return false;
     }
     f.println("# Format: BSSID (12 hex chars) followed by optional SSID");
-    
-    for (const auto& entry : boarBros) {
-        uint64_t bssid = entry.first;
-        const String& ssid = entry.second;
-        
+
+    for (uint16_t i = 0; i < boarBrosCount; i++) {
+        uint64_t bssid = boarBros[i].bssid;
+
         // Convert uint64 back to hex string
         char hex[13];
         snprintf(hex, sizeof(hex), "%02X%02X%02X%02X%02X%02X",
@@ -3308,9 +3328,9 @@ bool OinkMode::saveBoarBros() {
                  (uint8_t)((bssid >> 16) & 0xFF),
                  (uint8_t)((bssid >> 8) & 0xFF),
                  (uint8_t)(bssid & 0xFF));
-        
-        if (ssid.length() > 0) {
-            f.printf("%s %s\n", hex, ssid.c_str());
+
+        if (boarBros[i].ssid[0] != '\0') {
+            f.printf("%s %s\n", hex, boarBros[i].ssid);
         } else {
             f.println(hex);
         }
@@ -3321,7 +3341,17 @@ bool OinkMode::saveBoarBros() {
 }
 
 void OinkMode::removeBoarBro(uint64_t bssid) {
-    boarBros.erase(bssid);
+    for (uint16_t i = 0; i < boarBrosCount; i++) {
+        if (boarBros[i].bssid == bssid) {
+            // Shift remaining entries down
+            if (i < boarBrosCount - 1) {
+                memmove(&boarBros[i], &boarBros[i + 1], (boarBrosCount - i - 1) * sizeof(BoarBro));
+            }
+            boarBrosCount--;
+            memset(&boarBros[boarBrosCount], 0, sizeof(BoarBro));
+            break;
+        }
+    }
     saveBoarBros();
 }
 
@@ -3387,21 +3417,24 @@ bool OinkMode::excludeNetwork(int index) {
     if (index < 0 || index >= (int)networks().size()) {
         return false;
     }
-    if (boarBros.size() >= MAX_BOAR_BROS) {
+    if (boarBrosCount >= MAX_BOAR_BROS) {
         return false;
     }
-    
+
     uint64_t bssid = bssidToUint64(networks()[index].bssid);
-    
+
     // Check if already excluded
-    if (boarBros.count(bssid) > 0) {
+    if (isExcluded(networks()[index].bssid)) {
         return false;
     }
-    
+
     // Store BSSID with SSID (use NONAME BRO for hidden networks)
-    String ssid = String(networks()[index].ssid);
-    if (ssid.length() == 0) ssid = "NONAME BRO";
-    boarBros[bssid] = ssid;
+    boarBros[boarBrosCount].bssid = bssid;
+    const char* ssid = networks()[index].ssid;
+    if (ssid[0] == '\0') ssid = "NONAME BRO";
+    strncpy(boarBros[boarBrosCount].ssid, ssid, 32);
+    boarBros[boarBrosCount].ssid[32] = '\0';
+    boarBrosCount++;
     saveBoarBros();
     
     // Check if this is a mid-attack exclusion (mercy save) vs normal exclusion
@@ -3430,20 +3463,23 @@ bool OinkMode::excludeNetwork(int index) {
 
 // Exclude network by BSSID directly (for use from other modes like SPECTRUM)
 bool OinkMode::excludeNetworkByBSSID(const uint8_t* bssid, const char* ssidIn) {
-    if (boarBros.size() >= MAX_BOAR_BROS) {
+    if (boarBrosCount >= MAX_BOAR_BROS) {
         return false;
     }
-    
+
     uint64_t bssid64 = bssidToUint64(bssid);
-    
+
     // Check if already excluded
-    if (boarBros.count(bssid64) > 0) {
+    if (isExcluded(bssid)) {
         return false;
     }
-    
+
     // Store BSSID with SSID (use NONAME BRO for hidden/empty networks)
-    String ssid = (ssidIn && ssidIn[0]) ? String(ssidIn) : "NONAME BRO";
-    boarBros[bssid64] = ssid;
+    boarBros[boarBrosCount].bssid = bssid64;
+    const char* ssid = (ssidIn && ssidIn[0]) ? ssidIn : "NONAME BRO";
+    strncpy(boarBros[boarBrosCount].ssid, ssid, 32);
+    boarBros[boarBrosCount].ssid[32] = '\0';
+    boarBrosCount++;
     saveBoarBros();
     
     // Award XP for BOAR BROS action

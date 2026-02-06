@@ -523,7 +523,6 @@ void Porkchop::setMode(PorkchopMode mode) {
             break;
         case PorkchopMode::CHARGING:
             SDLog::log("PORK", "Mode: CHARGING");
-            ChargingMode::init();
             ChargingMode::start();
             break;
         default:
@@ -965,8 +964,7 @@ void Porkchop::updateMode() {
             break;
         case PorkchopMode::CHARGING:
             ChargingMode::update();
-            // Auto-exit when unplugged
-            if (!ChargingMode::isRunning()) {
+            if (ChargingMode::shouldExit()) {
                 setMode(PorkchopMode::IDLE);
             }
             break;

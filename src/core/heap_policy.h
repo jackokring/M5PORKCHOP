@@ -38,6 +38,7 @@ namespace HeapPolicy {
     static constexpr uint32_t kHealthSampleIntervalMs = 1000;
     static constexpr uint32_t kHealthToastDurationMs = 5000;
     static constexpr uint8_t kHealthToastMinDelta = 5;
+    static constexpr uint32_t kHealthToastSettleMs = 3000;
     static constexpr uint8_t kHealthConditionTriggerPct = 65;
     static constexpr uint8_t kHealthConditionClearPct = 75;
     static constexpr uint32_t kHealthConditionCooldownMs = 30000;

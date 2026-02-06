@@ -37,6 +37,202 @@ PersonalityConfig Config::personalityConfig;
 bool Config::initialized = false;
 static bool sdAvailable = false;
 
+// ---- Binary config blob (zero heap allocation) ----
+static constexpr uint32_t CONFIG_MAGIC   = 0x504F524B;  // 'PORK'
+static constexpr uint16_t CONFIG_VERSION = 1;
+#define CONFIG_BIN_FILE "/porkchop.dat"
+
+static const char* configBinPathSD() {
+    return SDLayout::usingNewLayout()
+        ? "/m5porkchop/config/porkchop.dat"
+        : "/porkchop.dat";
+}
+
+struct __attribute__((packed)) ConfigBlob {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t blobSize;
+
+    // GPS
+    uint8_t  gpsEnabled;
+    uint8_t  gpsSource;
+    uint8_t  gpsRxPin;
+    uint8_t  gpsTxPin;
+    uint32_t gpsBaudRate;
+    uint16_t gpsUpdateInterval;
+    uint16_t gpsSleepTimeMs;
+    uint8_t  gpsPowerSave;
+    int8_t   gpsTimezoneOffset;
+
+    // WiFi
+    uint16_t channelHopInterval;
+    uint16_t spectrumHopInterval;
+    uint16_t lockTime;
+    uint8_t  enableDeauth;
+    uint8_t  randomizeMAC;
+    int8_t   spectrumMinRssi;
+    int8_t   attackMinRssi;
+    uint8_t  spectrumTopN;
+    uint16_t spectrumStaleMs;
+    uint8_t  spectrumCollapseSsid;
+    uint8_t  spectrumTiltEnabled;
+    char     otaSSID[33];
+    char     otaPassword[65];
+    uint8_t  autoConnect;
+    char     wpaSecKey[33];
+    char     wigleApiName[65];
+    char     wigleApiToken[65];
+
+    // BLE
+    uint16_t burstInterval;
+    uint16_t advDuration;
+
+    // ML (disabled but preserved for future)
+    uint8_t  mlEnabled;
+    uint8_t  mlCollectionMode;
+    char     mlModelPath[64];
+    float    mlConfidenceThreshold;
+    float    mlRogueApThreshold;
+    float    mlVulnScorerThreshold;
+    uint8_t  mlAutoUpdate;
+    char     mlUpdateUrl[128];
+};
+
+static void populateBlob(ConfigBlob& b, const GPSConfig& gps, const WiFiConfig& wifi,
+                          const BLEConfig& ble, const MLConfig& ml) {
+    memset(&b, 0, sizeof(b));
+    b.magic    = CONFIG_MAGIC;
+    b.version  = CONFIG_VERSION;
+    b.blobSize = sizeof(ConfigBlob);
+
+    b.gpsEnabled        = gps.enabled ? 1 : 0;
+    b.gpsSource         = static_cast<uint8_t>(gps.source);
+    b.gpsRxPin          = gps.rxPin;
+    b.gpsTxPin          = gps.txPin;
+    b.gpsBaudRate       = gps.baudRate;
+    b.gpsUpdateInterval = gps.updateInterval;
+    b.gpsSleepTimeMs    = gps.sleepTimeMs;
+    b.gpsPowerSave      = gps.powerSave ? 1 : 0;
+    b.gpsTimezoneOffset = gps.timezoneOffset;
+
+    b.channelHopInterval   = wifi.channelHopInterval;
+    b.spectrumHopInterval  = wifi.spectrumHopInterval;
+    b.lockTime             = wifi.lockTime;
+    b.enableDeauth         = wifi.enableDeauth ? 1 : 0;
+    b.randomizeMAC         = wifi.randomizeMAC ? 1 : 0;
+    b.spectrumMinRssi      = wifi.spectrumMinRssi;
+    b.attackMinRssi        = wifi.attackMinRssi;
+    b.spectrumTopN         = wifi.spectrumTopN;
+    b.spectrumStaleMs      = wifi.spectrumStaleMs;
+    b.spectrumCollapseSsid = wifi.spectrumCollapseSsid ? 1 : 0;
+    b.spectrumTiltEnabled  = wifi.spectrumTiltEnabled ? 1 : 0;
+    strncpy(b.otaSSID,       wifi.otaSSID,       sizeof(b.otaSSID) - 1);
+    strncpy(b.otaPassword,   wifi.otaPassword,   sizeof(b.otaPassword) - 1);
+    b.autoConnect = wifi.autoConnect ? 1 : 0;
+    strncpy(b.wpaSecKey,     wifi.wpaSecKey,     sizeof(b.wpaSecKey) - 1);
+    strncpy(b.wigleApiName,  wifi.wigleApiName,  sizeof(b.wigleApiName) - 1);
+    strncpy(b.wigleApiToken, wifi.wigleApiToken, sizeof(b.wigleApiToken) - 1);
+
+    b.burstInterval = ble.burstInterval;
+    b.advDuration   = ble.advDuration;
+
+    b.mlEnabled              = ml.enabled ? 1 : 0;
+    b.mlCollectionMode       = static_cast<uint8_t>(ml.collectionMode);
+    strncpy(b.mlModelPath, ml.modelPath, sizeof(b.mlModelPath) - 1);
+    b.mlConfidenceThreshold  = ml.confidenceThreshold;
+    b.mlRogueApThreshold     = ml.rogueApThreshold;
+    b.mlVulnScorerThreshold  = ml.vulnScorerThreshold;
+    b.mlAutoUpdate           = ml.autoUpdate ? 1 : 0;
+    strncpy(b.mlUpdateUrl, ml.updateUrl, sizeof(b.mlUpdateUrl) - 1);
+}
+
+static bool writeBlobTo(fs::FS& fs, const char* path, const ConfigBlob& b) {
+    File file = fs.open(path, FILE_WRITE);
+    if (!file) {
+        Serial.printf("[CONFIG] writeBlobTo: failed to open '%s'\n", path);
+        return false;
+    }
+    size_t written = file.write((const uint8_t*)&b, sizeof(b));
+    file.close();
+    Serial.printf("[CONFIG] writeBlobTo: %u/%u bytes -> '%s'\n",
+                  written, sizeof(b), path);
+    return written == sizeof(b);
+}
+
+static bool readBlobFrom(fs::FS& fs, const char* path, ConfigBlob& b) {
+    File file = fs.open(path, FILE_READ);
+    if (!file) return false;
+
+    size_t fileSize = file.size();
+    if (fileSize < 8) { file.close(); return false; }  // too small for header
+
+    size_t readSize = (fileSize < sizeof(b)) ? fileSize : sizeof(b);
+    memset(&b, 0, sizeof(b));
+    size_t got = file.read((uint8_t*)&b, readSize);
+    file.close();
+
+    if (got < 8 || b.magic != CONFIG_MAGIC) return false;
+    Serial.printf("[CONFIG] readBlobFrom: '%s' v%u, %u bytes\n", path, b.version, got);
+    return true;
+}
+
+static void extractBlob(const ConfigBlob& b, GPSConfig& gps, WiFiConfig& wifi,
+                         BLEConfig& ble, MLConfig& ml) {
+    gps.enabled        = b.gpsEnabled != 0;
+    gps.source         = static_cast<GPSSource>(b.gpsSource);
+    gps.rxPin          = b.gpsRxPin;
+    gps.txPin          = b.gpsTxPin;
+    gps.baudRate       = b.gpsBaudRate;
+    gps.updateInterval = b.gpsUpdateInterval;
+    gps.sleepTimeMs    = b.gpsSleepTimeMs;
+    gps.powerSave      = b.gpsPowerSave != 0;
+    gps.timezoneOffset = b.gpsTimezoneOffset;
+
+    // Auto-set pins based on source (same as JSON loader)
+    if (gps.source == GPSSource::CAP_LORA) {
+        gps.rxPin = 15; gps.txPin = 13;
+    } else if (gps.source == GPSSource::GROVE) {
+        gps.rxPin = 1;  gps.txPin = 2;
+    }
+
+    wifi.channelHopInterval   = b.channelHopInterval;
+    wifi.spectrumHopInterval  = b.spectrumHopInterval;
+    wifi.lockTime             = b.lockTime;
+    wifi.enableDeauth         = b.enableDeauth != 0;
+    wifi.randomizeMAC         = b.randomizeMAC != 0;
+    wifi.spectrumMinRssi      = b.spectrumMinRssi;
+    wifi.attackMinRssi        = b.attackMinRssi;
+    wifi.spectrumTopN         = b.spectrumTopN;
+    wifi.spectrumStaleMs      = b.spectrumStaleMs;
+    wifi.spectrumCollapseSsid = b.spectrumCollapseSsid != 0;
+    wifi.spectrumTiltEnabled  = b.spectrumTiltEnabled != 0;
+    strncpy(wifi.otaSSID,       b.otaSSID,       sizeof(wifi.otaSSID) - 1);
+    wifi.otaSSID[sizeof(wifi.otaSSID) - 1] = '\0';
+    strncpy(wifi.otaPassword,   b.otaPassword,   sizeof(wifi.otaPassword) - 1);
+    wifi.otaPassword[sizeof(wifi.otaPassword) - 1] = '\0';
+    wifi.autoConnect = b.autoConnect != 0;
+    strncpy(wifi.wpaSecKey,     b.wpaSecKey,     sizeof(wifi.wpaSecKey) - 1);
+    wifi.wpaSecKey[sizeof(wifi.wpaSecKey) - 1] = '\0';
+    strncpy(wifi.wigleApiName,  b.wigleApiName,  sizeof(wifi.wigleApiName) - 1);
+    wifi.wigleApiName[sizeof(wifi.wigleApiName) - 1] = '\0';
+    strncpy(wifi.wigleApiToken, b.wigleApiToken, sizeof(wifi.wigleApiToken) - 1);
+    wifi.wigleApiToken[sizeof(wifi.wigleApiToken) - 1] = '\0';
+
+    ble.burstInterval = b.burstInterval;
+    ble.advDuration   = b.advDuration;
+
+    ml.enabled              = b.mlEnabled != 0;
+    ml.collectionMode       = static_cast<MLCollectionMode>(b.mlCollectionMode);
+    strncpy(ml.modelPath, b.mlModelPath, sizeof(ml.modelPath) - 1);
+    ml.modelPath[sizeof(ml.modelPath) - 1] = '\0';
+    ml.confidenceThreshold  = b.mlConfidenceThreshold;
+    ml.rogueApThreshold     = b.mlRogueApThreshold;
+    ml.vulnScorerThreshold  = b.mlVulnScorerThreshold;
+    ml.autoUpdate           = b.mlAutoUpdate != 0;
+    strncpy(ml.updateUrl, b.mlUpdateUrl, sizeof(ml.updateUrl) - 1);
+    ml.updateUrl[sizeof(ml.updateUrl) - 1] = '\0';
+}
+
 static uint16_t clampU16(uint32_t value, uint16_t minVal, uint16_t maxVal) {
     if (value < minVal) return minVal;
     if (value > maxVal) return maxVal;
@@ -79,8 +275,8 @@ static void ensureSdSpiReady() {
 
 bool Config::init() {
     // Initialize SPIFFS first (always available)
-    if (!SPIFFS.begin(true)) {
-        Serial.println("[CONFIG] SPIFFS mount failed");
+    if (!SPIFFS.begin(false)) {
+        Serial.println("[CONFIG] SPIFFS mount failed (not formatting - data preserved)");
     }
 
     // Allow buses to stabilize after M5.begin()
@@ -135,16 +331,21 @@ bool Config::init() {
         savePersonalityToSPIFFS();
     }
 
-    // Load main config (SD if available, otherwise SPIFFS)
+    // Load main config: SD primary, SPIFFS fallback
+    Serial.printf("[CONFIG] Pre-load state: sdAvailable=%d, newLayout=%d\n",
+                  sdAvailable, SDLayout::usingNewLayout());
     if (!load()) {
         Serial.println("[CONFIG] Creating default config");
         createDefaultConfig();
-        save();  // persist defaults to whichever FS is active
+        save();
     }
 
-    // Try to load WPA-SEC key from file (auto-deletes after import)
+    // Try to load keys from files (auto-deletes after import)
     if (loadWpaSecKeyFromFile()) {
         Serial.println("[CONFIG] WPA-SEC key loaded from file");
+    }
+    if (loadWigleKeyFromFile()) {
+        Serial.println("[CONFIG] WiGLE API keys loaded from file");
     }
 
     initialized = true;
@@ -196,7 +397,17 @@ void Config::prepareCapLoraGpio() {
 }
 
 bool Config::reinitSD() {
-    Serial.println("[CONFIG] Attempting SD card re-initialization...");
+    // Quick check: SD still accessible? Skip destructive reinit if so.
+    if (sdAvailable && SD.exists("/")) {
+        Serial.println("[CONFIG] SD still accessible after GPS init, skipping reinit");
+        return true;
+    }
+
+    Serial.println("[CONFIG] SD access lost, attempting re-initialization...");
+
+    // Save current state to restore on failure
+    bool wasSdAvailable = sdAvailable;
+    bool wasNewLayout = SDLayout::usingNewLayout();
 
     // Clean up any existing SD state
     SD.end();
@@ -235,40 +446,47 @@ bool Config::reinitSD() {
     }
 
     if (sdAvailable) {
-        SDLayout::migrateIfNeeded();
+        // Success: verify layout by checking marker directly (no full migration)
+        if (SD.exists(SDLayout::migrationMarkerPath())) {
+            SDLayout::setUseNewLayout(true);
+        } else if (wasNewLayout) {
+            // Marker unreadable but we were using new layout — keep it
+            SDLayout::setUseNewLayout(true);
+        }
         SDLayout::ensureDirs();
         SDLog::log("CFG", "SD card re-initialized OK");
     } else {
-        SDLayout::setUseNewLayout(false);
-        Serial.println("[CONFIG] SD card reinit failed");
+        // FAIL: Restore previous state — don't corrupt flags
+        sdAvailable = wasSdAvailable;
+        SDLayout::setUseNewLayout(wasNewLayout);
+        Serial.println("[CONFIG] SD reinit failed, keeping previous SD state");
     }
 
     return sdAvailable;
 }
 
-bool Config::load() {
-    // Use SD if available, else SPIFFS fallback
-    fs::FS& cfgFS = sdAvailable ? (fs::FS&)SD : (fs::FS&)SPIFFS;
+bool Config::loadFrom(fs::FS& fs, const char* path) {
+    File file = fs.open(path, FILE_READ);
+    if (!file) return false;
 
-    const char* cfgPath = sdAvailable ? SDLayout::configPathSD() : CONFIG_FILE;
-    File file = cfgFS.open(cfgPath, FILE_READ);
-    if (!file && sdAvailable && SDLayout::usingNewLayout()) {
-        file = cfgFS.open(SDLayout::legacyConfigPath(), FILE_READ);
-    }
-    if (!file) {
-        Serial.println("[CONFIG] Cannot open config file");
-        return false;
-    }
+    size_t fileSize = file.size();
+    Serial.printf("[CONFIG] loadFrom(): '%s' size=%u bytes\n", path, fileSize);
+    if (fileSize == 0) { file.close(); return false; }
 
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, file);
     file.close();
 
     if (err) {
-        Serial.printf("[CONFIG] JSON parse error: %s\n", err.c_str());
+        Serial.printf("[CONFIG] loadFrom(): JSON error: %s ('%s')\n", err.c_str(), path);
         return false;
     }
 
+    // Populate config from parsed JSON — shared with load()
+    return applyJson(doc);
+}
+
+bool Config::applyJson(const JsonDocument& doc) {
     // GPS config
     if (doc["gps"].is<JsonObject>()) {
         gpsConfig.enabled = doc["gps"]["enabled"] | true;
@@ -298,17 +516,24 @@ bool Config::load() {
     if (doc["ml"].is<JsonObject>()) {
         mlConfig.enabled = doc["ml"]["enabled"] | true;
         mlConfig.collectionMode = static_cast<MLCollectionMode>(doc["ml"]["collectionMode"] | 0);
-        mlConfig.modelPath = doc["ml"]["modelPath"] | "/m5porkchop/models/porkchop_model.bin";
+        const char* mp = doc["ml"]["modelPath"] | "/m5porkchop/models/porkchop_model.bin";
+        strncpy(mlConfig.modelPath, mp, sizeof(mlConfig.modelPath) - 1);
+        mlConfig.modelPath[sizeof(mlConfig.modelPath) - 1] = '\0';
         if (sdAvailable && SDLayout::usingNewLayout()) {
-            if (mlConfig.modelPath.startsWith("/models/")) {
-                mlConfig.modelPath = String(SDLayout::modelsDir()) + mlConfig.modelPath.substring(7);
+            if (strncmp(mlConfig.modelPath, "/models/", 8) == 0) {
+                char tmp[64];
+                snprintf(tmp, sizeof(tmp), "%s%s", SDLayout::modelsDir(), mlConfig.modelPath + 7);
+                strncpy(mlConfig.modelPath, tmp, sizeof(mlConfig.modelPath) - 1);
+                mlConfig.modelPath[sizeof(mlConfig.modelPath) - 1] = '\0';
             }
         }
         mlConfig.confidenceThreshold = doc["ml"]["confidenceThreshold"] | 0.7f;
         mlConfig.rogueApThreshold = doc["ml"]["rogueApThreshold"] | 0.8f;
         mlConfig.vulnScorerThreshold = doc["ml"]["vulnScorerThreshold"] | 0.6f;
         mlConfig.autoUpdate = doc["ml"]["autoUpdate"] | false;
-        mlConfig.updateUrl = doc["ml"]["updateUrl"] | "";
+        const char* uu = doc["ml"]["updateUrl"] | "";
+        strncpy(mlConfig.updateUrl, uu, sizeof(mlConfig.updateUrl) - 1);
+        mlConfig.updateUrl[sizeof(mlConfig.updateUrl) - 1] = '\0';
     }
 
     // WiFi config
@@ -357,8 +582,71 @@ bool Config::load() {
         bleConfig.advDuration = doc["ble"]["advDuration"] | 100;
     }
 
-    Serial.println("[CONFIG] Loaded successfully");
+    Serial.printf("[CONFIG] Loaded OK: wpaKey=%s, wigleName=%s, wigleToken=%s, otaSSID=%s, deauth=%d, gps=%d\n",
+                  strlen(wifiConfig.wpaSecKey) > 0 ? "(SET)" : "(EMPTY)",
+                  strlen(wifiConfig.wigleApiName) > 0 ? "(SET)" : "(EMPTY)",
+                  strlen(wifiConfig.wigleApiToken) > 0 ? "(SET)" : "(EMPTY)",
+                  strlen(wifiConfig.otaSSID) > 0 ? wifiConfig.otaSSID : "(EMPTY)",
+                  wifiConfig.enableDeauth,
+                  static_cast<int>(gpsConfig.source));
     return true;
+}
+
+bool Config::load() {
+    Serial.printf("[CONFIG] load(): sdAvail=%d, newLayout=%d\n",
+                  sdAvailable, SDLayout::usingNewLayout());
+
+    ConfigBlob blob;
+
+    // 1. Try binary from SD
+    if (sdAvailable && readBlobFrom((fs::FS&)SD, configBinPathSD(), blob)) {
+        extractBlob(blob, gpsConfig, wifiConfig, bleConfig, mlConfig);
+        sanitizeWiFiConfig(wifiConfig);
+        Serial.println("[CONFIG] Loaded binary from SD");
+        // Mirror to SPIFFS
+        writeBlobTo((fs::FS&)SPIFFS, CONFIG_BIN_FILE, blob);
+        return true;
+    }
+
+    // 2. Try binary from SPIFFS
+    if (readBlobFrom((fs::FS&)SPIFFS, CONFIG_BIN_FILE, blob)) {
+        extractBlob(blob, gpsConfig, wifiConfig, bleConfig, mlConfig);
+        sanitizeWiFiConfig(wifiConfig);
+        Serial.println("[CONFIG] Loaded binary from SPIFFS");
+        return true;
+    }
+
+    // 3. JSON migration: try SD paths
+    if (sdAvailable) {
+        const char* sdPath = SDLayout::configPathSD();
+        if (loadFrom((fs::FS&)SD, sdPath)) {
+            Serial.printf("[CONFIG] Migrated JSON from SD: '%s'\n", sdPath);
+            save();           // write binary to both SD + SPIFFS
+            SD.remove(sdPath);  // delete old JSON
+            Serial.printf("[CONFIG] Deleted old JSON: '%s'\n", sdPath);
+            return true;
+        }
+        if (SDLayout::usingNewLayout()) {
+            const char* legacyPath = SDLayout::legacyConfigPath();
+            if (loadFrom((fs::FS&)SD, legacyPath)) {
+                Serial.printf("[CONFIG] Migrated JSON from SD legacy: '%s'\n", legacyPath);
+                save();
+                SD.remove(legacyPath);
+                return true;
+            }
+        }
+    }
+
+    // 4. JSON migration: try SPIFFS
+    if (loadFrom((fs::FS&)SPIFFS, CONFIG_FILE)) {
+        Serial.println("[CONFIG] Migrated JSON from SPIFFS");
+        save();                      // write binary
+        SPIFFS.remove(CONFIG_FILE);  // delete old JSON
+        return true;
+    }
+
+    Serial.println("[CONFIG] No config found (binary or JSON)");
+    return false;
 }
 
 bool Config::loadPersonality() {
@@ -446,65 +734,24 @@ void Config::savePersonalityToSPIFFS() {
 }
 
 bool Config::save() {
-    JsonDocument doc;
+    ConfigBlob blob;
+    populateBlob(blob, gpsConfig, wifiConfig, bleConfig, mlConfig);
 
-    // GPS config
-    doc["gps"]["enabled"] = gpsConfig.enabled;
-    doc["gps"]["gpsSource"] = static_cast<uint8_t>(gpsConfig.source);
-    doc["gps"]["rxPin"] = gpsConfig.rxPin;
-    doc["gps"]["txPin"] = gpsConfig.txPin;
-    doc["gps"]["baudRate"] = gpsConfig.baudRate;
-    doc["gps"]["updateInterval"] = gpsConfig.updateInterval;
-    doc["gps"]["sleepTimeMs"] = gpsConfig.sleepTimeMs;
-    doc["gps"]["powerSave"] = gpsConfig.powerSave;
-    doc["gps"]["timezoneOffset"] = gpsConfig.timezoneOffset;
+    Serial.printf("[CONFIG] save(): sdAvail=%d, wpaKey=%s, wigle=%s\n",
+                  sdAvailable,
+                  strlen(wifiConfig.wpaSecKey) > 0 ? "(SET)" : "(EMPTY)",
+                  strlen(wifiConfig.wigleApiName) > 0 ? "(SET)" : "(EMPTY)");
 
-    // ML config
-    doc["ml"]["enabled"] = mlConfig.enabled;
-    doc["ml"]["collectionMode"] = static_cast<uint8_t>(mlConfig.collectionMode);
-    doc["ml"]["modelPath"] = mlConfig.modelPath;
-    doc["ml"]["confidenceThreshold"] = mlConfig.confidenceThreshold;
-    doc["ml"]["rogueApThreshold"] = mlConfig.rogueApThreshold;
-    doc["ml"]["vulnScorerThreshold"] = mlConfig.vulnScorerThreshold;
-    doc["ml"]["autoUpdate"] = mlConfig.autoUpdate;
-    doc["ml"]["updateUrl"] = mlConfig.updateUrl;
-
-    // WiFi config
-    doc["wifi"]["channelHopInterval"] = wifiConfig.channelHopInterval;
-    doc["wifi"]["spectrumHopInterval"] = wifiConfig.spectrumHopInterval;
-    doc["wifi"]["lockTime"] = wifiConfig.lockTime;
-    doc["wifi"]["enableDeauth"] = wifiConfig.enableDeauth;
-    doc["wifi"]["randomizeMAC"] = wifiConfig.randomizeMAC;
-    doc["wifi"]["attackMinRssi"] = wifiConfig.attackMinRssi;
-    doc["wifi"]["spectrumMinRssi"] = wifiConfig.spectrumMinRssi;
-    doc["wifi"]["spectrumTopN"] = wifiConfig.spectrumTopN;
-    doc["wifi"]["spectrumStaleMs"] = wifiConfig.spectrumStaleMs;
-    doc["wifi"]["spectrumCollapseSsid"] = wifiConfig.spectrumCollapseSsid;
-    doc["wifi"]["spectrumTiltEnabled"] = wifiConfig.spectrumTiltEnabled;
-    doc["wifi"]["otaSSID"] = wifiConfig.otaSSID;
-    doc["wifi"]["otaPassword"] = wifiConfig.otaPassword;
-    doc["wifi"]["autoConnect"] = wifiConfig.autoConnect;
-    doc["wifi"]["wpaSecKey"] = wifiConfig.wpaSecKey;
-    doc["wifi"]["wigleApiName"] = wifiConfig.wigleApiName;
-    doc["wifi"]["wigleApiToken"] = wifiConfig.wigleApiToken;
-
-    // BLE config
-    doc["ble"]["burstInterval"] = bleConfig.burstInterval;
-    doc["ble"]["advDuration"] = bleConfig.advDuration;
-
-    // Save to SD if available, otherwise SPIFFS
-    fs::FS& cfgFS = sdAvailable ? (fs::FS&)SD : (fs::FS&)SPIFFS;
-
-    const char* cfgPath = sdAvailable ? SDLayout::configPathSD() : CONFIG_FILE;
-    File file = cfgFS.open(cfgPath, FILE_WRITE);
-    if (!file) {
-        return false;
+    bool ok = false;
+    if (sdAvailable) {
+        ok = writeBlobTo((fs::FS&)SD, configBinPathSD(), blob);
     }
 
-    size_t written = serializeJsonPretty(doc, file);
-    file.close();
+    // Always mirror to SPIFFS
+    bool spiffsOk = writeBlobTo((fs::FS&)SPIFFS, CONFIG_BIN_FILE, blob);
+    if (!sdAvailable) ok = spiffsOk;
 
-    return written > 0;
+    return ok;
 }
 
 bool Config::createDefaultConfig() {

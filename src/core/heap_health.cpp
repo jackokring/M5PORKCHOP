@@ -18,6 +18,9 @@ static size_t minFree = 0;
 static size_t minLargest = 0;
 static bool conditionPending = false;
 static uint32_t lastConditionMs = 0;
+static uint8_t stableHealthPct = 100;
+static bool pendingToast = false;
+static uint32_t pendingToastMs = 0;
 
 static uint8_t computePercent(size_t freeHeap, size_t largestBlock, bool updatePeaks) {
     if (updatePeaks) {
@@ -68,9 +71,6 @@ void update() {
     if (minFree == 0 || freeHeap < minFree) minFree = freeHeap;
     if (minLargest == 0 || largestBlock < minLargest) minLargest = largestBlock;
     uint8_t newPct = computePercent(freeHeap, largestBlock, true);
-
-    int delta = (int)newPct - (int)heapHealthPct;
-    uint8_t deltaAbs = (delta < 0) ? (uint8_t)(-delta) : (uint8_t)delta;
     heapHealthPct = newPct;
 
     bool contigLow = largestBlock < HeapPolicy::kProactiveTlsConditioning;
@@ -88,14 +88,28 @@ void update() {
         }
     }
 
-    if (delta != 0 && deltaAbs >= HeapPolicy::kHealthToastMinDelta) {
-        if (now - lastToastMs >= HeapPolicy::kHealthToastDurationMs) {
-            toastDelta = deltaAbs;
-            toastImproved = delta > 0;
+    // Debounced toast: compare against stable baseline, not previous sample
+    int netDelta = (int)heapHealthPct - (int)stableHealthPct;
+    uint8_t netDeltaAbs = (netDelta < 0) ? (uint8_t)(-netDelta) : (uint8_t)netDelta;
+
+    if (netDeltaAbs >= HeapPolicy::kHealthToastMinDelta) {
+        if (!pendingToast) {
+            pendingToast = true;
+            pendingToastMs = now;
+        }
+        if ((now - pendingToastMs >= HeapPolicy::kHealthToastSettleMs) &&
+            (now - lastToastMs >= HeapPolicy::kHealthToastDurationMs)) {
+            toastDelta = netDeltaAbs;
+            toastImproved = netDelta > 0;
             toastActive = true;
             toastStartMs = now;
             lastToastMs = now;
+            stableHealthPct = heapHealthPct;
+            pendingToast = false;
         }
+    } else {
+        pendingToast = false;
+        stableHealthPct = heapHealthPct;
     }
 }
 
@@ -111,6 +125,9 @@ void resetPeaks(bool suppressToast) {
     heapHealthPct = computePercent(peakFree, peakLargest, false);
     conditionPending = false;
     lastConditionMs = millis();
+
+    stableHealthPct = heapHealthPct;
+    pendingToast = false;
 
     if (suppressToast) {
         toastActive = false;

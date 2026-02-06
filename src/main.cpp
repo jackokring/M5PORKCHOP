@@ -38,8 +38,9 @@ static void preInitWiFiDriverEarly() {
     // Force driver/buffers allocation while heap is still clean/contiguous
     WiFi.mode(WIFI_STA);
 
-    // Keep driver ON (do NOT wifioff=true)
-    WiFi.disconnect(true /* erase */, false /* wifioff */);
+    // Stop radio but keep driver initialized (buffers stay allocated).
+    // Signature: disconnect(bool wifioff, bool eraseap)
+    WiFi.disconnect(true /* wifioff */, false /* eraseap */);
 
     // No modem sleep to reduce odd timing/latency during TLS + UI load
     WiFi.setSleep(false);
@@ -293,6 +294,13 @@ void setup() {
     // This dramatically reduces "esp_wifi_init 257" failures on reconnect later.
     preInitWiFiDriverEarly();
 
+    // Deassert CapLoRa SX1262 CS BEFORE SD init. The SX1262 shares
+    // MOSI(G14)/MISO(G39)/SCK(G40) with the SD card. If its CS floats low
+    // the SX1262 responds on the bus and SD.begin() fails with f_mount(3).
+    // Safe on non-ADV hardware (GPIO5 is unused).
+    pinMode(5, OUTPUT);
+    digitalWrite(5, HIGH);
+
     // Load configuration from SD
     if (!Config::init()) {
         Serial.println("[MAIN] Config init failed, using defaults");
@@ -383,9 +391,10 @@ void loop() {
     static uint32_t lastHeapLog = 0;
     if (millis() - lastHeapLog > 5000) {
         lastHeapLog = millis();
-        Serial.printf("[DBG-HEAP-LOOP] free=%u largest=%u\n",
+        Serial.printf("[DBG-HEAP-LOOP] free=%u largest=%u minFree=%u\n",
                       (unsigned)ESP.getFreeHeap(),
-                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+                      (unsigned)ESP.getMinFreeHeap());
     }
     // #endregion
 

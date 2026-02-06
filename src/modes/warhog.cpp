@@ -505,6 +505,11 @@ void WarhogMode::scanTask(void* pvParameters) {
     }
 #endif
     
+    // Log stack usage for sizing decisions
+    UBaseType_t hwm = uxTaskGetStackHighWaterMark(NULL);
+    Serial.printf("[WARHOG] Scan task stack HWM: %u bytes unused of 4096\n",
+                  (unsigned)(hwm * sizeof(StackType_t)));
+
     // Clean up task handle and self-delete
     scanTaskHandle = NULL;
     vTaskDelete(NULL);

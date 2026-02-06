@@ -18,13 +18,16 @@ extern Porkchop porkchop;
 static Preferences moodPrefs;
 static const char* MOOD_NVS_NAMESPACE = "porkmood";
 
+// Helper: safe copy into fixed-size char buffer
+#define SET_PHRASE(dst, src) do { strncpy((dst), (src), sizeof(dst) - 1); (dst)[sizeof(dst) - 1] = '\0'; } while(0)
+
 // Static members
-String Mood::currentPhrase = "oink";
+char Mood::currentPhrase[40] = "oink";
 int Mood::happiness = 50;
 uint32_t Mood::lastPhraseChange = 0;
 uint32_t Mood::phraseInterval = 5000;
 uint32_t Mood::lastActivityTime = 0;
-static String lastStatusMessage = "";
+static char lastStatusMessage[40] = "";
 static uint32_t lastStatusMessageTime = 0;
 
 // Mood momentum system
@@ -33,7 +36,7 @@ uint32_t Mood::lastBoostTime = 0;
 static int lastEffectiveHappiness = 50;
 
 // Phrase queue for chaining (4 slots for 5-line riddles)
-String Mood::phraseQueue[4] = {"", "", "", ""};
+char Mood::phraseQueue[4][40] = {{0}, {0}, {0}, {0}};
 uint8_t Mood::phraseQueueCount = 0;
 uint32_t Mood::lastQueuePop = 0;
 
@@ -289,7 +292,7 @@ static void rebuildBubbleCache(const char* phrase) {
 }
 
 static void ensureBubbleCache() {
-    const char* current = Mood::getCurrentPhrase().c_str();
+    const char* current = Mood::getCurrentPhrase();
     if (strcmp(bubblePhraseRaw, current) != 0) {
         rebuildBubbleCache(current);
     }
@@ -353,9 +356,9 @@ bool Mood::isDialogueLocked() {
 
 static const uint32_t PHRASE_CHAIN_DELAY_MS = 2000;  // 2 seconds between chain phrases
 
-static void queuePhrase(const String& phrase) {
+static void queuePhrase(const char* phrase) {
     if (Mood::phraseQueueCount < 4) {
-        Mood::phraseQueue[Mood::phraseQueueCount] = phrase;
+        SET_PHRASE(Mood::phraseQueue[Mood::phraseQueueCount], phrase);
         Mood::phraseQueueCount++;
     }
 }
@@ -363,9 +366,9 @@ static void queuePhrase(const String& phrase) {
 static void queuePhrases(const char* p1, const char* p2 = nullptr, const char* p3 = nullptr) {
     // Clear existing queue
     Mood::phraseQueueCount = 0;
-    if (p1) queuePhrase(String(p1));
-    if (p2) queuePhrase(String(p2));
-    if (p3) queuePhrase(String(p3));
+    if (p1) queuePhrase(p1);
+    if (p2) queuePhrase(p2);
+    if (p3) queuePhrase(p3);
     Mood::lastQueuePop = millis();
 }
 
@@ -379,13 +382,14 @@ static bool processQueue() {
     }
     
     // Pop first phrase from queue
-    Mood::currentPhrase = Mood::phraseQueue[0];
-    
+    SET_PHRASE(Mood::currentPhrase, Mood::phraseQueue[0]);
+
     // Shift remaining phrases down
-    for (uint8_t i = 0; i < Mood::phraseQueueCount - 1; i++) {
-        Mood::phraseQueue[i] = Mood::phraseQueue[i + 1];
-    }
     Mood::phraseQueueCount--;
+    if (Mood::phraseQueueCount > 0) {
+        memmove(Mood::phraseQueue[0], Mood::phraseQueue[1], Mood::phraseQueueCount * sizeof(Mood::phraseQueue[0]));
+    }
+    Mood::phraseQueue[Mood::phraseQueueCount][0] = '\0';
     Mood::lastQueuePop = now;
     Mood::lastPhraseChange = now;
     
@@ -488,10 +492,11 @@ static bool tryQueueRiddle() {
     int pick = random(0, RIDDLE_COUNT);
     
     // Queue all 5 lines (first becomes current, rest in queue)
-    Mood::currentPhrase = RIDDLES[pick][0];
+    SET_PHRASE(Mood::currentPhrase, RIDDLES[pick][0]);
     Mood::phraseQueueCount = 0;
     for (int i = 1; i < 5; i++) {
-        Mood::phraseQueue[Mood::phraseQueueCount++] = RIDDLES[pick][i];
+        SET_PHRASE(Mood::phraseQueue[Mood::phraseQueueCount], RIDDLES[pick][i]);
+        Mood::phraseQueueCount++;
     }
     Mood::lastQueuePop = millis();
     Mood::lastPhraseChange = millis();
@@ -948,15 +953,15 @@ const char* PHRASES_RARE[] = {
 };
 
 void Mood::init() {
-    currentPhrase = "oink";
+    SET_PHRASE(currentPhrase, "oink");
     lastPhraseChange = millis();
     phraseInterval = 5000;
     lastActivityTime = millis();
-    
+
     // Reset momentum system
     momentumBoost = 0;
     lastBoostTime = 0;
-    
+
     // Reset phrase queue
     phraseQueueCount = 0;
     
@@ -987,9 +992,9 @@ void Mood::init() {
         
         // Welcome back phrase based on saved mood
         if (savedMood > 60) {
-            currentPhrase = "missed me piggy?";
+            SET_PHRASE(currentPhrase, "missed me piggy?");
         } else if (savedMood < -20) {
-            currentPhrase = "back for more..";
+            SET_PHRASE(currentPhrase, "back for more..");
         }
     } else {
         happiness = 50;
@@ -1025,57 +1030,57 @@ void Mood::update() {
     // Network milestones: 10, 50, 100, 500, 1000
     if (sess.networks >= 10 && !(milestonesShown & 0x01)) {
         milestonesShown |= 0x01;
-        currentPhrase = "10 TRUFFLES BABY";
+        SET_PHRASE(currentPhrase, "10 TRUFFLES BABY");
         applyMomentumBoost(15);
         lastPhraseChange = now;
     } else if (sess.networks >= 50 && !(milestonesShown & 0x02)) {
         milestonesShown |= 0x02;
         queuePhrases("50 NETWORKS!", "oink oink oink", nullptr);
-        currentPhrase = "HALF CENTURY!";
+        SET_PHRASE(currentPhrase, "HALF CENTURY!");
         applyMomentumBoost(20);
         lastPhraseChange = now;
     } else if (sess.networks >= 100 && !(milestonesShown & 0x04)) {
         milestonesShown |= 0x04;
         queuePhrases("THE BIG 100!", "centurion piggy", "unstoppable");
-        currentPhrase = "TRIPLE DIGITS!";
+        SET_PHRASE(currentPhrase, "TRIPLE DIGITS!");
         applyMomentumBoost(30);
         lastPhraseChange = now;
     } else if (sess.networks >= 500 && !(milestonesShown & 0x08)) {
         milestonesShown |= 0x08;
         queuePhrases("500 NETWORKS!", "legend mode", "wifi vacuum");
-        currentPhrase = "HALF A THOUSAND";
+        SET_PHRASE(currentPhrase, "HALF A THOUSAND");
         applyMomentumBoost(40);
         lastPhraseChange = now;
     }
     // Distance milestones: 1km, 5km, 10km
     else if (sess.distanceM >= 1000 && !(milestonesShown & 0x10)) {
         milestonesShown |= 0x10;
-        currentPhrase = "1KM WALKED!";
+        SET_PHRASE(currentPhrase, "1KM WALKED!");
         applyMomentumBoost(15);
         lastPhraseChange = now;
     } else if (sess.distanceM >= 5000 && !(milestonesShown & 0x20)) {
         milestonesShown |= 0x20;
         queuePhrases("5KM COVERED!", "piggy parkour", nullptr);
-        currentPhrase = "SERIOUS WALKER";
+        SET_PHRASE(currentPhrase, "SERIOUS WALKER");
         applyMomentumBoost(25);
         lastPhraseChange = now;
     } else if (sess.distanceM >= 10000 && !(milestonesShown & 0x40)) {
         milestonesShown |= 0x40;
         queuePhrases("10KM LEGEND!", "marathon pig", "touch grass pro");
-        currentPhrase = "DOUBLE DIGITS KM";
+        SET_PHRASE(currentPhrase, "DOUBLE DIGITS KM");
         applyMomentumBoost(35);
         lastPhraseChange = now;
     }
     // Handshake milestones: 5, 10
     else if (sess.handshakes >= 5 && !(milestonesShown & 0x80)) {
         milestonesShown |= 0x80;
-        currentPhrase = "5 HANDSHAKES!";
+        SET_PHRASE(currentPhrase, "5 HANDSHAKES!");
         applyMomentumBoost(20);
         lastPhraseChange = now;
     } else if (sess.handshakes >= 10 && !(milestonesShown & 0x100)) {
         milestonesShown |= 0x100;
         queuePhrases("10 HANDSHAKES!", "pwn master", nullptr);
-        currentPhrase = "DOUBLE DIGITS!";
+        SET_PHRASE(currentPhrase, "DOUBLE DIGITS!");
         applyMomentumBoost(30);
         lastPhraseChange = now;
     }
@@ -1145,10 +1150,12 @@ void Mood::onHandshakeCaptured(const char* apName) {
     
     // First phrase - the capture announcement
     if (apName && strlen(apName) > 0) {
-        String ap = String(apName);
-        if (ap.length() > 20) ap = ap.substring(0, 20) + "..";
+        char ap[24];
+        strncpy(ap, apName, 20);
+        ap[20] = '\0';
+        if (strlen(apName) > 20) { ap[20] = '.'; ap[21] = '.'; ap[22] = '\0'; }
         const char* templates[] = { "%s pwned", "%s gg ez", "rekt %s", "%s is mine" };
-        snprintf(buf1, sizeof(buf1), templates[random(0, 4)], ap.c_str());
+        snprintf(buf1, sizeof(buf1), templates[random(0, 4)], ap);
     } else {
         // Personality-aware excited phrases
         PorkchopMode mode = porkchop.getMode();
@@ -1190,10 +1197,10 @@ void Mood::onHandshakeCaptured(const char* apName) {
     }
     
     // Set first phrase immediately, queue rest
-    currentPhrase = buf1;
+    SET_PHRASE(currentPhrase, buf1);
     lastPhraseChange = millis();
     queuePhrases(buf2, buf3);
-    
+
     // Celebratory beep for handshake capture - non-blocking via SFX engine
     SFX::play(SFX::HANDSHAKE);
     
@@ -1259,10 +1266,10 @@ void Mood::onPMKIDCaptured(const char* apName) {
     strncpy(buf3, brags[random(0, 4)], sizeof(buf3) - 1);
     buf3[sizeof(buf3) - 1] = '\0';
     
-    currentPhrase = buf1;
+    SET_PHRASE(currentPhrase, buf1);
     lastPhraseChange = millis();
     queuePhrases(buf2, buf3);
-    
+
     // Triple beep for PMKID - non-blocking via SFX engine
     SFX::play(SFX::PMKID);
     
@@ -1302,9 +1309,11 @@ void Mood::onNewNetwork(const char* apName, int8_t rssi, uint8_t channel) {
     
     // Show AP name with info in funny phrases
     if (apName && strlen(apName) > 0) {
-        String ap = String(apName);
-        if (ap.length() > 20) ap = ap.substring(0, 20) + "..";
-        
+        char ap[24];
+        strncpy(ap, apName, 20);
+        ap[20] = '\0';
+        if (strlen(apName) > 20) { ap[20] = '.'; ap[21] = '.'; ap[22] = '\0'; }
+
         const char* templates[] = {
             "sniffed %s ch%d",
             "%s %ddb yum",
@@ -1315,30 +1324,30 @@ void Mood::onNewNetwork(const char* apName, int8_t rssi, uint8_t channel) {
         int idx = random(0, 5);
         char buf[64];
         if (idx == 1 || idx == 3) {
-            snprintf(buf, sizeof(buf), templates[idx], ap.c_str(), rssi);
+            snprintf(buf, sizeof(buf), templates[idx], ap, rssi);
         } else if (idx == 0 || idx == 2) {
-            snprintf(buf, sizeof(buf), templates[idx], ap.c_str(), channel);
+            snprintf(buf, sizeof(buf), templates[idx], ap, channel);
         } else {
-            snprintf(buf, sizeof(buf), templates[idx], ap.c_str());
+            snprintf(buf, sizeof(buf), templates[idx], ap);
         }
-        currentPhrase = buf;
+        SET_PHRASE(currentPhrase, buf);
     } else {
         // Hidden network
         char buf[48];
         snprintf(buf, sizeof(buf), "sneaky truffle CH%d %ddB", channel, rssi);
-        currentPhrase = buf;
+        SET_PHRASE(currentPhrase, buf);
     }
     lastPhraseChange = millis();
 }
 
-void Mood::setStatusMessage(const String& msg) {
+void Mood::setStatusMessage(const char* msg) {
     uint32_t now = millis();
-    if (msg == lastStatusMessage && (now - lastStatusMessageTime) < 1000) {
+    if (strcmp(msg, lastStatusMessage) == 0 && (now - lastStatusMessageTime) < 1000) {
         return;
     }
-    lastStatusMessage = msg;
+    SET_PHRASE(lastStatusMessage, msg);
     lastStatusMessageTime = now;
-    currentPhrase = msg;
+    SET_PHRASE(currentPhrase, msg);
     lastPhraseChange = now;
 }
 
@@ -1368,7 +1377,7 @@ void Mood::onMLPrediction(float confidence) {
         }
         
         int idx = pickPhraseIdx(PhraseCategory::EXCITED, excitedCount);
-        currentPhrase = excitedPhrases[idx];
+        SET_PHRASE(currentPhrase, excitedPhrases[idx]);
     } else if (confidence > 0.5f) {
         happiness = min(happiness + 5, 100);
         
@@ -1386,9 +1395,9 @@ void Mood::onMLPrediction(float confidence) {
         }
         
         int idx = pickPhraseIdx(PhraseCategory::HAPPY, happyCount);
-        currentPhrase = happyPhrases[idx];
+        SET_PHRASE(currentPhrase, happyPhrases[idx]);
     }
-    
+
     lastPhraseChange = millis();
 }
 
@@ -1419,7 +1428,7 @@ void Mood::onNoActivity(uint32_t seconds) {
             if (mode == PorkchopMode::OINK_MODE || mode == PorkchopMode::SPECTRUM_MODE) {
                 // In hunting modes, use quiet hunting phrases instead of generic sleepy
                 int idx = pickPhraseIdx(PhraseCategory::SLEEPY, sizeof(PHRASES_OINK_QUIET) / sizeof(PHRASES_OINK_QUIET[0]));
-                currentPhrase = PHRASES_OINK_QUIET[idx];
+                SET_PHRASE(currentPhrase, PHRASES_OINK_QUIET[idx]);
             } else {
                 // Personality-aware sleepy phrases
                 bool isCD = (mode == PorkchopMode::DNH_MODE);
@@ -1439,7 +1448,7 @@ void Mood::onNoActivity(uint32_t seconds) {
                 }
                 
                 int idx = pickPhraseIdx(PhraseCategory::SLEEPY, sleepyCount);
-                currentPhrase = sleepyPhrases[idx];
+                SET_PHRASE(currentPhrase, sleepyPhrases[idx]);
             }
             lastPhraseChange = now;  // Prevent immediate re-selection
         }
@@ -1472,7 +1481,7 @@ void Mood::onWiFiLost() {
     }
     
     int idx = pickPhraseIdx(PhraseCategory::SAD, sadCount);
-    currentPhrase = sadPhrases[idx];
+    SET_PHRASE(currentPhrase, sadPhrases[idx]);
     lastPhraseChange = millis();
 }
 
@@ -1487,19 +1496,19 @@ void Mood::onGPSFix() {
         XP::addXP(XPEvent::GPS_LOCK);
     }
     
-    currentPhrase = "gps locked n loaded";
+    SET_PHRASE(currentPhrase, "gps locked n loaded");
     lastPhraseChange = millis();
 }
 
 void Mood::onGPSLost() {
     happiness = max(happiness - 5, -100);  // Small permanent dip
     applyMomentumBoost(-15);  // Temporary sadness
-    currentPhrase = "gps lost sad piggy";
+    SET_PHRASE(currentPhrase, "gps lost sad piggy");
     lastPhraseChange = millis();
 }
 
 void Mood::onLowBattery() {
-    currentPhrase = "piggy needs juice";
+    SET_PHRASE(currentPhrase, "piggy needs juice");
     lastPhraseChange = millis();
 }
 
@@ -1526,7 +1535,7 @@ void Mood::selectPhrase() {
     if (specialRoll < 3) {
         // 3% chance for cryptic lore (PROJECT M5PORKSOUP breadcrumbs)
         int idx = pickPhraseIdx(PhraseCategory::RARE_LORE, PHRASES_RARE_LORE_COUNT);
-        currentPhrase = PHRASES_RARE_LORE[idx];
+        SET_PHRASE(currentPhrase, PHRASES_RARE_LORE[idx]);
         return;
     } else if (specialRoll < 5) {
         // 2% chance for regular rare phrases
@@ -1534,7 +1543,7 @@ void Mood::selectPhrase() {
         count = sizeof(PHRASES_RARE) / sizeof(PHRASES_RARE[0]);
         cat = PhraseCategory::RARE;
         int idx = pickPhraseIdx(cat, count);
-        currentPhrase = phrases[idx];
+        SET_PHRASE(currentPhrase, phrases[idx]);
         return;
     }
     
@@ -1546,7 +1555,7 @@ void Mood::selectPhrase() {
         if (strstr(PHRASES_DYNAMIC[idx], "$NAME") && Config::personality().callsign[0] == '\0') {
             idx = pickPhraseIdx(PhraseCategory::DYNAMIC, PHRASES_DYNAMIC_COUNT);
         }
-        currentPhrase = formatDynamicPhrase(PHRASES_DYNAMIC[idx]);
+        SET_PHRASE(currentPhrase, formatDynamicPhrase(PHRASES_DYNAMIC[idx]));
         return;
     }
     
@@ -1560,10 +1569,10 @@ void Mood::selectPhrase() {
         count = sizeof(PHRASES_HUNTING) / sizeof(PHRASES_HUNTING[0]);
         cat = PhraseCategory::HUNTING;
         int idx = pickPhraseIdx(cat, count);
-        currentPhrase = phrases[idx];
+        SET_PHRASE(currentPhrase, phrases[idx]);
         return;
     }
-    
+
     // High curiosity (>0.7) with activity can trigger excited phrases (personality-aware)
     if (pers.curiosity > 0.7f && sess.networks > 5 && personalityRoll < (int)(pers.curiosity * 25)) {
         if (isCD) {
@@ -1578,10 +1587,10 @@ void Mood::selectPhrase() {
         }
         cat = PhraseCategory::EXCITED;
         int idx = pickPhraseIdx(cat, count);
-        currentPhrase = phrases[idx];
+        SET_PHRASE(currentPhrase, phrases[idx]);
         return;
     }
-    
+
     // Phase 2: Mood bleed-through - extreme moods can override category
     // When very happy (>80), 30% chance to use excited phrases
     // When very sad (<-60), 30% chance to use sad phrases
@@ -1672,7 +1681,7 @@ void Mood::selectPhrase() {
     }
     
     int idx = pickPhraseIdx(cat, count);
-    currentPhrase = phrases[idx];
+    SET_PHRASE(currentPhrase, phrases[idx]);
 }
 
 void Mood::updateAvatarState() {
@@ -1967,7 +1976,7 @@ void Mood::draw(M5Canvas& canvas) {
     }
 }
 
-const String& Mood::getCurrentPhrase() {
+const char* Mood::getCurrentPhrase() {
     return currentPhrase;
 }
 
@@ -2048,7 +2057,7 @@ void Mood::onSniffing(uint16_t networkCount, uint8_t channel) {
     int idx = pickPhraseIdx(PhraseCategory::SNIFFING, sizeof(PHRASES_SNIFFING) / sizeof(PHRASES_SNIFFING[0]));
     char buf[64];
     snprintf(buf, sizeof(buf), "%s CH%d (%d APs)", PHRASES_SNIFFING[idx], channel, networkCount);
-    currentPhrase = buf;
+    SET_PHRASE(currentPhrase, buf);
     lastPhraseChange = millis();
 }
 
@@ -2060,7 +2069,7 @@ void Mood::onPassiveRecon(uint16_t networkCount, uint8_t channel) {
     int idx = pickPhraseIdx(PhraseCategory::PASSIVE_RECON, sizeof(PHRASES_PASSIVE_RECON) / sizeof(PHRASES_PASSIVE_RECON[0]));
     char buf[64];
     snprintf(buf, sizeof(buf), "%s CH%d (%d)", PHRASES_PASSIVE_RECON[idx], channel, networkCount);
-    currentPhrase = buf;
+    SET_PHRASE(currentPhrase, buf);
     lastPhraseChange = millis();
 }
 
@@ -2069,19 +2078,26 @@ void Mood::onDeauthing(const char* apName, uint32_t deauthCount) {
     isBoredState = false;  // Clear bored state - we're attacking!
     
     // Handle null or empty SSID (hidden networks)
-    String ap = (apName && strlen(apName) > 0) ? String(apName) : "ghost AP";
-    if (ap.length() > 20) ap = ap.substring(0, 20) + "..";
-    
+    char ap[24];
+    if (apName && strlen(apName) > 0) {
+        strncpy(ap, apName, 20);
+        ap[20] = '\0';
+        if (strlen(apName) > 20) { ap[20] = '.'; ap[21] = '.'; ap[22] = '\0'; }
+    } else {
+        strcpy(ap, "ghost AP");
+    }
+
     int idx = pickPhraseIdx(PhraseCategory::DEAUTH, sizeof(PHRASES_DEAUTH) / sizeof(PHRASES_DEAUTH[0]));
     char buf[64];
-    snprintf(buf, sizeof(buf), PHRASES_DEAUTH[idx], ap.c_str());
-    
+    snprintf(buf, sizeof(buf), PHRASES_DEAUTH[idx], ap);
+
     // Append deauth count every 5th update
     if (deauthCount % 50 == 0 && deauthCount > 0) {
-        String msg = String(buf) + " [" + String(deauthCount) + "]";
-        currentPhrase = msg;
+        char buf2[64];
+        snprintf(buf2, sizeof(buf2), "%s [%lu]", buf, (unsigned long)deauthCount);
+        SET_PHRASE(currentPhrase, buf2);
     } else {
-        currentPhrase = buf;
+        SET_PHRASE(currentPhrase, buf);
     }
     lastPhraseChange = millis();
 }
@@ -2101,7 +2117,7 @@ void Mood::onDeauthSuccess(const uint8_t* clientMac) {
     int idx = pickPhraseIdx(PhraseCategory::DEAUTH_SUCCESS, sizeof(PHRASES_DEAUTH_SUCCESS) / sizeof(PHRASES_DEAUTH_SUCCESS[0]));
     char buf[48];
     snprintf(buf, sizeof(buf), PHRASES_DEAUTH_SUCCESS[idx], macStr);
-    currentPhrase = buf;
+    SET_PHRASE(currentPhrase, buf);
     lastPhraseChange = millis();
     
     // Quick beep for confirmed kick - non-blocking
@@ -2113,7 +2129,7 @@ void Mood::onDeauthSuccess(const uint8_t* clientMac) {
 
 void Mood::onIdle() {
     int idx = pickPhraseIdx(PhraseCategory::MENU_IDLE, sizeof(PHRASES_MENU_IDLE) / sizeof(PHRASES_MENU_IDLE[0]));
-    currentPhrase = PHRASES_MENU_IDLE[idx];
+    SET_PHRASE(currentPhrase, PHRASES_MENU_IDLE[idx]);
     lastPhraseChange = millis();
 }
 
@@ -2133,10 +2149,10 @@ void Mood::onBored(uint16_t networkCount) {
         // Networks exist but all exhausted/protected
         char buf[48];
         snprintf(buf, sizeof(buf), "%s (%d pwned)", PHRASES_BORED[idx], networkCount);
-        currentPhrase = buf;
+        SET_PHRASE(currentPhrase, buf);
     } else {
         // No networks at all
-        currentPhrase = PHRASES_BORED[idx];
+        SET_PHRASE(currentPhrase, PHRASES_BORED[idx]);
     }
     lastPhraseChange = millis();
     
@@ -2147,7 +2163,7 @@ void Mood::onBored(uint16_t networkCount) {
 void Mood::onWarhogUpdate() {
     lastActivityTime = millis();
     int idx = pickPhraseIdx(PhraseCategory::WARHOG, sizeof(PHRASES_WARHOG) / sizeof(PHRASES_WARHOG[0]));
-    currentPhrase = PHRASES_WARHOG[idx];
+    SET_PHRASE(currentPhrase, PHRASES_WARHOG[idx]);
     lastPhraseChange = millis();
 }
 
@@ -2165,7 +2181,7 @@ void Mood::onWarhogFound(const char* apName, uint8_t channel) {
     // XP awarded in warhog.cpp when network is logged (authoritative source)
     
     int idx = pickPhraseIdx(PhraseCategory::WARHOG_FOUND, sizeof(PHRASES_WARHOG_FOUND) / sizeof(PHRASES_WARHOG_FOUND[0]));
-    currentPhrase = PHRASES_WARHOG_FOUND[idx];
+    SET_PHRASE(currentPhrase, PHRASES_WARHOG_FOUND[idx]);
     lastPhraseChange = millis();
 }
 
@@ -2210,16 +2226,16 @@ void Mood::onPiggyBluesUpdate(const char* vendor, int8_t rssi, uint8_t targetCou
         // Targeted phrase with vendor info
         int idx = pickPhraseIdx(PhraseCategory::PIGGYBLUES_TARGETED, sizeof(PHRASES_PIGGYBLUES_TARGETED) / sizeof(PHRASES_PIGGYBLUES_TARGETED[0]));
         snprintf(buf, sizeof(buf), PHRASES_PIGGYBLUES_TARGETED[idx], vendor, rssi);
-        currentPhrase = buf;
+        SET_PHRASE(currentPhrase, buf);
     } else if (targetCount > 0) {
         // Status phrase with target counts
         int idx = pickPhraseIdx(PhraseCategory::PIGGYBLUES_STATUS, sizeof(PHRASES_PIGGYBLUES_STATUS) / sizeof(PHRASES_PIGGYBLUES_STATUS[0]));
         snprintf(buf, sizeof(buf), PHRASES_PIGGYBLUES_STATUS[idx], targetCount, totalFound);
-        currentPhrase = buf;
+        SET_PHRASE(currentPhrase, buf);
     } else {
         // Idle phrase
         int idx = pickPhraseIdx(PhraseCategory::PIGGYBLUES_IDLE, sizeof(PHRASES_PIGGYBLUES_IDLE) / sizeof(PHRASES_PIGGYBLUES_IDLE[0]));
-        currentPhrase = PHRASES_PIGGYBLUES_IDLE[idx];
+        SET_PHRASE(currentPhrase, PHRASES_PIGGYBLUES_IDLE[idx]);
     }
     lastPhraseChange = millis();
 }

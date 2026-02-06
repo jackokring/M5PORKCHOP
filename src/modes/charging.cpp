@@ -6,6 +6,7 @@
 #include "../core/network_recon.h"
 #include "../gps/gps.h"
 #include "../core/config.h"
+#include "../core/xp.h"
 #include <M5Cardputer.h>
 #include <esp_wifi.h>
 #include <WiFi.h>
@@ -15,6 +16,7 @@
 bool ChargingMode::running = false;
 bool ChargingMode::exitRequested = false;
 bool ChargingMode::keyWasPressed = false;
+bool ChargingMode::barsHidden = false;
 
 uint8_t ChargingMode::batteryPercent = 0;
 float ChargingMode::batteryVoltage = 0.0f;
@@ -34,7 +36,6 @@ uint32_t ChargingMode::lastEstimateMs = 0;
 
 bool ChargingMode::reconWasActive = false;
 bool ChargingMode::gpsWasActive = false;
-uint8_t ChargingMode::wifiModeBefore = static_cast<uint8_t>(WIFI_MODE_NULL);
 bool ChargingMode::wifiWasOn = false;
 bool ChargingMode::powerPresent = false;
 bool ChargingMode::powerSeen = false;
@@ -54,8 +55,8 @@ static const float kTrendDropV = 0.030f;
 static const float kDischargeVoltages[] = {3.00f, 3.30f, 3.50f, 3.60f, 3.70f, 3.75f, 3.80f, 3.90f, 4.00f, 4.10f, 4.20f};
 static const uint8_t kDischargePercents[] = {0, 5, 10, 20, 30, 40, 50, 60, 70, 85, 100};
 
-// Charging curve - voltage reads higher due to charge current
-static const float kChargeVoltages[] = {3.50f, 3.70f, 3.85f, 3.95f, 4.05f, 4.10f, 4.15f, 4.18f, 4.20f, 4.20f, 4.20f};
+// Charging curve - flattened upper range to model constant-voltage (CV) phase
+static const float kChargeVoltages[] = {3.50f, 3.70f, 3.85f, 3.95f, 4.05f, 4.10f, 4.13f, 4.16f, 4.18f, 4.19f, 4.20f};
 static const uint8_t kChargePercents[] = {0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100};
 
 static bool isUsbConnected() {
@@ -64,35 +65,6 @@ static bool isUsbConnected() {
 #else
     return false;
 #endif
-}
-
-void ChargingMode::init() {
-    running = false;
-    exitRequested = false;
-    batteryPercent = 0;
-    batteryVoltage = 0.0f;
-    charging = false;
-    minutesToFull = -1;
-    unplugDetectMs = 0;
-    lastEstimateVoltage = 0.0f;
-    lastEstimateMs = 0;
-    reconWasActive = false;
-    gpsWasActive = false;
-    wifiModeBefore = static_cast<uint8_t>(WIFI_MODE_NULL);
-    wifiWasOn = false;
-    powerPresent = false;
-    powerSeen = false;
-    lastChargingMs = 0;
-    entryVoltage = 0.0f;
-    peakVoltage = 0.0f;
-    trendPowerPresent = false;
-    
-    memset(voltageHistory, 0, sizeof(voltageHistory));
-    voltageHistoryIdx = 0;
-    lastVoltageMs = 0;
-    lastUpdateMs = 0;
-    animFrame = 0;
-    lastAnimMs = 0;
 }
 
 void ChargingMode::start() {
@@ -112,9 +84,8 @@ void ChargingMode::start() {
         Serial.println("[CHARGING] GPS sleeping");
     }
     
-    // Shutdown WiFi completely
-    wifiModeBefore = static_cast<uint8_t>(WiFi.getMode());
-    wifiWasOn = (wifiModeBefore != WIFI_MODE_NULL);
+    // Shutdown WiFi completely - NetworkRecon::start() will restore it on exit
+    wifiWasOn = (WiFi.getMode() != WIFI_MODE_NULL);
     if (wifiWasOn) {
         WiFiUtils::shutdown();
         Serial.println("[CHARGING] WiFi stopped");
@@ -141,7 +112,12 @@ void ChargingMode::start() {
     
     // Initialize state
     running = true;
+    barsHidden = true;
     exitRequested = false;
+    batteryPercent = 0;
+    batteryVoltage = 0.0f;
+    charging = false;
+    minutesToFull = -1;
     keyWasPressed = true;  // Prevent immediate key detection
     unplugDetectMs = 0;
     lastEstimateVoltage = 0.0f;
@@ -172,8 +148,11 @@ void ChargingMode::stop() {
     if (!running) return;
     
     Serial.println("[CHARGING] Stopping charging mode - restoring services");
-    
+
+    XP::processPendingSave();
+
     running = false;
+    barsHidden = false;
     exitRequested = false;
     unplugDetectMs = 0;
     lastEstimateVoltage = 0.0f;
@@ -182,11 +161,6 @@ void ChargingMode::stop() {
     // Restore display brightness
     uint8_t brightness = Config::personality().brightness;
     M5.Display.setBrightness(brightness * 255 / 100);
-    
-    // Restore WiFi mode if it was active on entry
-    if (wifiWasOn) {
-        WiFi.mode(static_cast<wifi_mode_t>(wifiModeBefore));
-    }
     
     // Wake GPS if it was enabled
     if (gpsWasActive) {
@@ -233,10 +207,8 @@ void ChargingMode::update() {
         unplugDetectMs = 0;
     }
 
-    if (exitRequested) {
-        stop();
-        return;
-    }
+    // exitRequested is checked by the state machine in porkchop.cpp
+    // which will call setMode(IDLE) -> stop() through the normal lifecycle
 }
 
 void ChargingMode::handleInput() {

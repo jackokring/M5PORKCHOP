@@ -265,7 +265,7 @@ void Display::update() {
     updateDimming();
     
     // SD Format mode hides bars to save RAM for disk operations
-    bool barsHidden = SdFormatMenu::areBarsHidden();
+    bool barsHidden = SdFormatMenu::areBarsHidden() || ChargingMode::areBarsHidden();
     
     if (!barsHidden) {
         drawTopBar();

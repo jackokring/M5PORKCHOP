@@ -15,7 +15,7 @@ public:
     static void onHandshakeCaptured(const char* apName = nullptr);
     static void onPMKIDCaptured(const char* apName = nullptr);
     static void onNewNetwork(const char* apName = nullptr, int8_t rssi = 0, uint8_t channel = 0);
-    static void setStatusMessage(const String& msg);  // For mode-specific info
+    static void setStatusMessage(const char* msg);  // For mode-specific info
     static void onMLPrediction(float confidence);
     static void onNoActivity(uint32_t seconds);
     static void onWiFiLost();
@@ -36,7 +36,7 @@ public:
     static void resetBLESniffState();  // Reset first-target sniff flag on mode start
     
     // Get current mood phrase
-    static const String& getCurrentPhrase();
+    static const char* getCurrentPhrase();
     static int getCurrentHappiness();
     static int getEffectiveHappiness();  // Happiness with momentum applied
     static int getLastEffectiveHappiness();  // Cached effective happiness (no decay)
@@ -48,9 +48,9 @@ public:
     static bool isDialogueLocked();
     
     // Phase 6: Public for phrase chaining helper functions
-    static String currentPhrase;
+    static char currentPhrase[40];
     static uint32_t lastPhraseChange;
-    static String phraseQueue[4];  // Expanded for 5-line riddles
+    static char phraseQueue[4][40];  // Expanded for 5-line riddles
     static uint8_t phraseQueueCount;
     static uint32_t lastQueuePop;
     

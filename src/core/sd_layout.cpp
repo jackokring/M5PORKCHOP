@@ -466,7 +466,21 @@ bool migrateIfNeeded() {
     }
 
     if (SD.exists(kNewRoot) && !isDirEmpty(kNewRoot)) {
-        Serial.println("[MIGRATE] /m5porkchop exists without marker; skipping migration");
+        // /m5porkchop exists with data but no marker. Most likely a previous
+        // migration completed but the marker file was lost/corrupted.
+        // Check for config dir as evidence of completed migration.
+        if (SD.exists(kNewConfig)) {
+            Serial.println("[MIGRATE] /m5porkchop/config exists without marker; re-creating marker");
+            ensureDir(kNewMeta);
+            File marker = SD.open(kMarker, FILE_WRITE);
+            if (marker) {
+                marker.println("v1");
+                marker.close();
+            }
+            setUseNewLayout(true);
+            return true;
+        }
+        Serial.println("[MIGRATE] /m5porkchop exists without marker or config; skipping migration");
         setUseNewLayout(false);
         return false;
     }

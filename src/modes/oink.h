@@ -5,7 +5,6 @@
 #include <esp_wifi.h>
 #include <vector>
 #include <set>
-#include <map>
 #include <FS.h>
 #include "../core/network_recon.h"
 
@@ -166,7 +165,10 @@ public:
     static bool isExcluded(const uint8_t* bssid);  // Check if BSSID is excluded
     static uint16_t getExcludedCount();   // Number of excluded networks
     static void removeBoarBro(uint64_t bssid);  // Remove from exclusion list
-    static const std::map<uint64_t, String>& getExcludedMap() { return boarBros; }
+
+    // BOAR BROS data structure
+    struct BoarBro { uint64_t bssid; char ssid[33]; };
+    static const BoarBro* getExcludedList() { return boarBros; }
     
     // Stress test injection (no RF)
     static void injectTestNetwork(const uint8_t* bssid, const char* ssid, uint8_t channel, int8_t rssi, wifi_auth_mode_t authmode, bool hasPMF);
@@ -233,8 +235,9 @@ private:
     static void writePCAPHeader(fs::File& f);
     static void writePCAPPacket(fs::File& f, const uint8_t* data, uint16_t len, uint32_t ts);
     
-    // BOAR BROS storage
-    static std::map<uint64_t, String> boarBros;  // Excluded BSSIDs -> SSID
+    // BOAR BROS storage (fixed array, zero heap allocation)
+    static BoarBro boarBros[50];
+    static uint16_t boarBrosCount;
     static uint64_t bssidToUint64(const uint8_t* bssid);  // Convert 6-byte BSSID to uint64
     static void recordFilteredNetwork(const uint8_t* bssid);
     static uint16_t filteredCount;

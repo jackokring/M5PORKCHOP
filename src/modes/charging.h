@@ -6,7 +6,6 @@
 
 class ChargingMode {
 public:
-    static void init();
     static void start();
     static void stop();
     static void update();
@@ -15,6 +14,7 @@ public:
     static bool isRunning() { return running; }
     static bool shouldExit() { return exitRequested; }
     static void clearExit() { exitRequested = false; }
+    static bool areBarsHidden() { return barsHidden; }
     
     // Battery info getters for display
     static uint8_t getBatteryPercent() { return batteryPercent; }
@@ -26,6 +26,7 @@ private:
     static bool running;
     static bool exitRequested;
     static bool keyWasPressed;
+    static bool barsHidden;
     
     // Battery state
     static uint8_t batteryPercent;
@@ -53,7 +54,6 @@ private:
     // Session state snapshots
     static bool reconWasActive;
     static bool gpsWasActive;
-    static uint8_t wifiModeBefore;
     static bool wifiWasOn;
 
     // External power tracking

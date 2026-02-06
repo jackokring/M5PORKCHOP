@@ -3,6 +3,7 @@
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <FS.h>
 #include <SPI.h>
 
 #define CONFIG_FILE "/porkchop.conf"
@@ -73,12 +74,12 @@ static constexpr uint8_t BOOT_MODE_COUNT = 4;
 struct MLConfig {
     bool enabled = true;
     MLCollectionMode collectionMode = MLCollectionMode::ENHANCED;  // Data collection mode
-    String modelPath = "/m5porkchop/models/porkchop_model.bin";
+    char modelPath[64] = "/m5porkchop/models/porkchop_model.bin";
     float confidenceThreshold = 0.7f;
     float rogueApThreshold = 0.8f;
     float vulnScorerThreshold = 0.6f;
     bool autoUpdate = false;
-    String updateUrl = "";
+    char updateUrl[128] = "";
 };
 
 // WiFi settings for scanning and OTA
@@ -166,4 +167,6 @@ private:
     static bool createDefaultConfig();
     static bool createDefaultPersonality();
     static void savePersonalityToSPIFFS();
+    static bool loadFrom(fs::FS& fs, const char* path);   // JSON migration only
+    static bool applyJson(const JsonDocument& doc);        // JSON migration only
 };
