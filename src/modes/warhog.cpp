@@ -231,8 +231,8 @@ void WarhogMode::start() {
     // Stop NetworkRecon before WiFi manipulation (uses promiscuous mode, incompatible with STA scanning)
     NetworkRecon::stop();
     
-    // Full WiFi reinitialization for clean slate
-    WiFi.disconnect(true);  // Disconnect and clear settings
+    // Soft WiFi reset — keep driver alive to avoid esp_wifi_init() RX buffer failures
+    WiFi.disconnect(false, true);  // Keep driver, erase AP credentials
     delay(200);             // Let it settle
     WiFi.mode(WIFI_STA);    // Station mode for scanning
     
@@ -288,8 +288,8 @@ void WarhogMode::stop() {
             WiFi.scanDelete();
         } else {
             // Task was force-killed — WiFi state may be inconsistent.
-            // Full disconnect resets the scan state machine safely.
-            WiFi.disconnect(true);
+            // Soft reset keeps driver alive (avoid RX buffer realloc on fragmented heap).
+            WiFi.disconnect(false, true);
             delay(50);
         }
     }
@@ -326,9 +326,9 @@ void WarhogMode::scanTask(void* pvParameters) {
         return;
     }
 
-    // Do full WiFi reset for reliable scanning
+    // Soft WiFi reset — keep driver alive to avoid RX buffer realloc failures
     WiFi.scanDelete();
-    WiFi.disconnect(true);
+    WiFi.disconnect(false, true);
         vTaskDelay(pdMS_TO_TICKS(100));
 
     // Check abort between WiFi operations

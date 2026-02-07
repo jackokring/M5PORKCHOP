@@ -510,6 +510,15 @@ static void scanXpAwards() {
         return;
     }
     if (xpSessionAwarded >= XP_SESSION_CAP) return;
+
+    // Gate: defer scan if heap is too low for SD reads + vector operations
+    HeapGates::GateStatus gate = HeapGates::checkGate(
+        HeapPolicy::kFileServerMinHeap,
+        HeapPolicy::kFileServerMinLargest);
+    if (gate.failure != HeapGates::TlsGateFailure::None) {
+        xpScanPending = true;
+        return;
+    }
     if (!XP_WPA_AWARDED_FILE || !XP_WIGLE_AWARDED_FILE || !WPA_SENT_FILE || !WIGLE_UPLOADED_FILE) {
         refreshSdPaths();
     }

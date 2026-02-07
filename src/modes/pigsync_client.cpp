@@ -888,8 +888,8 @@ void PigSyncMode::start() {
     // Pause NetworkRecon - promiscuous mode conflicts with ESP-NOW
     NetworkRecon::pause();
     
-    // Disable WiFi first
-    WiFi.disconnect(true);
+    // Soft WiFi reset — keep driver alive to avoid RX buffer realloc failures
+    WiFi.disconnect(false, true);
     WiFi.mode(WIFI_STA);
     delay(100);
     

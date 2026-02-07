@@ -55,25 +55,8 @@ static void ensureNvsReady() {
 }
 
 void stopPromiscuous() {
-    // #region agent log - HEAP INSTRUMENTATION
-    Serial.printf("[WIFI-HEAP] stopPromiscuous() ENTRY: free=%u largest=%u\n",
-                  ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-    // #endregion
-    
-    // Promiscuous must be off before switching modes / reconnecting
     esp_wifi_set_promiscuous(false);
-    
-    // #region agent log
-    Serial.printf("[WIFI-HEAP] After esp_wifi_set_promiscuous(false): free=%u largest=%u\n",
-                  ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-    // #endregion
-    
     esp_wifi_set_promiscuous_rx_cb(nullptr);
-    
-    // #region agent log
-    Serial.printf("[WIFI-HEAP] stopPromiscuous() EXIT: free=%u largest=%u\n",
-                  ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-    // #endregion
 }
 
 void lockTls() {
@@ -280,43 +263,14 @@ void hardReset() {
 }
 
 void shutdown() {
-    // #region agent log - HEAP INSTRUMENTATION
-    Serial.printf("[WIFI-HEAP] shutdown() ENTRY: free=%u largest=%u\n",
-                  ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-    // #endregion
-    
     stopPromiscuous();
-    
-    // #region agent log
-    Serial.printf("[WIFI-HEAP] After stopPromiscuous(): free=%u largest=%u\n",
-                  ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-    // #endregion
 
     // Soft shutdown (no driver teardown)
     WiFi.persistent(false);
-
-    // Same fix here: never power off WiFi driver
     WiFi.disconnect(false, true);
-    
-    // #region agent log
-    Serial.printf("[WIFI-HEAP] After WiFi.disconnect(): free=%u largest=%u\n",
-                  ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-    // #endregion
-
-    // Keep STA mode (do not go WIFI_OFF)
     WiFi.mode(WIFI_STA);
-    
-    // #region agent log
-    Serial.printf("[WIFI-HEAP] After WiFi.mode(STA): free=%u largest=%u\n",
-                  ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-    // #endregion
 
     delay(HeapPolicy::kWiFiShutdownDelayMs);
-    
-    // #region agent log
-    Serial.printf("[WIFI-HEAP] shutdown() EXIT (after 80ms delay): free=%u largest=%u\n",
-                  ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-    // #endregion
 }
 
 size_t conditionHeapForTLS() {
@@ -499,6 +453,17 @@ size_t brewHeap(uint32_t dwellMs, bool includeBleCleanup) {
         esp_wifi_set_channel(channels[i % 13], WIFI_SECOND_CHAN_NONE);
         delay(stepMs);
         yield();
+
+        // Early exit if heap has stabilized (same check as conditionHeapForTLS)
+        uint32_t elapsedMs = (i + 1) * stepMs;
+        if (elapsedMs > HeapPolicy::kConditioningWarmupMs) {
+            size_t currentLargest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+            if (currentLargest > HeapPolicy::kHeapStableThreshold) {
+                Serial.printf("[HEAP] Brew early exit at %ums (largest=%u)\n",
+                              elapsedMs, (unsigned)currentLargest);
+                break;
+            }
+        }
     }
 
     esp_wifi_set_promiscuous(false);
