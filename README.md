@@ -333,7 +333,7 @@
           RAM is for living, not for hoarding.)
 
     BOUNTY SYSTEM: wardriven networks become targets for
-    PigSync. your Sirloin companion can hunt what you found.
+    PigSync. your s3rloin companion can hunt what you found.
     max 15 bounty BSSIDs per sync payload.
     manage in LOOT > BOUNTIES.
 
@@ -815,14 +815,14 @@
 --[ 6 - PIGSYNC (son of a pig)
 
     ESP-NOW encrypted sync between POPS (Porkchop) and
-    SON (Sirloin). the prodigal son answers the phone.
+    SON (s3rloin). the prodigal son answers the phone.
 
 
 ----[ 6.1 - THE PROTOCOL
 
     press [2] from IDLE to enter PigSync.
 
-    DISCOVERY: broadcast on channel 1. Sirloin responds
+    DISCOVERY: broadcast on channel 1. s3rloin responds
     with MAC, pending capture count, flags, RSSI.
 
     CONNECTION: CMD_HELLO -> RSP_HELLO (session token +
@@ -839,9 +839,9 @@
      yes, the keys are pig-themed. obviously.)
 
     BOUNTIES: wardriven network BSSIDs sent as hunting
-    targets. max 15 per payload. Sirloin reports matches.
+    targets. max 15 per payload. s3rloin reports matches.
 
-    TIME SYNC: Sirloin has RTC, Porkchop doesn't.
+    TIME SYNC: s3rloin has RTC, Porkchop doesn't.
     CMD_TIME_SYNC with RTT calculation for accuracy.
 
 
@@ -873,12 +873,12 @@
 
 ----[ 6.3 - BEACON GRUNTS (Phase 3)
 
-    Sirloin broadcasts BeaconGrunt packets when idle:
+    s3rloin broadcasts grunt beacon packets when idle:
     MAC, capture count, battery, storage, mood tier,
     RTC time, uptime, short name.
 
     connectionless passive awareness. Porkchop can see
-    Sirloin's status without initiating a call.
+    s3rloin's status without initiating a call.
 
     the son is out there. broadcasting.
     porkchop listens. porkchop hopes.
