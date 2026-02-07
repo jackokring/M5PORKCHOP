@@ -297,7 +297,10 @@ static void loadAwardedList(const char* path, std::vector<XpAwardEntry>& out, bo
         return;
     }
     out.clear();
-    out.reserve(XP_AWARD_CACHE_MAX);
+    // Reserve conservatively — full 512 entries may not fit alongside WebServer
+    size_t freeHeap = ESP.getFreeHeap();
+    size_t reserveCount = (freeHeap > 60000) ? XP_AWARD_CACHE_MAX : 64;
+    try { out.reserve(reserveCount); } catch (...) { /* grow on demand */ }
     complete = true;
     File f = SD.open(path, FILE_READ);
     if (f) {
@@ -318,7 +321,7 @@ static void loadAwardedList(const char* path, std::vector<XpAwardEntry>& out, bo
                     XpAwardEntry entry;
                     strncpy(entry.key, stored, sizeof(entry.key) - 1);
                     entry.key[sizeof(entry.key) - 1] = '\0';
-                    out.push_back(entry);
+                    try { out.push_back(entry); } catch (...) { complete = false; break; }
                 } else {
                     complete = false;
                     break;
@@ -341,7 +344,7 @@ static bool appendAwarded(const char* path, std::vector<XpAwardEntry>& out, cons
     XpAwardEntry entry;
     strncpy(entry.key, value, sizeof(entry.key) - 1);
     entry.key[sizeof(entry.key) - 1] = '\0';
-    out.push_back(entry);
+    try { out.push_back(entry); } catch (...) { /* file written, cache just won't track it */ }
     return true;
 }
 
