@@ -17,7 +17,7 @@ public:
     
 private:
     struct CrashEntry {
-        String path;
+        char path[64];
         time_t timestamp = 0;
     };
     static bool active;
@@ -30,14 +30,12 @@ private:
     static bool fileViewActive;
     static bool nukeConfirmActive;
     static bool keyWasPressed;
-    static String activeFile;
-    
+    static char activeFile[64];
+
     static void scanCrashFiles();
-    static void loadCrashFile(const String& path);
+    static void loadCrashFile(const char* path);
     static void drawList(M5Canvas& canvas);
     static void drawFile(M5Canvas& canvas);
     static void drawNukeConfirm(M5Canvas& canvas);
     static void nukeCrashFiles();
-    static String getDisplayName(const String& path);
-    static String formatTime(time_t t);
 };

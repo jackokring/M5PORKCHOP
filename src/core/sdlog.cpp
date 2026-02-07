@@ -8,7 +8,7 @@
 
 bool SDLog::logEnabled = false;
 bool SDLog::initialized = false;
-String SDLog::currentLogFile = "";
+char SDLog::currentLogFile[64] = {0};
 
 void SDLog::init() {
     initialized = true;
@@ -16,18 +16,18 @@ void SDLog::init() {
 }
 
 void SDLog::setEnabled(bool enabled) {
-    Serial.printf("[SDLOG] setEnabled(%s), SD available: %s\n", 
-                  enabled ? "true" : "false", 
+    Serial.printf("[SDLOG] setEnabled(%s), SD available: %s\n",
+                  enabled ? "true" : "false",
                   Config::isSDAvailable() ? "true" : "false");
-    
+
     logEnabled = enabled && Config::isSDAvailable();
-    
-    if (logEnabled && currentLogFile.length() == 0) {
+
+    if (logEnabled && currentLogFile[0] == '\0') {
         ensureLogFile();
     }
-    
+
     if (logEnabled) {
-        Serial.printf("[SDLOG] Logging now ENABLED to: %s\n", currentLogFile.c_str());
+        Serial.printf("[SDLOG] Logging now ENABLED to: %s\n", currentLogFile);
         log("SDLOG", "SD logging enabled");
     } else {
         Serial.printf("[SDLOG] Logging DISABLED\n");
@@ -35,29 +35,29 @@ void SDLog::setEnabled(bool enabled) {
 }
 
 void SDLog::ensureLogFile() {
-    if (currentLogFile.length() > 0) return;
+    if (currentLogFile[0] != '\0') return;
     if (!Config::isSDAvailable()) return;
-    
+
     // Create logs directory if needed
     const char* logsDir = SDLayout::logsDir();
     if (!SD.exists(logsDir)) {
         SD.mkdir(logsDir);
     }
-    
+
     // Use fixed filename - easier to find and read
-    currentLogFile = String(logsDir) + "/porkchop.log";
-    
+    snprintf(currentLogFile, sizeof(currentLogFile), "%s/porkchop.log", logsDir);
+
     // Create file with header
-    File f = SD.open(currentLogFile.c_str(), FILE_WRITE);
+    File f = SD.open(currentLogFile, FILE_WRITE);
     if (f) {
         f.println("=== PORKCHOP LOG ===");
         f.printf("Started at millis: %lu\n", millis());
         f.println("====================");
         f.close();
-        Serial.printf("[SDLOG] Log file: %s\n", currentLogFile.c_str());
+        Serial.printf("[SDLOG] Log file: %s\n", currentLogFile);
     } else {
-        Serial.printf("[SDLOG] Failed to create: %s\n", currentLogFile.c_str());
-        currentLogFile = "";
+        Serial.printf("[SDLOG] Failed to create: %s\n", currentLogFile);
+        currentLogFile[0] = '\0';
     }
 }
 
@@ -66,10 +66,10 @@ void SDLog::log(const char* tag, const char* format, ...) {
     if (!logEnabled) {
         return;
     }
-    if (currentLogFile.length() == 0) {
+    if (currentLogFile[0] == '\0') {
         // Try to create log file if it doesn't exist
         ensureLogFile();
-        if (currentLogFile.length() == 0) {
+        if (currentLogFile[0] == '\0') {
             Serial.printf("[SDLOG] ERROR: Could not create log file\n");
             return;
         }
@@ -88,11 +88,11 @@ void SDLog::log(const char* tag, const char* format, ...) {
     // Try to open file with retry on failure (SD can be busy with other operations)
     File f;
     for (int retry = 0; retry < 3; retry++) {
-        f = SD.open(currentLogFile.c_str(), FILE_APPEND);
+        f = SD.open(currentLogFile, FILE_APPEND);
         if (f) break;
         delay(5);  // Brief delay before retry
     }
-    
+
     if (!f) {
         Serial.printf("[SDLOG] Failed to open log file for append\n");
         return;
@@ -105,15 +105,15 @@ void SDLog::log(const char* tag, const char* format, ...) {
 
 void SDLog::logRaw(const char* message) {
     if (!logEnabled) return;
-    if (currentLogFile.length() == 0) {
+    if (currentLogFile[0] == '\0') {
         ensureLogFile();
-        if (currentLogFile.length() == 0) return;
+        if (currentLogFile[0] == '\0') return;
     }
-    
+
     // Try to open file with retry on failure
     File f;
     for (int retry = 0; retry < 3; retry++) {
-        f = SD.open(currentLogFile.c_str(), FILE_APPEND);
+        f = SD.open(currentLogFile, FILE_APPEND);
         if (f) break;
         delay(5);
     }
@@ -129,8 +129,8 @@ void SDLog::flush() {
 }
 
 void SDLog::close() {
-    if (logEnabled && currentLogFile.length() > 0) {
+    if (logEnabled && currentLogFile[0] != '\0') {
         log("SDLOG", "Log closed");
     }
-    currentLogFile = "";
+    currentLogFile[0] = '\0';
 }

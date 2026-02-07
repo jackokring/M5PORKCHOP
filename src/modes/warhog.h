@@ -62,8 +62,8 @@ private:
     static uint32_t wepNetworks;
     static uint32_t wpaNetworks;
     static uint32_t savedCount;      // Networks saved with GPS to CSV
-    static String currentFilename;   // Current session CSV file
-    static String currentWigleFilename; // Current session WiGLE CSV file
+    static char currentFilename[128];   // Current session CSV file
+    static char currentWigleFilename[128]; // Current session WiGLE CSV file
 
     // Background scan task
     static TaskHandle_t scanTaskHandle;
@@ -84,7 +84,7 @@ private:
                                  int8_t rssi, uint8_t channel, wifi_auth_mode_t auth,
                                  double lat, double lon, double alt, double accuracy);
     
-    static String authModeToString(wifi_auth_mode_t mode);
-    static String authModeToWigleString(wifi_auth_mode_t mode);
-    static String generateFilename(const char* ext);
+    static const char* authModeToString(wifi_auth_mode_t mode);
+    static const char* authModeToWigleString(wifi_auth_mode_t mode);
+    static void generateFilename(char* buf, size_t bufSize, const char* ext);
 };

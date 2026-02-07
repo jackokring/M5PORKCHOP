@@ -203,7 +203,8 @@ void CapturesMenu::processAsyncScan() {
 
         if (isPCAP || isPMKID || isHS22000) {
             CaptureInfo info;
-            info.filename = name;
+            memset(&info, 0, sizeof(info));
+            strncpy(info.filename, name.c_str(), sizeof(info.filename) - 1);
             info.fileSize = currentFile.size();
             info.captureTime = currentFile.getLastWrite();
             info.isPMKID = isPMKID;  // Only true for PMKID files
@@ -215,14 +216,12 @@ void CapturesMenu::processAsyncScan() {
                 baseName = baseName.substring(0, baseName.length() - 3);
             }
             if (baseName.length() >= 12) {
-                info.bssid = baseName.substring(0, 2) + ":" +
-                             baseName.substring(2, 4) + ":" +
-                             baseName.substring(4, 6) + ":" +
-                             baseName.substring(6, 8) + ":" +
-                             baseName.substring(8, 10) + ":" +
-                             baseName.substring(10, 12);
+                const char* b = baseName.c_str();
+                snprintf(info.bssid, sizeof(info.bssid),
+                         "%.2s:%.2s:%.2s:%.2s:%.2s:%.2s",
+                         b, b+2, b+4, b+6, b+8, b+10);
             } else {
-                info.bssid = baseName;
+                strncpy(info.bssid, baseName.c_str(), sizeof(info.bssid) - 1);
             }
 
             // Try to get SSID from companion .txt file if it exists. For PMKID we use _pmkid.txt suffix, otherwise .txt
@@ -232,18 +231,19 @@ void CapturesMenu::processAsyncScan() {
             if (SD.exists(txtPath)) {
                 File txtFile = SD.open(txtPath, FILE_READ);
                 if (txtFile) {
-                    info.ssid = txtFile.readStringUntil('\n');
-                    info.ssid.trim();
+                    String line = txtFile.readStringUntil('\n');
+                    line.trim();
+                    strncpy(info.ssid, line.c_str(), sizeof(info.ssid) - 1);
                     txtFile.close();
                 }
             }
-            if (info.ssid.isEmpty()) {
-                info.ssid = "[UNKNOWN]";
+            if (info.ssid[0] == '\0') {
+                strncpy(info.ssid, "[UNKNOWN]", sizeof(info.ssid) - 1);
             }
 
             // Default status and password
             info.status = CaptureStatus::LOCAL;
-            info.password = "";
+            // password already zeroed by memset
 
             captures.push_back(info);
             
@@ -278,7 +278,7 @@ void CapturesMenu::updateWPASecStatus() {
     char normalized[13] = {0};
     for (auto& cap : captures) {
         // Normalize BSSID for lookup (remove colons)
-        WPASec::normalizeBSSID_Char(cap.bssid.c_str(), normalized, sizeof(normalized));
+        WPASec::normalizeBSSID_Char(cap.bssid, normalized, sizeof(normalized));
         if (normalized[0] == '\0') {
             cap.status = CaptureStatus::LOCAL;
             continue;
@@ -286,7 +286,11 @@ void CapturesMenu::updateWPASecStatus() {
         
         if (WPASec::isCracked(normalized)) {
             cap.status = CaptureStatus::CRACKED;
-            cap.password = WPASec::getPassword(normalized);
+            {
+                String pw = WPASec::getPassword(normalized);
+                strncpy(cap.password, pw.c_str(), sizeof(cap.password) - 1);
+                cap.password[sizeof(cap.password) - 1] = '\0';
+            }
         } else if (WPASec::isUploaded(normalized)) {
             cap.status = CaptureStatus::UPLOADED;
         } else {
@@ -315,12 +319,16 @@ void CapturesMenu::processAsyncWPASecUpdate() {
         
         // Normalize BSSID for lookup (remove colons)
         char normalized[13] = {0};
-        WPASec::normalizeBSSID_Char(cap.bssid.c_str(), normalized, sizeof(normalized));
+        WPASec::normalizeBSSID_Char(cap.bssid, normalized, sizeof(normalized));
         
         if (normalized[0] != '\0') {
             if (WPASec::isCracked(normalized)) {
                 cap.status = CaptureStatus::CRACKED;
-                cap.password = WPASec::getPassword(normalized);
+                {
+                    String pw = WPASec::getPassword(normalized);
+                    strncpy(cap.password, pw.c_str(), sizeof(cap.password) - 1);
+                    cap.password[sizeof(cap.password) - 1] = '\0';
+                }
             } else if (WPASec::isUploaded(normalized)) {
                 cap.status = CaptureStatus::UPLOADED;
             } else {
@@ -572,7 +580,7 @@ void CapturesMenu::draw(M5Canvas& canvas) {
             ssidBuf[pos++] = 'P';
             ssidBuf[pos++] = ']';
         }
-        const char* ssidSrc = cap.ssid.c_str();
+        const char* ssidSrc = cap.ssid;
         while (*ssidSrc && pos + 1 < sizeof(ssidBuf)) {
             ssidBuf[pos++] = (char)toupper((unsigned char)*ssidSrc++);
         }
@@ -742,7 +750,7 @@ void CapturesMenu::drawDetailView(M5Canvas& canvas) {
     // SSID
     char ssidLine[24];
     size_t ssidPos = 0;
-    const char* ssidSrc = cap.ssid.c_str();
+    const char* ssidSrc = cap.ssid;
     while (*ssidSrc && ssidPos + 1 < sizeof(ssidLine)) {
         ssidLine[ssidPos++] = (char)toupper((unsigned char)*ssidSrc++);
     }
@@ -753,9 +761,9 @@ void CapturesMenu::drawDetailView(M5Canvas& canvas) {
         ssidLine[16] = '\0';
     }
     canvas.drawString(ssidLine, centerX, boxY + 6);
-    
+
     // BSSID (already uppercase from storage)
-    canvas.drawString(cap.bssid.c_str(), centerX, boxY + 20);
+    canvas.drawString(cap.bssid, centerX, boxY + 20);
     
     // Status and password
     if (cap.status == CaptureStatus::CRACKED) {
@@ -763,7 +771,7 @@ void CapturesMenu::drawDetailView(M5Canvas& canvas) {
         
         // Password in larger text
         char pwLine[24];
-        const char* pwSrc = cap.password.c_str();
+        const char* pwSrc = cap.password;
         size_t pwLen = strlen(pwSrc);
         if (pwLen > 20 && sizeof(pwLine) > 20) {
             size_t keep = 18;

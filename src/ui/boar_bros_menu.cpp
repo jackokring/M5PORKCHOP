@@ -80,19 +80,17 @@ void BoarBrosMenu::loadBros() {
             
             if (valid) {
                 BroInfo info;
+                memset(&info, 0, sizeof(info));
                 info.bssid = bssid;
-                char bssidBuf[18];
-                formatBSSID(bssid, bssidBuf, sizeof(bssidBuf));
-                info.bssidStr = bssidBuf;
-                
+                formatBSSID(bssid, info.bssidStr, sizeof(info.bssidStr));
+
                 // Extract SSID from rest of line (after space)
                 if (line.length() > 13) {
-                    info.ssid = line.substring(13);
-                    info.ssid.trim();
-                } else {
-                    info.ssid = "";
+                    String ssidPart = line.substring(13);
+                    ssidPart.trim();
+                    strncpy(info.ssid, ssidPart.c_str(), sizeof(info.ssid) - 1);
                 }
-                
+
                 bros.push_back(info);
             }
         }
@@ -124,7 +122,7 @@ void BoarBrosMenu::getSelectedInfo(char* out, size_t len) {
         return;
     }
     if (selectedIndex < bros.size()) {
-        strncpy(out, bros[selectedIndex].bssidStr.c_str(), len - 1);
+        strncpy(out, bros[selectedIndex].bssidStr, len - 1);
         out[len - 1] = '\0';
         return;
     }
@@ -248,7 +246,7 @@ void BoarBrosMenu::draw(M5Canvas& canvas) {
         
         // SSID or "NONAME BRO" for hidden networks
         canvas.setCursor(4, y);
-        const char* nameSrc = bro.ssid.length() > 0 ? bro.ssid.c_str() : "NONAME BRO";
+        const char* nameSrc = bro.ssid[0] != '\0' ? bro.ssid : "NONAME BRO";
         char displayName[20];
         size_t pos = 0;
         while (*nameSrc && pos + 1 < sizeof(displayName)) {
@@ -305,7 +303,7 @@ void BoarBrosMenu::drawDeleteConfirm(M5Canvas& canvas) {
     canvas.drawString("REMOVE THIS BRO?", boxX + boxW / 2, boxY + 10);
     
     const BroInfo& bro = bros[selectedIndex];
-    const char* broSrc = bro.ssid.length() > 0 ? bro.ssid.c_str() : bro.bssidStr.c_str();
+    const char* broSrc = bro.ssid[0] != '\0' ? bro.ssid : bro.bssidStr;
     char broName[24];
     size_t broPos = 0;
     while (*broSrc && broPos + 1 < sizeof(broName)) {

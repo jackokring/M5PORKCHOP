@@ -730,7 +730,7 @@ void init() {
     Serial.println("[RECON] Initializing NetworkRecon service...");
     
     networks.clear();
-    networks.reserve(50);  // Initial reserve, will grow as needed
+    networks.reserve(MAX_RECON_NETWORKS);  // Full upfront reserve — eliminates growth reallocations
     
     packetCount = 0;
     currentChannel = 1;
@@ -794,11 +794,13 @@ void start() {
         
         NimBLEDevice::deinit(true);
         delay(100);
-        
+        yield();  // Let deferred FreeRTOS cleanup tasks coalesce freed BLE memory
+        delay(50);
+
         Serial.printf("[RECON] After BLE deinit: free=%u largest=%u\n",
                       ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     }
-    
+
     // Initialize WiFi
     WiFi.persistent(false);
     WiFi.setSleep(false);
@@ -912,6 +914,14 @@ void update() {
     if (now - lastCleanupTime > CLEANUP_INTERVAL_MS) {
         cleanupStaleNetworks();
         lastCleanupTime = now;
+
+        // Reclaim over-provisioned capacity to reduce heap fragmentation
+        // Only shrink if capacity exceeds size by a wide margin (avoids thrashing)
+        if (networks.capacity() > networks.size() + 40) {
+            busy.store(true, std::memory_order_release);
+            try { networks.shrink_to_fit(); } catch (...) {}
+            busy.store(false, std::memory_order_release);
+        }
     }
     
     // Check heap stabilization

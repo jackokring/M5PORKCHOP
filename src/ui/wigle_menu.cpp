@@ -39,13 +39,12 @@ uint8_t WigleMenu::syncSkipped = 0;
 bool WigleMenu::syncStatsFetched = false;
 char WigleMenu::syncError[48] = "";
 
-static void formatDisplayName(const String& filename, char* out, size_t len, size_t maxChars,
+static void formatDisplayName(const char* filename, char* out, size_t len, size_t maxChars,
                               const char* ellipsis, bool stripDecorators) {
     if (!out || len == 0) return;
     out[0] = '\0';
-    if (len == 0) return;
 
-    const char* name = filename.c_str();
+    const char* name = filename;
     size_t total = strlen(name);
     size_t start = 0;
     size_t end = total;
@@ -163,7 +162,7 @@ void WigleMenu::processAsyncScan() {
             
             // Sort by filename (newest first - filenames include timestamp)
             std::sort(files.begin(), files.end(), [](const WigleFileInfo& a, const WigleFileInfo& b) {
-                return a.filename > b.filename;
+                return strcmp(a.filename, b.filename) > 0;
             });
             
             Serial.printf("[WIGLE_MENU] Async scan complete. Found %d WiGLE files\n", files.size());
@@ -175,16 +174,17 @@ void WigleMenu::processAsyncScan() {
             // Only show WiGLE format files (*.wigle.csv)
             if (name.endsWith(".wigle.csv")) {
                 WigleFileInfo info;
+                memset(&info, 0, sizeof(info));
                 int slash = name.lastIndexOf('/');
                 String base = (slash >= 0) ? name.substring(slash + 1) : name;
-                info.filename = base;
-                info.fullPath = String(SDLayout::wardrivingDir()) + "/" + base;
+                strncpy(info.filename, base.c_str(), sizeof(info.filename) - 1);
+                snprintf(info.fullPath, sizeof(info.fullPath), "%s/%s", SDLayout::wardrivingDir(), base.c_str());
                 info.fileSize = currentFile.size();
                 // Estimate network count: ~150 bytes per line after header
                 info.networkCount = info.fileSize > 300 ? (info.fileSize - 300) / 150 : 0;
-                
+
                 // Check upload status
-                info.status = WiGLE::isUploaded(info.fullPath.c_str()) ? 
+                info.status = WiGLE::isUploaded(info.fullPath) ?
                     WigleFileStatus::UPLOADED : WigleFileStatus::LOCAL;
                 
                 files.push_back(info);
@@ -547,21 +547,26 @@ void WigleMenu::nukeTrack() {
     
     const WigleFileInfo& file = files[selectedIndex];
     
-    Serial.printf("[WIGLE_MENU] Nuking track: %s\n", file.fullPath.c_str());
-    
+    Serial.printf("[WIGLE_MENU] Nuking track: %s\n", file.fullPath);
+
     // Delete the .wigle.csv file
     bool deleted = SD.remove(file.fullPath);
-    
+
     // Also delete matching internal CSV if exists (same name without .wigle)
-    String internalPath = file.fullPath;
-    internalPath.replace(".wigle.csv", ".csv");
-    if (SD.exists(internalPath)) {
-        SD.remove(internalPath);
-        Serial.printf("[WIGLE_MENU] Also nuked: %s\n", internalPath.c_str());
+    char internalPath[80];
+    strncpy(internalPath, file.fullPath, sizeof(internalPath) - 1);
+    internalPath[sizeof(internalPath) - 1] = '\0';
+    char* wigleSuffix = strstr(internalPath, ".wigle.csv");
+    if (wigleSuffix) {
+        strcpy(wigleSuffix, ".csv");
+        if (SD.exists(internalPath)) {
+            SD.remove(internalPath);
+            Serial.printf("[WIGLE_MENU] Also nuked: %s\n", internalPath);
+        }
     }
-    
+
     // Remove from uploaded tracking if present
-    WiGLE::removeFromUploaded(file.fullPath.c_str());
+    WiGLE::removeFromUploaded(file.fullPath);
     
     if (deleted) {
         Display::setTopBarMessage("TRACK NUKED!", 4000);

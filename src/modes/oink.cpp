@@ -335,8 +335,10 @@ void OinkMode::init() {
     
     // networks vector is now managed by NetworkRecon - just clear OINK-specific data
     handshakes.clear();
+    handshakes.shrink_to_fit();
     pmkids.clear();
-    
+    pmkids.shrink_to_fit();
+
     handshakes.reserve(5);
     pmkids.reserve(10);
     filteredCount = 0;

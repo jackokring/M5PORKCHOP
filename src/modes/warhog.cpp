@@ -109,8 +109,8 @@ uint32_t WarhogMode::openNetworks = 0;
 uint32_t WarhogMode::wepNetworks = 0;
 uint32_t WarhogMode::wpaNetworks = 0;
 uint32_t WarhogMode::savedCount = 0;      // Geotagged networks (CSV)
-String WarhogMode::currentFilename = "";
-String WarhogMode::currentWigleFilename = "";
+char WarhogMode::currentFilename[128] = {0};
+char WarhogMode::currentWigleFilename[128] = {0};
 
 // Scan state
 bool WarhogMode::scanInProgress = false;
@@ -194,8 +194,8 @@ void WarhogMode::init() {
     wepNetworks = 0;
     wpaNetworks = 0;
     savedCount = 0;
-    currentFilename = "";
-    currentWigleFilename = "";
+    currentFilename[0] = '\0';
+    currentWigleFilename[0] = '\0';
 
     resetSeenTracking();
 
@@ -211,8 +211,8 @@ void WarhogMode::start() {
     wepNetworks = 0;
     wpaNetworks = 0;
     savedCount = 0;
-    currentFilename = "";
-    currentWigleFilename = "";
+    currentFilename[0] = '\0';
+    currentWigleFilename[0] = '\0';
 
     resetSeenTracking();
     seedCapturedFromOink();
@@ -480,8 +480,8 @@ void WarhogMode::performScan() {
 
 // Ensure CSV file exists with header
 bool WarhogMode::ensureCSVFileReady() {
-    if (currentFilename.length() > 0) return true;
-    
+    if (currentFilename[0] != '\0') return true;
+
     // Ensure wardriving directory exists
     const char* wardrivingDir = SDLayout::wardrivingDir();
     if (!SD.exists(wardrivingDir)) {
@@ -489,12 +489,12 @@ bool WarhogMode::ensureCSVFileReady() {
             return false;
         }
     }
-    
-    currentFilename = generateFilename("csv");
-    
-    File f = openFileWithRetry(currentFilename.c_str(), FILE_WRITE);
+
+    generateFilename(currentFilename, sizeof(currentFilename), "csv");
+
+    File f = openFileWithRetry(currentFilename, FILE_WRITE);
     if (!f) {
-        currentFilename = "";
+        currentFilename[0] = '\0';
         return false;
     }
     
@@ -510,31 +510,31 @@ void WarhogMode::appendCSVEntry(const uint8_t* bssid, const char* ssid,
                                  double lat, double lon, double alt) {
     if (!ensureCSVFileReady()) return;
     
-    File f = openFileWithRetry(currentFilename.c_str(), FILE_APPEND);
+    File f = openFileWithRetry(currentFilename, FILE_APPEND);
     if (!f) return;
-    
+
     f.printf("%02X:%02X:%02X:%02X:%02X:%02X,",
             bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
     writeCSVField(f, ssid);
     f.print(",");
     f.printf("%d,%d,%s,%.6f,%.6f,%.1f,%lu\n",
-            rssi, channel, authModeToString(auth).c_str(),
+            rssi, channel, authModeToString(auth),
             lat, lon, alt, millis());
     f.close();
 }
 
 // Check if WiGLE file needs rotation due to size
 void WarhogMode::checkWigleFileRotation() {
-    if (currentWigleFilename.length() == 0) return;
-    
-    File f = SD.open(currentWigleFilename.c_str(), FILE_READ);
+    if (currentWigleFilename[0] == '\0') return;
+
+    File f = SD.open(currentWigleFilename, FILE_READ);
     if (!f) return;
-    
+
     size_t fileSize = f.size();
     f.close();
-    
+
     if (fileSize >= WIGLE_FILE_MAX_SIZE) {
-        currentWigleFilename = "";  // Force new file creation on next append
+        currentWigleFilename[0] = '\0';  // Force new file creation on next append
     }
 }
 
@@ -543,8 +543,8 @@ bool WarhogMode::ensureWigleFileReady() {
     // Check if current file needs rotation
     checkWigleFileRotation();
     
-    if (currentWigleFilename.length() > 0) return true;
-    
+    if (currentWigleFilename[0] != '\0') return true;
+
     // Ensure wardriving directory exists
     const char* wardrivingDir = SDLayout::wardrivingDir();
     if (!SD.exists(wardrivingDir)) {
@@ -552,12 +552,12 @@ bool WarhogMode::ensureWigleFileReady() {
             return false;
         }
     }
-    
-    currentWigleFilename = generateFilename("wigle.csv");
-    
-    File f = openFileWithRetry(currentWigleFilename.c_str(), FILE_WRITE);
+
+    generateFilename(currentWigleFilename, sizeof(currentWigleFilename), "wigle.csv");
+
+    File f = openFileWithRetry(currentWigleFilename, FILE_WRITE);
     if (!f) {
-        currentWigleFilename = "";
+        currentWigleFilename[0] = '\0';
         return false;
     }
     
@@ -577,27 +577,18 @@ bool WarhogMode::ensureWigleFileReady() {
     return true;
 }
 
-// Convert auth mode to WiGLE capability string format
-String WarhogMode::authModeToWigleString(wifi_auth_mode_t mode) {
+// Convert auth mode to WiGLE capability string format (returns string literal, zero allocation)
+const char* WarhogMode::authModeToWigleString(wifi_auth_mode_t mode) {
     switch (mode) {
-        case WIFI_AUTH_OPEN:
-            return "[ESS]";
-        case WIFI_AUTH_WEP:
-            return "[WEP][ESS]";
-        case WIFI_AUTH_WPA_PSK:
-            return "[WPA-PSK-CCMP][ESS]";
-        case WIFI_AUTH_WPA2_PSK:
-            return "[WPA2-PSK-CCMP][ESS]";
-        case WIFI_AUTH_WPA_WPA2_PSK:
-            return "[WPA-PSK-CCMP+TKIP][WPA2-PSK-CCMP+TKIP][ESS]";
-        case WIFI_AUTH_WPA3_PSK:
-            return "[WPA3-SAE][ESS]";
-        case WIFI_AUTH_WPA2_WPA3_PSK:
-            return "[WPA2-PSK-CCMP][WPA3-SAE][ESS]";
-        case WIFI_AUTH_WAPI_PSK:
-            return "[WAPI-PSK][ESS]";
-        default:
-            return "[ESS]";
+        case WIFI_AUTH_OPEN:          return "[ESS]";
+        case WIFI_AUTH_WEP:           return "[WEP][ESS]";
+        case WIFI_AUTH_WPA_PSK:       return "[WPA-PSK-CCMP][ESS]";
+        case WIFI_AUTH_WPA2_PSK:      return "[WPA2-PSK-CCMP][ESS]";
+        case WIFI_AUTH_WPA_WPA2_PSK:  return "[WPA-PSK-CCMP+TKIP][WPA2-PSK-CCMP+TKIP][ESS]";
+        case WIFI_AUTH_WPA3_PSK:      return "[WPA3-SAE][ESS]";
+        case WIFI_AUTH_WPA2_WPA3_PSK: return "[WPA2-PSK-CCMP][WPA3-SAE][ESS]";
+        case WIFI_AUTH_WAPI_PSK:      return "[WAPI-PSK][ESS]";
+        default:                      return "[ESS]";
     }
 }
 
@@ -623,7 +614,7 @@ void WarhogMode::appendWigleEntry(const uint8_t* bssid, const char* ssid,
                                    double lat, double lon, double alt, double accuracy) {
     if (!ensureWigleFileReady()) return;
     
-    File f = openFileWithRetry(currentWigleFilename.c_str(), FILE_APPEND);
+    File f = openFileWithRetry(currentWigleFilename, FILE_APPEND);
     if (!f) return;
     
     // MAC (BSSID with colons)
@@ -800,7 +791,7 @@ GPSData WarhogMode::getGPSData() {
 bool WarhogMode::exportCSV(const char* path) {
     // Data is already in currentFilename as CSV
     // This function would copy/rename, but for now just return status
-    return currentFilename.length() > 0;
+    return currentFilename[0] != '\0';
 }
 
 // Helper to escape XML special characters
@@ -819,17 +810,17 @@ static String escapeXML(const char* str) {
     return result;
 }
 
-String WarhogMode::authModeToString(wifi_auth_mode_t mode) {
+const char* WarhogMode::authModeToString(wifi_auth_mode_t mode) {
     switch (mode) {
-        case WIFI_AUTH_OPEN: return "OPEN";
-        case WIFI_AUTH_WEP: return "WEP";
-        case WIFI_AUTH_WPA_PSK: return "WPA";
-        case WIFI_AUTH_WPA2_PSK: return "WPA2";
-        case WIFI_AUTH_WPA_WPA2_PSK: return "WPA/WPA2";
-        case WIFI_AUTH_WPA3_PSK: return "WPA3";
+        case WIFI_AUTH_OPEN:          return "OPEN";
+        case WIFI_AUTH_WEP:           return "WEP";
+        case WIFI_AUTH_WPA_PSK:       return "WPA";
+        case WIFI_AUTH_WPA2_PSK:      return "WPA2";
+        case WIFI_AUTH_WPA_WPA2_PSK:  return "WPA/WPA2";
+        case WIFI_AUTH_WPA3_PSK:      return "WPA3";
         case WIFI_AUTH_WPA2_WPA3_PSK: return "WPA2/WPA3";
-        case WIFI_AUTH_WAPI_PSK: return "WAPI";
-        default: return "UNKNOWN";
+        case WIFI_AUTH_WAPI_PSK:      return "WAPI";
+        default:                      return "UNKNOWN";
     }
 }
 
@@ -882,30 +873,25 @@ void WarhogMode::buildBountyList(uint8_t* buffer, uint8_t* count) {
     }
 }
 
-String WarhogMode::generateFilename(const char* ext) {
-    char buf[64];
+void WarhogMode::generateFilename(char* buf, size_t bufSize, const char* ext) {
     GPSData gps = GPS::getData();
     const char* wardrivingDir = SDLayout::wardrivingDir();
-    
+
     if (gps.date > 0 && gps.time > 0) {
-        // date format: DDMMYY, time format: HHMMSSCC (centiseconds)
         uint8_t day = gps.date / 10000;
         uint8_t month = (gps.date / 100) % 100;
         uint8_t year = gps.date % 100;
         uint8_t hour = gps.time / 1000000;
         uint8_t minute = (gps.time / 10000) % 100;
         uint8_t second = (gps.time / 100) % 100;
-        
-        snprintf(buf, sizeof(buf), "%s/warhog_20%02d%02d%02d_%02d%02d%02d.%s",
+
+        snprintf(buf, bufSize, "%s/warhog_20%02d%02d%02d_%02d%02d%02d.%s",
                 wardrivingDir,
                 year, month, day, hour, minute, second, ext);
     } else {
-        // No GPS time - use millis with random suffix for uniqueness
-        snprintf(buf, sizeof(buf), "%s/warhog_%lu_%04X.%s", 
+        snprintf(buf, bufSize, "%s/warhog_%lu_%04X.%s",
                 wardrivingDir,
                 millis(), (uint16_t)esp_random(), ext);
     }
-    
-    return String(buf);
 }
 

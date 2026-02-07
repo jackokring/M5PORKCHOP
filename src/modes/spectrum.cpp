@@ -2449,19 +2449,19 @@ void SpectrumMode::pruneStaleClients() {
 }
 
 // Get monitored network SSID [P3] [P15]
-String SpectrumMode::getMonitoredSSID() {
+const char* SpectrumMode::getMonitoredSSID() {
+    static char truncated[12];
     if (!monitoringNetwork) return "";
-    if (monitoredNetworkIndex < 0 || 
+    if (monitoredNetworkIndex < 0 ||
         monitoredNetworkIndex >= (int)networks.size()) return "";
-    
+
     const char* ssid = networks[monitoredNetworkIndex].ssid;
     if (ssid[0] == 0) return "<HIDDEN>";  // [P15]
-    
+
     // Truncate for bottom bar [P9]
-    char truncated[12];
     strncpy(truncated, ssid, 11);
     truncated[11] = '\0';
-    return String(truncated);
+    return truncated;
 }
 
 // Get client count for monitored network [P3]

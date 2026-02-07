@@ -102,7 +102,7 @@ public:
     
     // Client monitoring accessors [P3]
     static bool isMonitoring() { return monitoringNetwork; }
-    static String getMonitoredSSID();
+    static const char* getMonitoredSSID();
     static int getClientCount();
     static uint8_t getMonitoredChannel() { return monitoredChannel; }
     

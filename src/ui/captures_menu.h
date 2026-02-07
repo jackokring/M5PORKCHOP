@@ -15,14 +15,14 @@ enum class CaptureStatus {
 };
 
 struct CaptureInfo {
-    String filename;
-    String ssid;
-    String bssid;
+    char filename[48];
+    char ssid[33];
+    char bssid[18];
     uint32_t fileSize;
     time_t captureTime;  // File modification time
     bool isPMKID;        // true = .22000 PMKID, false = .pcap handshake
     CaptureStatus status; // WPA-SEC status
-    String password;      // Cracked password (if status == CRACKED)
+    char password[64];    // Cracked password (if status == CRACKED)
 };
 
 // Sync state machine for WPA-SEC operations

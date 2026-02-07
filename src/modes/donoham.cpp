@@ -341,6 +341,8 @@ void DoNoHamMode::stop() {
     pmkids.shrink_to_fit();
     handshakes.clear();
     handshakes.shrink_to_fit();
+    incompleteHandshakes.clear();
+    incompleteHandshakes.shrink_to_fit();
     
     // Reset deferred flags
     pendingPMKIDWrite = 0;
@@ -1174,27 +1176,22 @@ void DoNoHamMode::saveAllHandshakes() {
         eapolLen += 4;
         if (eapolLen > eapolFrame->len) eapolLen = eapolFrame->len;
         
-        char* eapolHex = (char*)malloc(eapolLen * 2 + 1);
-        if (!eapolHex) {
-            f.close();
-            continue;
-        }
-        
+        // Stack buffer for EAPOL hex (max 512 bytes * 2 + null = 1025)
+        char eapolHex[1025];
+
         // Copy and zero MIC
         uint8_t eapolCopy[512];
         memcpy(eapolCopy, eapolFrame->data, eapolLen);
         memset(eapolCopy + 81, 0, 16);
-        
+
         for (int i = 0; i < eapolLen; i++) {
             sprintf(eapolHex + i*2, "%02x", eapolCopy[i]);
         }
         eapolHex[eapolLen * 2] = 0;
-        
+
         // WPA*02*MIC*MAC_AP*MAC_CLIENT*ESSID*ANONCE*EAPOL*MESSAGEPAIR
         f.printf("WPA*02*%s*%s*%s*%s*%s*%s*%02x\n",
             micHex, macAP, macClient, essidHex, nonceHex, eapolHex, msgPair);
-        
-        free(eapolHex);
         f.close();
         
         // Save SSID to companion txt file (matches OINK pattern)
