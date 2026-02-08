@@ -117,7 +117,7 @@ void CapturesMenu::emergencyCleanup() {
 bool CapturesMenu::scanCaptures() {
     // Initialize async scan
     captures.clear();
-    captures.reserve(16);  // Grow naturally — reserve(100) was 17.7KB contiguous
+    captures.reserve(MAX_CAPTURES);  // Full upfront reserve — no mid-scan reallocations
 
     // Guard: Skip if no SD card available
     if (!Config::isSDAvailable()) {

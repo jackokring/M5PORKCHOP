@@ -48,7 +48,7 @@ bool WiGLE::loadUploadedList() {
     if (listLoaded) return true;
 
     uploadedFiles.clear();
-    uploadedFiles.reserve(32);  // Grow naturally — avoid 200-entry upfront alloc
+    uploadedFiles.reserve(WIGLE_MAX_UPLOADED);  // Full upfront reserve — no growth reallocations
 
     const char* uploadedPath = SDLayout::wigleUploadedPath();
     if (!SD.exists(uploadedPath)) {

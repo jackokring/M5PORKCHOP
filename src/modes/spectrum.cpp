@@ -395,37 +395,14 @@ void SpectrumMode::update() {
     // push_back can reallocate vector, invalidating iterators in concurrent callback
     // [BUG FIX] Technique 4 (reserve pattern) + Technique 7 (recovery) per HEAP_MANAGEMENT.txt
     if (pendingNetworkAdd.load()) {
-        // Technique 4: Reserve capacity OUTSIDE busy region
-        bool canGrow = (networks.size() < networks.capacity());
-        
-        if (!canGrow && networks.size() < MAX_SPECTRUM_NETWORKS) {
-            // Check heap threshold (20KB) before growth operations
-            if (HeapGates::canGrow(HeapPolicy::kMinHeapForSpectrumGrowth,
-                                   HeapPolicy::kMinFragRatioForGrowth)) {
-                busy = true;  // [BUG8 FIX] Guard reserve - reallocation invalidates callback references
-                networks.reserve(networks.capacity() + 10);  // Grow by 10 slots
-                busy = false;
-                canGrow = true;
-            } else {
-                // Technique 7 Level 1: Recovery attempt - prune stale networks first
-                pruneStale();  // pruneStale manages its own busy guards internally
+        // With reserve(MAX_SPECTRUM_NETWORKS) at start(), push_back never allocates.
+        // At capacity, evict weakest instead of growing (zero heap allocation).
+        bool hasCapacity = (networks.size() < networks.capacity());
 
-                // Re-check heap after recovery
-                if (HeapGates::canGrow(HeapPolicy::kMinHeapForSpectrumGrowth,
-                                       HeapPolicy::kMinFragRatioForGrowth)) {
-                    busy = true;  // [BUG8 FIX] Guard reserve after prune
-                    networks.reserve(networks.capacity() + 10);
-                    busy = false;
-                    canGrow = true;
-                }
-                // else: recovery failed, skip this add (better than crash)
-            }
-        }
-        
         bool inserted = false;
         bool replaced = false;
         busy = true;  // Block callback during vector modification
-        if (networks.size() < MAX_SPECTRUM_NETWORKS && canGrow) {
+        if (hasCapacity) {
             networks.push_back(pendingNetwork);
             inserted = true;
         } else if (!networks.empty()) {

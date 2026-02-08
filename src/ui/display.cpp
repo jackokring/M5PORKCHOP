@@ -2899,14 +2899,25 @@ static uint16_t getNextScreenshotNumber() {
     
     File entry;
     while ((entry = dir.openNextFile())) {
-        String name = entry.name();
+        const char* name = entry.name();
         entry.close();
-        
-        // Parse "screenshotNNN.bmp" format
-        if (name.startsWith("screenshot") && name.endsWith(".bmp")) {
-            String numStr = name.substring(10, name.length() - 4);
-            uint16_t num = numStr.toInt();
-            if (num > maxNum) maxNum = num;
+
+        // Parse "screenshotNNN.bmp" format — zero heap allocation
+        // Extract basename if path includes directory
+        const char* base = strrchr(name, '/');
+        base = base ? base + 1 : name;
+        size_t baseLen = strlen(base);
+        if (baseLen > 14 && strncmp(base, "screenshot", 10) == 0 &&
+            strcmp(base + baseLen - 4, ".bmp") == 0) {
+            // Extract number between "screenshot" and ".bmp"
+            char numBuf[8];
+            size_t numLen = baseLen - 14;  // 10 ("screenshot") + 4 (".bmp")
+            if (numLen < sizeof(numBuf)) {
+                memcpy(numBuf, base + 10, numLen);
+                numBuf[numLen] = '\0';
+                uint16_t num = (uint16_t)atoi(numBuf);
+                if (num > maxNum) maxNum = num;
+            }
         }
     }
     dir.close();

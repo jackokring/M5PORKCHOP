@@ -51,6 +51,7 @@ void WPASec::normalizeBSSID_Char(const char* bssid, char* output, size_t outLen)
 
 bool WPASec::loadUploadedList() {
     uploadedCache.clear();
+    uploadedCache.reserve(64);  // 64 * 13B = 832B — avoids 6 reallocations
     const char* uploadedPath = SDLayout::wpasecUploadedPath();
     if (!SD.exists(uploadedPath)) return true;
 
@@ -86,6 +87,7 @@ bool WPASec::loadCache() {
     if (cacheLoaded) return true;
 
     crackedCache.clear();
+    crackedCache.reserve(128);  // 128 * 110B = 14KB — avoids 6 reallocations vs no reserve
     uploadedCache.clear();
 
     const char* cachePath = SDLayout::wpasecResultsPath();

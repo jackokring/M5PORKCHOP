@@ -14,6 +14,8 @@ static void formatDisplayName(const char* path, char* out, size_t len);
 static void truncateWithEllipsis(char* text, size_t maxLen);
 static void formatTimeLine(time_t t, char* out, size_t len);
 
+static const size_t MAX_CRASH_FILES = 32;
+
 bool CrashViewer::active = false;
 std::vector<CrashViewer::CrashEntry> CrashViewer::crashFiles;
 std::vector<CrashViewer::LogLine> CrashViewer::fileLines;
@@ -44,6 +46,7 @@ void CrashViewer::init() {
 
 void CrashViewer::scanCrashFiles() {
     crashFiles.clear();
+    crashFiles.reserve(MAX_CRASH_FILES);  // Cap at 32 — avoids unbounded growth
     selectedIndex = 0;
     listScroll = 0;
 
@@ -62,7 +65,7 @@ void CrashViewer::scanCrashFiles() {
     }
 
     uint8_t yieldCounter = 0;
-    while (true) {
+    while (crashFiles.size() < MAX_CRASH_FILES) {
         File entry = dir.openNextFile();
         if (!entry) break;
 

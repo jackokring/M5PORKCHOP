@@ -712,9 +712,11 @@ void WarhogMode::processScanResults() {
             }
         }
         
-        // Extract network info
-        String ssidStr = WiFi.SSID(i);
-        const char* ssid = ssidStr.c_str();
+        // Extract SSID to stack buffer — avoids heap String for each of 50+ networks
+        char ssidBuf[33];
+        strncpy(ssidBuf, WiFi.SSID(i).c_str(), sizeof(ssidBuf) - 1);
+        ssidBuf[sizeof(ssidBuf) - 1] = '\0';
+        const char* ssid = ssidBuf;
         int8_t rssi = WiFi.RSSI(i);
         uint8_t channel = WiFi.channel(i);
         wifi_auth_mode_t authmode = WiFi.encryptionType(i);
@@ -793,21 +795,6 @@ bool WarhogMode::exportCSV(const char* path) {
     return currentFilename[0] != '\0';
 }
 
-// Helper to escape XML special characters
-static String escapeXML(const char* str) {
-    String result;
-    for (int i = 0; str[i] && i < 64; i++) {
-        switch (str[i]) {
-            case '&':  result += "&amp;"; break;
-            case '<':  result += "&lt;"; break;
-            case '>':  result += "&gt;"; break;
-            case '"':  result += "&quot;"; break;
-            case '\'': result += "&apos;"; break;
-            default:   result += str[i]; break;
-        }
-    }
-    return result;
-}
 
 const char* WarhogMode::authModeToString(wifi_auth_mode_t mode) {
     switch (mode) {

@@ -41,7 +41,8 @@ void BoarBrosMenu::hide() {
 
 void BoarBrosMenu::loadBros() {
     bros.clear();
-    
+    bros.reserve(50);  // Max entries — avoids 6 reallocations during load
+
     const char* boarPath = SDLayout::boarBrosPath();
     if (!SD.exists(boarPath)) {
         Serial.println("[BOAR_BROS] No file found");

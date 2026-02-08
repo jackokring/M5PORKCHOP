@@ -36,7 +36,7 @@ static std::atomic<bool> busy{false};  // [BUG3 FIX] Atomic for cross-core visib
 static std::atomic<uint32_t> hopIntervalOverrideMs{0};
 static size_t heapLargestAtStart = 0;
 static bool heapStabilized = false;
-static uint8_t shrinkDeferCount = 0;  // Hysteresis counter to prevent shrink/grow thrashing
+// shrinkDeferCount removed — shrink_to_fit no longer runs during operation
 
 // Channel hop order (most common channels first for faster discovery)
 static const uint8_t CHANNEL_HOP_ORDER[RECON_CHANNEL_COUNT] = {
@@ -638,45 +638,18 @@ static void processDeferredEvents() {
         // Apply any deferred SSID reveal before adding
         applyPendingSsid(pending);
         
-        // Check capacity OUTSIDE critical section
-        bool shouldAdd = false;
-        size_t capacityLimit = networks.capacity();
-        bool hasCapacity = networks.size() < capacityLimit;
-        bool belowMax = networks.size() < MAX_RECON_NETWORKS;
-        bool canGrow = belowMax;
-        
-        // Only add if we have pre-reserved capacity (no allocation needed)
-        if (hasCapacity && belowMax) {
-            shouldAdd = true;
-        } else if (canGrow &&
-                   HeapGates::canGrow(HeapPolicy::kMinHeapForReconGrowth,
-                                      HeapPolicy::kMinFragRatioForGrowth)) {
-            // Grow capacity in aligned steps to reduce fragmentation from
-            // differently-sized blocks. Round up to next multiple of 40.
-            size_t newCap = ((networks.capacity() + 40) / 40) * 40;
-            if (newCap > MAX_RECON_NETWORKS) newCap = MAX_RECON_NETWORKS;
-            busy.store(true, std::memory_order_release);
-            taskENTER_CRITICAL(&vectorMux);
-            try {
-                networks.reserve(newCap);
-            } catch (...) {
-                // OOM - skip growth
-            }
-            taskEXIT_CRITICAL(&vectorMux);
-            busy.store(false, std::memory_order_release);
-            capacityLimit = networks.capacity();
-            hasCapacity = networks.size() < capacityLimit;
-            shouldAdd = hasCapacity && belowMax;
-        }
-        
+        // With reserve(MAX_RECON_NETWORKS) at init and no shrink_to_fit,
+        // push_back never allocates. At capacity, evict weakest instead of growing.
+        bool hasCapacity = networks.size() < networks.capacity();
+
         bool inserted = false;
         bool replaced = false;
-        if (shouldAdd) {
+        if (hasCapacity) {
             taskENTER_CRITICAL(&vectorMux);
-            networks.push_back(pending);  // Safe: capacity pre-reserved
+            networks.push_back(pending);  // Safe: capacity pre-reserved at init
             taskEXIT_CRITICAL(&vectorMux);
             inserted = true;
-        } else if (!belowMax) {
+        } else {
             // Vector is full - evict a low-value entry if the new one is better
             uint32_t now = millis();
             int pendingScore = computeRetentionScore(pending, now);
@@ -956,23 +929,10 @@ void update() {
         cleanupStaleNetworks();
         lastCleanupTime = now;
 
-        // Reclaim over-provisioned capacity to reduce heap fragmentation
-        // Hysteresis: require 3 consecutive cleanup cycles with excess capacity
-        // before shrinking. This prevents grow/shrink thrashing when network
-        // count oscillates (each cycle reallocates a ~17KB block).
-        if (networks.capacity() > networks.size() + 40) {
-            shrinkDeferCount++;
-            if (shrinkDeferCount >= 3) {
-                busy.store(true, std::memory_order_release);
-                taskENTER_CRITICAL(&vectorMux);
-                try { networks.shrink_to_fit(); } catch (...) {}
-                taskEXIT_CRITICAL(&vectorMux);
-                busy.store(false, std::memory_order_release);
-                shrinkDeferCount = 0;
-            }
-        } else {
-            shrinkDeferCount = 0;
-        }
+        // NOTE: No shrink_to_fit here. The reserve(MAX_RECON_NETWORKS) at init
+        // is permanent during operation. Shrinking would force TLSF to find a
+        // new differently-sized block on next growth, creating fragmentation.
+        // Capacity is only released in freeNetworks() on mode exit.
     }
     
     // Check heap stabilization
