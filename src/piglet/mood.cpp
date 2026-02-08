@@ -5,12 +5,18 @@
 #include "../core/config.h"
 #include "../core/xp.h"
 #include "../core/porkchop.h"
+#include "../core/heap_health.h"
+#include "../core/challenges.h"
+#include "../core/network_recon.h"
+#include "../gps/gps.h"
 #include "../ui/display.h"
+#include "../ui/swine_stats.h"
 #include "../modes/oink.h"
 #include "../audio/sfx.h"
 #include <Preferences.h>
 #include <ctype.h>
 #include <string.h>
+#include <time.h>
 
 extern Porkchop porkchop;
 
@@ -56,6 +62,243 @@ static bool isBoredState = false;
 
 // Dialogue lock - prevents automatic phrase selection during BLE sync dialogue
 static bool dialogueLocked = false;
+
+// === SITUATIONAL AWARENESS TRACKING STATE ===
+// ~20 bytes total RAM, all phrase arrays are flash-resident const char*
+
+// Idea 1: Heap pressure
+static uint8_t lastHeapPressure = 0;       // Last HeapPressureLevel seen
+static uint32_t lastHeapCheckMs = 0;
+
+// Idea 2: Time-of-day (checked in selectPhrase, no persistent state needed)
+
+// Idea 3: Network density
+static uint16_t lastDensityCount = 0;      // Last network count for threshold detection
+static uint32_t lastDensityPhraseMs = 0;
+static uint32_t densityTrackStartMs = 0;   // When we started tracking (for "after 2+ min" sparse check)
+
+// Idea 4: Challenge proximity
+static uint8_t challengeHypedFlags = 0;    // Bits 0-2: which challenges were hyped at 80%+
+
+// Idea 5: GPS movement
+static uint32_t lastGPSPhraseMs = 0;
+static uint32_t standingStillSinceMs = 0;  // When speed first hit 0
+static bool wasStandingStill = false;
+
+// Idea 6: Session fatigue milestones (bitflags)
+static uint8_t fatigueMilestonesShown = 0; // bits: 0=30m, 1=1h, 2=2h, 3=3h, 4=4h, 5=6h
+
+// Idea 7: Encryption reactions
+static bool firstWEPSeen = false;
+static bool firstWPA3Seen = false;
+static bool firstOpenSeen = false;
+static uint8_t openNetCount = 0;
+static uint32_t lastEncryptionPhraseMs = 0;
+
+// Idea 8: Buff/debuff awareness
+static uint8_t lastBuffFlags = 0;
+static uint8_t lastDebuffFlags = 0;
+
+// Idea 9: Charging state
+static int8_t lastChargingState = -1;      // -1=unknown, 0=not charging, 1=charging
+
+// Idea 10: Return-session recognition (handled in init())
+
+// === SITUATIONAL AWARENESS PHRASE ARRAYS (all flash-resident) ===
+
+// Idea 1: Heap pressure phrases
+static const char* const PHRASES_HEAP_CAUTION[] = {
+    "heap getting tight",
+    "memory sweating",
+    "feeling cramped innit",
+    "malloc side-eyeing me"
+};
+static const int PHRASES_HEAP_CAUTION_COUNT = 4;
+
+static const char* const PHRASES_HEAP_WARNING[] = {
+    "heap hurting bad",
+    "oi wheres me RAM",
+    "bones creaking bruv",
+    "fragments everywhere",
+    "pig needs space"
+};
+static const int PHRASES_HEAP_WARNING_COUNT = 5;
+
+static const char* const PHRASES_HEAP_CRITICAL[] = {
+    "CRITICAL. PIG SCARED.",
+    "CANT BREATHE",
+    "HEAP ON LIFE SUPPORT",
+    "MALLOC SAYS GOODBYE"
+};
+static const int PHRASES_HEAP_CRITICAL_COUNT = 4;
+
+static const char* const PHRASES_HEAP_RECOVERY[] = {
+    "breathing again",
+    "RAM came back. pig lives.",
+    "defrag worked. praise."
+};
+static const int PHRASES_HEAP_RECOVERY_COUNT = 3;
+
+// Idea 2: Time-of-day phrases (personality-split)
+static const char* const PHRASES_TIME_EARLY_OINK[] = {
+    "proper early bruv",
+    "dawn patrol init",
+    "breakfast hack innit"
+};
+static const char* const PHRASES_TIME_EARLY_WARHOG[] = {
+    "zero dark thirty sir",
+    "morning recon active",
+    "first light ops"
+};
+static const char* const PHRASES_TIME_LATENIGHT_OINK[] = {
+    "its 2am. pig questions choices",
+    "nocturnal hog mode",
+    "sleep is for the compiled"
+};
+static const char* const PHRASES_TIME_LATENIGHT_CD[] = {
+    "midnight irie vibes",
+    "jah blesses di late shift"
+};
+static const char* const PHRASES_TIME_LATENIGHT_WARHOG[] = {
+    "graveyard shift active",
+    "0300 watch. radio quiet."
+};
+static const char* const PHRASES_TIME_SPECIAL[] = {
+    "13:37. pig approves.",
+    "its high noon somewhere",
+    "04:20. no comment.",
+    "witching hour. pig awake.",
+    "00:00. day reset. pig endures."
+};
+
+// Idea 3: Network density phrases
+static const char* const PHRASES_DENSITY_HIGH[] = {
+    "WIFI BUFFET",
+    "snout overwhelmed",
+    "too many. pig dizzy.",
+    "target rich. pig excited.",
+    "all you can sniff"
+};
+static const int PHRASES_DENSITY_HIGH_COUNT = 5;
+
+static const char* const PHRASES_DENSITY_LOW[] = {
+    "wifi desert mode",
+    "tumbleweeds. digital.",
+    "where all the APs at",
+    "empty spectrum. sad pig."
+};
+static const int PHRASES_DENSITY_LOW_COUNT = 4;
+
+static const char* const PHRASES_DENSITY_TRANSITION[] = {
+    "density dropping fast",
+    "entering hot zone",
+    "new territory. pig alert."
+};
+static const int PHRASES_DENSITY_TRANSITION_COUNT = 3;
+
+// Idea 4: Challenge proximity phrases
+static const char* const PHRASES_CHALLENGE_CLOSE[] = {
+    "almost. pig holds breath.",
+    "so close. dont choke.",
+    "one more. just one more.",
+    "pig sees the finish line",
+    "the demand is nearly met"
+};
+static const int PHRASES_CHALLENGE_CLOSE_COUNT = 5;
+
+// Idea 5: GPS movement phrases
+static const char* const PHRASES_GPS_STILL[] = {
+    "pig grows roots",
+    "standing still. pig bored.",
+    "move. truffles wont come to u."
+};
+static const char* const PHRASES_GPS_WALK_OINK[] = { "trotting nicely", "good pace bruv" };
+static const char* const PHRASES_GPS_WALK_WARHOG[] = { "steady patrol sir", "foot mobile" };
+static const char* const PHRASES_GPS_FAST[] = {
+    "PIG GOING FAST",
+    "vehicle detected. pig holds on.",
+    "speed run irl"
+};
+static const char* const PHRASES_GPS_VFAST[] = {
+    "pig requests seatbelt",
+    "highway truffle hunt"
+};
+static const char* const PHRASES_GPS_BADFIX[] = {
+    "GPS confused. pig lost.",
+    "satellites hiding",
+    "position: somewhere"
+};
+static const char* const PHRASES_GPS_FIXBACK[] = {
+    "GPS back. pig knows where.",
+    "found the sky again"
+};
+
+// Idea 6: Session fatigue phrases
+static const char* const PHRASES_FATIGUE[] = {
+    "half hour in. pig warms up.",     // 0: 30min
+    "1 hour. pig respects commitment.",// 1: 1hr
+    "2 hours. outside exists btw.",    // 2: 2hr
+    "3 HOURS. pig concerned for you.", // 3: 3hr
+    "piggy judges ur life choices",    // 4: 4hr
+    "MARATHON. PIG SALUTES."           // 5: 6hr
+};
+
+// Idea 7: Encryption reaction phrases
+static const char* const PHRASES_ENC_WEP[] = {
+    "WEP?! what year is this",
+    "WEP spotted. pig amused.",
+    "ancient relic detected"
+};
+static const char* const PHRASES_ENC_WPA3[] = {
+    "WPA3. pig respects this one.",
+    "proper security. rare."
+};
+static const char* const PHRASES_ENC_OPEN[] = {
+    "open net. no password. bold.",
+    "free wifi. pig suspicious."
+};
+static const char* const PHRASES_ENC_MANY_OPEN = "so many open nets. yikes.";
+
+// Idea 8: Buff/debuff awareness phrases
+static const char* const PHRASES_BUFF_GAINED[] = {
+    "power up! pig glows.",
+    "NE0N HIGH. pig feels electric.",
+    "pig buffed. pig ready."
+};
+static const char* const PHRASES_DEBUFF_GAINED[] = {
+    "debuff active. pig sluggish.",
+    "pig nerfed. pig endures.",
+    "hamstrung. pig limps on."
+};
+static const char* const PHRASES_BUFF_LOST = "buff wore off. pig normal.";
+
+// Idea 9: Charging state phrases
+static const char* const PHRASES_CHARGING_ON[] = {
+    "plugged in. pig rests.",
+    "charging. pig naps.",
+    "electrons flowing. pig grateful."
+};
+static const char* const PHRASES_CHARGING_OFF[] = {
+    "unplugged. adventure begins.",
+    "on battery. pig lightweight."
+};
+static const char* const PHRASES_CHARGING_OFF_LOW = "unplugged at %d%%. pig nervous.";
+
+// Idea 10: Return-session phrases
+static const char* const PHRASES_RETURN_QUICK[] = {
+    "back already?",
+    "missed me? pig missed you.",
+    "quick reboot. pig ready."
+};
+static const char* const PHRASES_RETURN_NORMAL[] = {
+    "welcome back. pig waited.",
+    "pig remembers."
+};
+static const char* const PHRASES_RETURN_LONG[] = {
+    "pig thought you left.",
+    "long time no sniff.",
+    "pig was lonely. pig lies."
+};
 
 static char bubblePhraseRaw[128] = "";
 static char bubblePhraseUpper[128] = "";
@@ -567,7 +810,9 @@ enum class PhraseCategory : uint8_t {
     HAPPY, EXCITED, HUNTING, SLEEPY, SAD, WARHOG, WARHOG_FOUND,
     PIGGYBLUES_TARGETED, PIGGYBLUES_STATUS, PIGGYBLUES_IDLE,
     DEAUTH, DEAUTH_SUCCESS, PMKID, SNIFFING, PASSIVE_RECON, MENU_IDLE, RARE, RARE_LORE, DYNAMIC,
-    BORED,  // No valid targets available
+    BORED,
+    // Situational awareness categories
+    SA_HEAP, SA_TIME, SA_DENSITY, SA_CHALLENGE, SA_GPS, SA_FATIGUE, SA_ENCRYPT, SA_BUFF, SA_CHARGING,
     COUNT  // Must be last
 };
 
@@ -985,16 +1230,50 @@ void Mood::init() {
     // Calculate time since last save
     uint32_t now = millis();  // Can't compare to NVS time directly, use as session marker
     
+    // Reset situational awareness state
+    lastHeapPressure = 0;
+    lastHeapCheckMs = 0;
+    lastDensityCount = 0;
+    lastDensityPhraseMs = 0;
+    densityTrackStartMs = 0;
+    challengeHypedFlags = 0;
+    lastGPSPhraseMs = 0;
+    standingStillSinceMs = 0;
+    wasStandingStill = false;
+    fatigueMilestonesShown = 0;
+    firstWEPSeen = false;
+    firstWPA3Seen = false;
+    firstOpenSeen = false;
+    openNetCount = 0;
+    lastEncryptionPhraseMs = 0;
+    lastBuffFlags = 0;
+    lastDebuffFlags = 0;
+    lastChargingState = -1;
+
     // If we have a saved mood, restore with some decay
     if (savedTime > 0) {
         // Start with saved mood, slightly regressed toward neutral
         happiness = savedMood + (50 - savedMood) / 4;  // 25% toward neutral
-        
-        // Welcome back phrase based on saved mood
-        if (savedMood > 60) {
+
+        // Idea 10: Return-session recognition
+        // Use session count and time gap to pick a return phrase
+        const PorkXPData& xpData = XP::getData();
+        uint16_t sessions = xpData.sessions;
+
+        // Milestone sessions (every 25th)
+        if (sessions > 0 && (sessions % 25) == 0) {
+            char buf[40];
+            snprintf(buf, sizeof(buf), "session #%u. pig endures.", sessions);
+            SET_PHRASE(currentPhrase, buf);
+        } else if (savedTime < 3600000) {
+            // Quick return (<1 hour session time saved = recent)
+            SET_PHRASE(currentPhrase, PHRASES_RETURN_QUICK[random(0, 3)]);
+        } else if (savedMood > 60) {
             SET_PHRASE(currentPhrase, "missed me piggy?");
         } else if (savedMood < -20) {
             SET_PHRASE(currentPhrase, "back for more..");
+        } else {
+            SET_PHRASE(currentPhrase, PHRASES_RETURN_NORMAL[random(0, 2)]);
         }
     } else {
         happiness = 50;
@@ -1092,12 +1371,18 @@ void Mood::update() {
         lastMoodSave = now;
     }
     
+    // Situational awareness: proactive checks (heap, charging, fatigue, etc.)
+    // These are rate-limited internally and only fire when conditions change
+    if (!dialogueLocked && phraseQueueCount == 0) {
+        updateSituationalAwareness(now);
+    }
+
     // Check for inactivity
     uint32_t inactiveSeconds = (now - lastActivityTime) / 1000;
     if (inactiveSeconds > 60) {
         onNoActivity(inactiveSeconds);
     }
-    
+
     // Natural happiness decay
     if (now - lastPhraseChange > phraseInterval) {
         happiness = constrain(happiness - 1, -100, 100);
@@ -1512,6 +1797,429 @@ void Mood::onLowBattery() {
     lastPhraseChange = millis();
 }
 
+// === SITUATIONAL AWARENESS IMPLEMENTATIONS ===
+
+// Helper: get current hour from RTC or Unix time (same fallback as Avatar::isNightTime)
+static int8_t getCurrentHour() {
+    auto dt = M5.Rtc.getDateTime();
+    if (dt.date.year >= 2024) {
+        return (int8_t)dt.time.hours;
+    }
+    time_t unixNow = time(nullptr);
+    if (unixNow >= 1700000000) {
+        struct tm timeinfo;
+        localtime_r(&unixNow, &timeinfo);
+        return (int8_t)timeinfo.tm_hour;
+    }
+    return -1;  // Unknown
+}
+
+// Idea 1: Heap pressure personality
+bool Mood::pickHeapPhraseIfDue(uint32_t now) {
+    if (now - lastHeapCheckMs < 10000) return false;
+    lastHeapCheckMs = now;
+
+    uint8_t level = (uint8_t)HeapHealth::getPressureLevel();
+
+    // Recovery detection: pressure dropped
+    if (level < lastHeapPressure && lastHeapPressure >= (uint8_t)HeapPressureLevel::Caution) {
+        lastHeapPressure = level;
+        int idx = pickPhraseIdx(PhraseCategory::SA_HEAP, PHRASES_HEAP_RECOVERY_COUNT);
+        SET_PHRASE(currentPhrase, PHRASES_HEAP_RECOVERY[idx]);
+        applyMomentumBoost(5);
+        lastPhraseChange = now;
+        return true;
+    }
+
+    lastHeapPressure = level;
+
+    if (level >= (uint8_t)HeapPressureLevel::Critical) {
+        int idx = pickPhraseIdx(PhraseCategory::SA_HEAP, PHRASES_HEAP_CRITICAL_COUNT);
+        SET_PHRASE(currentPhrase, PHRASES_HEAP_CRITICAL[idx]);
+        lastPhraseChange = now;
+        return true;
+    } else if (level >= (uint8_t)HeapPressureLevel::Warning) {
+        int idx = pickPhraseIdx(PhraseCategory::SA_HEAP, PHRASES_HEAP_WARNING_COUNT);
+        SET_PHRASE(currentPhrase, PHRASES_HEAP_WARNING[idx]);
+        lastPhraseChange = now;
+        return true;
+    } else if (level >= (uint8_t)HeapPressureLevel::Caution) {
+        int idx = pickPhraseIdx(PhraseCategory::SA_HEAP, PHRASES_HEAP_CAUTION_COUNT);
+        SET_PHRASE(currentPhrase, PHRASES_HEAP_CAUTION[idx]);
+        lastPhraseChange = now;
+        return true;
+    }
+
+    return false;
+}
+
+// Idea 2: Time-of-day awareness (called from selectPhrase with ~3% chance)
+bool Mood::pickTimePhraseIfDue(uint32_t now) {
+    (void)now;
+    int8_t hour = getCurrentHour();
+    if (hour < 0) return false;
+
+    PorkchopMode mode = porkchop.getMode();
+    bool isCD = (mode == PorkchopMode::DNH_MODE);
+    bool isWarhog = (mode == PorkchopMode::WARHOG_MODE);
+
+    // Special times first (exact hour matches)
+    if (hour == 13) {
+        // Check minute for 1337 (13:37)
+        auto dt = M5.Rtc.getDateTime();
+        if (dt.date.year >= 2024 && dt.time.minutes >= 35 && dt.time.minutes <= 39) {
+            SET_PHRASE(currentPhrase, PHRASES_TIME_SPECIAL[0]);  // "13:37. pig approves."
+            return true;
+        }
+    } else if (hour == 12 && random(0, 3) == 0) {
+        SET_PHRASE(currentPhrase, PHRASES_TIME_SPECIAL[1]);  // high noon
+        return true;
+    } else if (hour == 4 && random(0, 3) == 0) {
+        SET_PHRASE(currentPhrase, PHRASES_TIME_SPECIAL[2]);  // 04:20
+        return true;
+    } else if (hour == 0) {
+        SET_PHRASE(currentPhrase, PHRASES_TIME_SPECIAL[random(0, 2) == 0 ? 3 : 4]);
+        return true;
+    }
+
+    // Early morning (5-8am)
+    if (hour >= 5 && hour < 8) {
+        if (isWarhog) {
+            SET_PHRASE(currentPhrase, PHRASES_TIME_EARLY_WARHOG[random(0, 3)]);
+        } else {
+            SET_PHRASE(currentPhrase, PHRASES_TIME_EARLY_OINK[random(0, 3)]);
+        }
+        return true;
+    }
+
+    // Late night (midnight-4am)
+    if (hour >= 1 && hour < 4) {
+        if (isCD) {
+            SET_PHRASE(currentPhrase, PHRASES_TIME_LATENIGHT_CD[random(0, 2)]);
+        } else if (isWarhog) {
+            SET_PHRASE(currentPhrase, PHRASES_TIME_LATENIGHT_WARHOG[random(0, 2)]);
+        } else {
+            SET_PHRASE(currentPhrase, PHRASES_TIME_LATENIGHT_OINK[random(0, 3)]);
+        }
+        return true;
+    }
+
+    return false;
+}
+
+// Idea 3: Network density awareness
+bool Mood::pickDensityPhraseIfDue(uint32_t now) {
+    if (now - lastDensityPhraseMs < 120000) return false;  // Max 1 per 2 min
+
+    uint16_t count = NetworkRecon::getNetworkCount();
+    if (densityTrackStartMs == 0) {
+        densityTrackStartMs = now;
+        lastDensityCount = count;
+        return false;
+    }
+
+    bool triggered = false;
+
+    // Dense area (>80 visible)
+    if (count > 80 && lastDensityCount <= 80) {
+        int idx = pickPhraseIdx(PhraseCategory::SA_DENSITY, PHRASES_DENSITY_HIGH_COUNT);
+        SET_PHRASE(currentPhrase, PHRASES_DENSITY_HIGH[idx]);
+        triggered = true;
+    }
+    // Sparse area (<5 after 2+ min scanning)
+    else if (count < 5 && lastDensityCount >= 5 && (now - densityTrackStartMs) > 120000) {
+        int idx = pickPhraseIdx(PhraseCategory::SA_DENSITY, PHRASES_DENSITY_LOW_COUNT);
+        SET_PHRASE(currentPhrase, PHRASES_DENSITY_LOW[idx]);
+        triggered = true;
+    }
+    // Transition: significant drop (>50% loss from 20+)
+    else if (lastDensityCount >= 20 && count < lastDensityCount / 2) {
+        SET_PHRASE(currentPhrase, PHRASES_DENSITY_TRANSITION[0]);  // "density dropping fast"
+        triggered = true;
+    }
+    // Transition: entering hot zone (jump from <20 to >40)
+    else if (lastDensityCount < 20 && count > 40) {
+        SET_PHRASE(currentPhrase, PHRASES_DENSITY_TRANSITION[1]);  // "entering hot zone"
+        triggered = true;
+    }
+
+    lastDensityCount = count;
+    if (triggered) {
+        lastDensityPhraseMs = now;
+        lastPhraseChange = now;
+    }
+    return triggered;
+}
+
+// Idea 4: Challenge proximity hype
+bool Mood::pickChallengePhraseIfDue(uint32_t now) {
+    static uint32_t lastChallengeCheckMs = 0;
+    if (now - lastChallengeCheckMs < 30000) return false;
+    lastChallengeCheckMs = now;
+
+    for (uint8_t i = 0; i < 3; i++) {
+        ActiveChallenge ch;
+        if (!Challenges::getSnapshot(i, ch)) continue;
+        if (ch.completed || ch.failed) continue;
+        if (ch.target == 0) continue;
+
+        float pct = (float)ch.progress / (float)ch.target;
+        if (pct >= 0.8f && !(challengeHypedFlags & (1 << i))) {
+            challengeHypedFlags |= (1 << i);
+            int idx = pickPhraseIdx(PhraseCategory::SA_CHALLENGE, PHRASES_CHALLENGE_CLOSE_COUNT);
+            SET_PHRASE(currentPhrase, PHRASES_CHALLENGE_CLOSE[idx]);
+            applyMomentumBoost(10);
+            lastPhraseChange = now;
+            return true;
+        }
+    }
+
+    // Reset hype flags for completed challenges so new ones can be hyped
+    for (uint8_t i = 0; i < 3; i++) {
+        ActiveChallenge ch;
+        if (Challenges::getSnapshot(i, ch) && ch.completed) {
+            challengeHypedFlags &= ~(1 << i);
+        }
+    }
+
+    return false;
+}
+
+// Idea 5: GPS movement commentary
+bool Mood::pickGPSPhraseIfDue(uint32_t now) {
+    if (now - lastGPSPhraseMs < 180000) return false;  // Max 1 per 3 min
+    if (!Config::gps().enabled) return false;
+
+    GPSData gps = GPS::getData();
+
+    PorkchopMode mode = porkchop.getMode();
+    bool isWarhog = (mode == PorkchopMode::WARHOG_MODE);
+
+    // Bad GPS fix
+    if (gps.fix && (gps.satellites < 4 || gps.hdop > 500)) {
+        int idx = random(0, 3);
+        SET_PHRASE(currentPhrase, PHRASES_GPS_BADFIX[idx]);
+        lastGPSPhraseMs = now;
+        lastPhraseChange = now;
+        return true;
+    }
+
+    if (!gps.fix || !gps.valid) return false;
+
+    float speedKmh = gps.speed;  // TinyGPSPlus speed in km/h
+
+    // Standing still too long (5+ min at speed 0)
+    if (speedKmh < 1.0f) {
+        if (!wasStandingStill) {
+            standingStillSinceMs = now;
+            wasStandingStill = true;
+        } else if (now - standingStillSinceMs > 300000) {  // 5 min
+            int idx = random(0, 3);
+            SET_PHRASE(currentPhrase, PHRASES_GPS_STILL[idx]);
+            lastGPSPhraseMs = now;
+            lastPhraseChange = now;
+            standingStillSinceMs = now;  // Reset timer so it doesn't spam
+            return true;
+        }
+    } else {
+        wasStandingStill = false;
+
+        if (speedKmh > 60.0f) {
+            // Highway speed
+            int idx = random(0, 2);
+            SET_PHRASE(currentPhrase, PHRASES_GPS_VFAST[idx]);
+        } else if (speedKmh > 20.0f) {
+            // Car/bike speed
+            int idx = random(0, 3);
+            SET_PHRASE(currentPhrase, PHRASES_GPS_FAST[idx]);
+        } else if (speedKmh >= 1.0f && speedKmh <= 6.0f) {
+            // Walking speed
+            if (isWarhog) {
+                SET_PHRASE(currentPhrase, PHRASES_GPS_WALK_WARHOG[random(0, 2)]);
+            } else {
+                SET_PHRASE(currentPhrase, PHRASES_GPS_WALK_OINK[random(0, 2)]);
+            }
+        } else {
+            return false;  // Bike speed (7-20) not special enough to comment on
+        }
+        lastGPSPhraseMs = now;
+        lastPhraseChange = now;
+        return true;
+    }
+
+    return false;
+}
+
+// Idea 6: Session fatigue / endurance
+bool Mood::pickFatiguePhraseIfDue(uint32_t now) {
+    uint32_t sessionMs = now;  // millis() is session uptime
+    struct { uint32_t ms; uint8_t bit; } milestones[] = {
+        { 6UL * 3600000UL, 0x20 },   // 6hr
+        { 4UL * 3600000UL, 0x10 },   // 4hr
+        { 3UL * 3600000UL, 0x08 },   // 3hr
+        { 2UL * 3600000UL, 0x04 },   // 2hr
+        { 1UL * 3600000UL, 0x02 },   // 1hr
+        {      1800000UL,  0x01 },   // 30min
+    };
+
+    for (int i = 0; i < 6; i++) {
+        if (sessionMs >= milestones[i].ms && !(fatigueMilestonesShown & milestones[i].bit)) {
+            fatigueMilestonesShown |= milestones[i].bit;
+            // Map bit to phrase index: 0x01=0, 0x02=1, 0x04=2, 0x08=3, 0x10=4, 0x20=5
+            int phraseIdx = 0;
+            uint8_t b = milestones[i].bit;
+            while (b > 1) { b >>= 1; phraseIdx++; }
+            SET_PHRASE(currentPhrase, PHRASES_FATIGUE[phraseIdx]);
+            applyMomentumBoost(5);
+            lastPhraseChange = now;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Idea 7: Encryption-type reactions (called from onNewNetwork context)
+bool Mood::pickEncryptionPhraseIfDue(uint32_t now) {
+    if (now - lastEncryptionPhraseMs < 300000) return false;  // Max 1 per 5 min
+
+    // Scan current networks for notable encryption types
+    auto& nets = NetworkRecon::getNetworks();
+    uint8_t openCount = 0;
+    bool hasWEP = false;
+    bool hasWPA3 = false;
+
+    for (size_t i = 0; i < nets.size(); i++) {
+        if (nets[i].authmode == WIFI_AUTH_OPEN) openCount++;
+        if (nets[i].authmode == WIFI_AUTH_WEP) hasWEP = true;
+        if (nets[i].authmode == WIFI_AUTH_WPA3_PSK ||
+            nets[i].authmode == WIFI_AUTH_WPA2_WPA3_PSK) hasWPA3 = true;
+    }
+
+    bool triggered = false;
+
+    if (hasWEP && !firstWEPSeen) {
+        firstWEPSeen = true;
+        int idx = random(0, 3);
+        SET_PHRASE(currentPhrase, PHRASES_ENC_WEP[idx]);
+        triggered = true;
+    } else if (hasWPA3 && !firstWPA3Seen) {
+        firstWPA3Seen = true;
+        int idx = random(0, 2);
+        SET_PHRASE(currentPhrase, PHRASES_ENC_WPA3[idx]);
+        triggered = true;
+    } else if (openCount > 0 && !firstOpenSeen) {
+        firstOpenSeen = true;
+        int idx = random(0, 2);
+        SET_PHRASE(currentPhrase, PHRASES_ENC_OPEN[idx]);
+        triggered = true;
+    } else if (openCount > 5 && openNetCount <= 5) {
+        SET_PHRASE(currentPhrase, PHRASES_ENC_MANY_OPEN);
+        triggered = true;
+    }
+
+    openNetCount = openCount;
+    if (triggered) {
+        lastEncryptionPhraseMs = now;
+        lastPhraseChange = now;
+    }
+    return triggered;
+}
+
+// Idea 8: Buff/debuff awareness
+bool Mood::pickBuffPhraseIfDue(uint32_t now) {
+    static uint32_t lastBuffCheckMs = 0;
+    if (now - lastBuffCheckMs < 10000) return false;
+    lastBuffCheckMs = now;
+
+    BuffState bs = SwineStats::calculateBuffs();
+
+    bool triggered = false;
+
+    // Buff gained
+    if (bs.buffs != 0 && lastBuffFlags == 0) {
+        int idx = random(0, 3);
+        SET_PHRASE(currentPhrase, PHRASES_BUFF_GAINED[idx]);
+        triggered = true;
+    }
+    // Buff lost
+    else if (bs.buffs == 0 && lastBuffFlags != 0) {
+        SET_PHRASE(currentPhrase, PHRASES_BUFF_LOST);
+        triggered = true;
+    }
+    // Debuff gained
+    else if (bs.debuffs != 0 && lastDebuffFlags == 0) {
+        int idx = random(0, 3);
+        SET_PHRASE(currentPhrase, PHRASES_DEBUFF_GAINED[idx]);
+        triggered = true;
+    }
+
+    lastBuffFlags = bs.buffs;
+    lastDebuffFlags = bs.debuffs;
+
+    if (triggered) {
+        lastPhraseChange = now;
+    }
+    return triggered;
+}
+
+// Idea 9: Charging state reactions
+bool Mood::pickChargingPhraseIfDue(uint32_t now) {
+    static uint32_t lastChargeCheckMs = 0;
+    if (now - lastChargeCheckMs < 5000) return false;
+    lastChargeCheckMs = now;
+
+    auto chargeState = M5.Power.isCharging();
+    int8_t charging = (chargeState == m5::Power_Class::is_charging_t::is_charging) ? 1 : 0;
+
+    if (lastChargingState == -1) {
+        lastChargingState = charging;
+        return false;  // First check, just record state
+    }
+
+    if (charging == lastChargingState) return false;
+
+    bool triggered = false;
+
+    if (charging && !lastChargingState) {
+        // Just plugged in
+        int idx = random(0, 3);
+        SET_PHRASE(currentPhrase, PHRASES_CHARGING_ON[idx]);
+        triggered = true;
+    } else if (!charging && lastChargingState) {
+        // Just unplugged
+        int batt = M5.Power.getBatteryLevel();
+        if (batt >= 0 && batt < 20) {
+            char buf[40];
+            snprintf(buf, sizeof(buf), PHRASES_CHARGING_OFF_LOW, batt);
+            SET_PHRASE(currentPhrase, buf);
+        } else {
+            int idx = random(0, 2);
+            SET_PHRASE(currentPhrase, PHRASES_CHARGING_OFF[idx]);
+        }
+        triggered = true;
+    }
+
+    lastChargingState = charging;
+    if (triggered) {
+        lastPhraseChange = now;
+    }
+    return triggered;
+}
+
+// Master situational awareness update (called from Mood::update)
+void Mood::updateSituationalAwareness(uint32_t now) {
+    // Priority order: heap pressure > charging > fatigue > challenge > density > encryption > GPS > buff
+    // Only one SA phrase per update cycle to avoid spam
+    if (pickHeapPhraseIfDue(now)) return;
+    if (pickChargingPhraseIfDue(now)) return;
+    if (pickFatiguePhraseIfDue(now)) return;
+    if (pickChallengePhraseIfDue(now)) return;
+    if (pickDensityPhraseIfDue(now)) return;
+    if (pickEncryptionPhraseIfDue(now)) return;
+    if (pickGPSPhraseIfDue(now)) return;
+    if (pickBuffPhraseIfDue(now)) return;
+}
+
 void Mood::selectPhrase() {
     const char** phrases;
     int count;
@@ -1530,6 +2238,11 @@ void Mood::selectPhrase() {
     // Use effective happiness (base + momentum) for phrase selection
     int effectiveMood = getEffectiveHappiness();
     
+    // Idea 2: ~3% chance for time-of-day phrase
+    if (random(0, 100) < 3 && pickTimePhraseIfDue(millis())) {
+        return;
+    }
+
     // Phase 3: 5% chance for rare phrase (surprise variety)
     int specialRoll = random(0, 100);
     if (specialRoll < 3) {
@@ -1688,10 +2401,16 @@ void Mood::updateAvatarState() {
     // Use effective happiness (base + momentum) for avatar state
     int effectiveMood = getEffectiveHappiness();
     uint32_t now = millis();
-    
+
     // Phase 8: Pass mood intensity to avatar for animation timing
     Avatar::setMoodIntensity(effectiveMood);
-    
+
+    // Idea 1: CRITICAL heap pressure forces SAD avatar
+    if ((uint8_t)HeapHealth::getPressureLevel() >= (uint8_t)HeapPressureLevel::Critical) {
+        Avatar::setState(AvatarState::SAD);
+        return;
+    }
+
     // Mode-aware avatar state selection
     PorkchopMode mode = porkchop.getMode();
     
