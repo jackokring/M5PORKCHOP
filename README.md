@@ -2,7 +2,7 @@
                     Volume Zero, Issue 3, Phile 1 of 1
 
                           M5PORKCHOP README
-                          v0.1.8a-heapkampf
+                          v0.1.8b-heapkampf
 
                             ^__^
                             (oo)\_______
@@ -267,7 +267,7 @@
 
     BOAR BROS: press [B] to whitelist a network.
         bros get observed, not attacked. the pig has honor.
-        manage in LOOT > BOAR BROS. max 50 networks.
+        manage in SYSTEM > BOARBROS. max 50 networks.
         zero heap allocation (fixed array in BSS).
 
     SEAMLESS TOGGLE: press [D] to flip into DO NO HAM.
@@ -297,7 +297,7 @@
         - some achievements here reward patience over violence.
           the rarest catches go to the stillest hunters.
 
-    press [D] again to flip back to OINK.
+    press [O] to flip back to OINK.
     the pig remembers which side you chose.
 
 
@@ -321,7 +321,7 @@
     BOUNTY SYSTEM: wardriven networks become targets for
     PigSync. your s3rloin companion can hunt what you found.
     max 15 bounty BSSIDs per sync payload.
-    manage in LOOT > BOUNTIES.
+    manage in LOOT > BOUNTY.
 
     FILES: /m5porkchop/wardriving/*.wigle.csv
 
@@ -342,7 +342,7 @@
         - BRO indicator (networks in boar_bros.txt)
         - filter modes: ALL / VULN / SOFT (no PMF) / HIDDEN
         - render snapshot buffer (64 networks, heap-safe)
-        - packet-per-second counter (callback-safe atomic)
+        - packet-per-second counter (callback-safe volatile)
 
     DIAL MODE (Cardputer ADV only):
         BMI270 IMU detected = tilt-to-tune channel selection.
@@ -391,7 +391,7 @@
             Samsung  - Galaxy ecosystem triggers
             Windows  - Swift Pair dialogs
         - continuous NimBLE passive scan + opportunistic advertising
-        - no-reboot roulette counter (for the brave and the foolish)
+        - no-reboot roulette (50% random chance, for the brave and the foolish)
         - vendor identification from manufacturer data
 
     ENTRY: the pig warns you. you confirm. the pig sighs.
@@ -453,7 +453,7 @@
 
     plug in USB. the pig rests. the pig deserves this.
 
-    auto-enters when external power detected and battery low.
+    enter via menu or [C] from IDLE.
     shows battery percent, voltage, charge rate estimate,
     minutes-to-full calculation from voltage history (10 samples).
     suspends NetworkRecon and GPS to minimize draw.
@@ -646,7 +646,7 @@
     and you answered. efficient as a slaughterhouse. elegant
     as the animal that escaped one.
 
-    the grid in LOOT > ACHIEVEMENTS shows your progress.
+    the grid in RANK > BADGES shows your progress.
     names are in l33t-speak. conditions are not explained.
     the pig considers this a feature.
 
@@ -780,7 +780,7 @@
         - ALREADY UPLOADED tracking (no phantom submissions)
         - XP award for submissions
 
-    press [S] in LOOT > CAPTURES to sync.
+    press [S] in LOOT > HASHES to sync.
 
 
 ----[ 5.3 - IF UPLOADS FAIL
@@ -879,39 +879,45 @@
 
 ----[ 7.1 - MAIN MENU (from IDLE)
 
-    LOOT:
-        CAPTURES     - handshakes + PMKIDs with WPA-SEC status
-        WIGLE        - wardriving files with WiGLE status
-        ACHIEVEMENTS - trophy grid (64 slots)
-        BOAR BROS    - whitelist management (BSSID + SSID)
-        BOUNTIES     - unclaimed wardriven network targets
+    ATTACK:
+        OINKS        - OINK offensive mode
+        BLUES        - PIGGY BLUES BLE chaos
 
-    STATS:
-        SWINE STATS  - three tabs: ST4TS / B00STS / W1GL3
+    RECON:
+        DNOHAM       - DO NO HAM passive mode
+        WARHOG       - wardriving
+        SPCTRM       - spectrum analyzer
+
+    LOOT:
+        HASHES       - handshakes + PMKIDs with WPA-SEC status
+        TRACKS       - wardriving files with WiGLE status
+        BOUNTY       - unclaimed wardriven network targets
+
+    RANK:
+        FLEXES       - SWINE STATS (three tabs: ST4TS / B00STS / W1GL3)
                        lifetime counters, session performance,
                        active modifiers (some help, some hurt),
                        class perks that grow with rank, WiGLE rank
-
-    SETTINGS:
-        Personality  - name, callsign, colors, brightness, dim
-        WiFi         - SSID/password, channel hop interval,
-                       lock time, deauth toggle, RSSI thresholds
-        GPS          - source (Grove/CapLoRa/Custom), baud rate,
-                       timezone offset, power save
-        BLE          - burst interval, advertisement duration
-        Display      - brightness, dim timeout, dim level
-        Boot Mode    - auto-start mode (IDLE/OINK/DNOHAM/WARHOG)
-        G0 Button    - configurable action (screen toggle, mode entry)
-
-    TOOLS:
-        DIAGNOSTICS  - heap status, WiFi reset, garbage collection
-        SD FORMAT    - nuclear option (confirm required)
-        CRASH VIEWER - browse/delete core dumps
-        UNLOCKABLES  - secret code entry portal
+        BADGES       - trophy grid (64 slots)
+        UNLOCK       - secret code entry portal
                        (the pig hides things here. look carefully.)
 
+    COMMS:
+        PIGSYNC      - device discovery and sync
+        BACONTX      - BACON beacon broadcaster
+        TRANSFR      - web file manager
 
-----[ 7.2 - LOOT > CAPTURES
+    SYSTEM:
+        SETTINGS     - Personality, WiFi, GPS, BLE, Display, Boot Mode, G0
+        BOARBROS     - whitelist management (BSSID + SSID)
+        COREDUMP     - browse/delete core dumps
+        DIAGDATA     - heap status, WiFi reset, garbage collection
+        FORMATSD     - nuclear option (confirm required)
+        CHARGING     - low power charging mode
+        ABOUTPIG     - credits and version info
+
+
+----[ 7.2 - LOOT > HASHES
 
     shows .22000 and .pcap files.
     per-capture: BSSID, type (PMKID/HS), WPA-SEC status, timestamp.
@@ -921,7 +927,7 @@
     [ENTER] detail view
 
 
-----[ 7.3 - LOOT > WIGLE
+----[ 7.3 - LOOT > TRACKS
 
     shows .wigle.csv files.
     per-file: filename, size, upload status.
@@ -945,7 +951,7 @@
     [F] FILE TRANSFER     web file manager
     [S] SWINE STATS       numbers go up
     [T] SETTINGS          configuration
-    [C] CHARGING          low power mode (also auto-enters)
+    [C] CHARGING          low power mode
 
     [1] PIG DEMANDS       session challenges overlay
     [2] PIGSYNC           device discovery and sync
