@@ -50,7 +50,7 @@ public:
 
     // Network operations (require WiFi + sufficient heap)
     static bool hasApiKey();                         // Check if WPA-SEC key configured
-    static bool canSync();                           // Check heap requirements (~38KB)
+    static bool canSync();                           // Check heap requirements (~35KB)
     static WPASecSyncResult syncCaptures(WPASecProgressCallback cb = nullptr);  // Full sync
 
     // Status

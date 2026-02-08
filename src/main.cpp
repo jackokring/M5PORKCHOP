@@ -394,6 +394,11 @@ void setup() {
     // This stabilizes heap by running WiFi promiscuous mode early
     // and provides shared network data for OINK/DONOHAM/SPECTRUM modes
     NetworkRecon::start();
+
+    // Reset heap health baseline to post-init state so the health bar
+    // starts at the REAL value, not 100%. Without this, the EMA slowly
+    // converges from 100% to reality, looking like a steady decline.
+    HeapHealth::resetPeaks(true);
 }
 
 void loop() {

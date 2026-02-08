@@ -166,7 +166,7 @@
     THE CORE:
     cooperative main loop. porkchop.update() (SFX ticks inside),
     Display::update(), Mood::update(). the pig's vital organs.
-    single PorkchopMode enum, 25 states. one mode lives. the others wait.
+    single PorkchopMode enum, 24 states. one mode lives. the others wait.
     the pig is a finite state machine with infinite opinions.
     the horse is a barn with load-bearing feelings.
 
@@ -838,7 +838,7 @@
 
     DATA TRANSFER: chunked, 238 bytes per fragment.
     sequence numbers, CRC32 verification, ACK per chunk.
-    3 retries per chunk. 60 second transfer timeout.
+    5 retries per chunk. 60 second transfer timeout.
 
     ENCRYPTION: ESP-NOW encrypted unicast.
     PMK and LMK are hardcoded in pigsync_protocol.h.

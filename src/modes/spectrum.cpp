@@ -305,9 +305,9 @@ void SpectrumMode::start() {
     // Apply spectrum-specific sweep speed
     NetworkRecon::setHopIntervalOverride(Config::wifi().spectrumHopInterval);
     
-    // Reserve memory for spectrum-specific network data
-    networks.reserve(MAX_SPECTRUM_NETWORKS);
+    // init() first (clears + shrinks), THEN reserve (so shrink_to_fit doesn't kill capacity)
     init();
+    networks.reserve(MAX_SPECTRUM_NETWORKS);
     
     // Register our packet callback for visualization
     NetworkRecon::setPacketCallback(promiscuousCallback);

@@ -112,11 +112,19 @@ void update() {
     uint8_t newPct = computePercent(freeHeap, largestBlock, true);
     heapHealthPct = newPct;
 
-    // Asymmetric EMA for display: slow to drop (absorbs transient dips), moderate recovery
-    float alpha = (newPct < displayPctF)
-        ? HeapPolicy::kDisplayEmaAlphaDown
-        : HeapPolicy::kDisplayEmaAlphaUp;
-    displayPctF += alpha * ((float)newPct - displayPctF);
+    // On first sample, snap display to actual value (skip EMA convergence from 100%)
+    static bool firstSample = true;
+    if (firstSample) {
+        displayPctF = (float)newPct;
+        stableHealthPct = newPct;
+        firstSample = false;
+    } else {
+        // Asymmetric EMA for display: slow to drop (absorbs transient dips), moderate recovery
+        float alpha = (newPct < displayPctF)
+            ? HeapPolicy::kDisplayEmaAlphaDown
+            : HeapPolicy::kDisplayEmaAlphaUp;
+        displayPctF += alpha * ((float)newPct - displayPctF);
+    }
 
     float fragRatio = freeHeap > 0 ? (float)largestBlock / (float)freeHeap : 0.0f;
 
