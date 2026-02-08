@@ -17,7 +17,6 @@ namespace HeapPolicy {
 
     // Heap stabilization / recovery thresholds
     static constexpr size_t kHeapStableThreshold = 50000;
-    static constexpr size_t kFileServerRecoveryThreshold = 50000;
     static constexpr size_t kFileServerMinHeap = 40000;
     static constexpr size_t kFileServerMinLargest = 30000;
     static constexpr size_t kFileServerLogThreshold = 60000;
@@ -96,7 +95,9 @@ namespace HeapPolicy {
     static constexpr uint32_t kConditioningFinalDelayMs = 50;
     static constexpr uint32_t kBrewDefaultDwellMs = 1000;
     static constexpr uint32_t kBrewAutoDwellMs = 1200;
-    static constexpr uint32_t kBrewFileServerDwellMs = 2000;
+    // FileServer LWIP async cleanup polling
+    static constexpr uint32_t kFileServerLwipWaitMaxMs = 500;   // Max wait for async LWIP cleanup
+    static constexpr uint32_t kFileServerLwipPollMs = 50;       // Poll interval
 
     // WiFi/BLE settle delays used during conditioning/reset
     static constexpr uint32_t kWiFiModeDelayMs = 50;

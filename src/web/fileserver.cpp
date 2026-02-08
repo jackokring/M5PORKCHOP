@@ -3597,23 +3597,26 @@ void FileServer::stop() {
     MDNS.end();
     WiFiUtils::shutdown();
     
-    // Heap recovery: brief promiscuous cycle to coalesce fragments
-    // WebServer + mDNS allocations cause fragmentation; this triggers WiFi driver's
-    // internal buffer reorganization which helps defragment the heap
-    HeapGates::HeapSnapshot heapBefore = HeapGates::snapshot();
-    size_t largestBefore = heapBefore.largestBlock;
-    if (largestBefore < HeapPolicy::kFileServerRecoveryThreshold) {
-        // Short callback-enabled brew for reliable coalescing
-        FS_LOGF("[FILESERVER] Heap recovery starting: largest=%u\n", (unsigned)largestBefore);
-        size_t largestAfter = WiFiUtils::brewHeap(HeapPolicy::kBrewFileServerDwellMs, false);
-        if (largestAfter < HeapPolicy::kMinContigForTls) {
-            FS_LOGF("[FILESERVER] Brew insufficient (largest=%u), running full conditioning\n",
-                          (unsigned)largestAfter);
-            largestAfter = WiFiUtils::conditionHeapForTLS();
+    // Wait for async LWIP cleanup after WiFi disconnect.
+    // WiFi.disconnect() frees TCP/IP buffers asynchronously on core 0.
+    {
+        size_t prevLargest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+        size_t prevFree = ESP.getFreeHeap();
+        uint32_t waitStart = millis();
+
+        while ((millis() - waitStart) < HeapPolicy::kFileServerLwipWaitMaxMs) {
+            delay(HeapPolicy::kFileServerLwipPollMs);
+            size_t curLargest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+            size_t curFree = ESP.getFreeHeap();
+            if (curFree == prevFree && curLargest == prevLargest) break;
+            prevFree = curFree;
+            prevLargest = curLargest;
         }
-        FS_LOGF("[FILESERVER] Heap recovery complete: %u -> %u (+%d)\n",
-                      (unsigned)largestBefore, (unsigned)largestAfter,
-                      (int)(largestAfter - largestBefore));
+
+        FS_LOGF("[FILESERVER] LWIP cleanup: free=%u largest=%u (waited %ums)\n",
+                (unsigned)ESP.getFreeHeap(),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+                (unsigned)(millis() - waitStart));
     }
     
     state = FileServerState::IDLE;

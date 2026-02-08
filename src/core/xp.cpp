@@ -35,6 +35,20 @@ void (*XP::levelUpCallback)(uint8_t, uint8_t) = nullptr;
 // Protected by achQueueMutex to prevent race conditions
 static bool pendingSaveFlag = false;
 
+static uint32_t lastSavedCRC = 0;
+
+static uint32_t computeDataCRC(const PorkXPData* d) {
+    uint32_t crc = 0xFFFFFFFF;
+    const uint8_t* bytes = (const uint8_t*)d;
+    for (size_t i = 0; i < sizeof(PorkXPData); i++) {
+        crc ^= bytes[i];
+        for (int j = 0; j < 8; j++) {
+            crc = (crc >> 1) ^ (0xEDB88320 & -(crc & 1));
+        }
+    }
+    return crc ^ 0xFFFFFFFF;
+}
+
 // Mutex for protecting achievement queue operations AND pendingSaveFlag
 static SemaphoreHandle_t achQueueMutex = nullptr;
 
@@ -549,9 +563,13 @@ void XP::load() {
     data.cachedLevel = calculateLevel(data.totalXP);
     
     prefs.end();
+    lastSavedCRC = computeDataCRC(&data);
 }
 
 void XP::save() {
+    uint32_t currentCRC = computeDataCRC(&data);
+    if (currentCRC == lastSavedCRC) return;
+
     prefs.begin("porkxp", false);  // Read-write
     
     prefs.putUInt("totalxp", data.totalXP);
@@ -584,7 +602,8 @@ void XP::save() {
     prefs.putUInt("unlock", data.unlockables);  // Unlockables v0.1.8
     
     prefs.end();
-    
+    lastSavedCRC = currentCRC;
+
     Serial.printf("[XP] Saved - LV%d (%lu XP)\n", getLevel(), data.totalXP);
     
     // Backup to SD - pig survives M5Burner / NVS wipes
