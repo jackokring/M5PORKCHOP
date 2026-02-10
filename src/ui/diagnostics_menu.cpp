@@ -11,6 +11,8 @@
 #include "../web/wigle.h"
 #include "../core/sd_layout.h"
 #include "../core/heap_health.h"
+#include "../core/heap_policy.h"
+#include "../core/wifi_utils.h"
 #include <WiFi.h>
 #include <esp_heap_caps.h>
 #include <esp_wifi.h>
@@ -27,10 +29,12 @@ void DiagnosticsMenu::show() {
     active = true;
     keyWasPressed = true;  // Ignore the Enter that brought us here
     lastStatRefreshMs = 0; // force immediate refresh
+    HeapHealth::setKnuthEnabled(true);
 }
 
 void DiagnosticsMenu::hide() {
     active = false;
+    HeapHealth::setKnuthEnabled(false);
     // Release caches when leaving
     WPASec::freeCacheMemory();
     WiGLE::freeUploadedListMemory();
@@ -167,10 +171,8 @@ void DiagnosticsMenu::saveSnapshot() {
 }
 
 void DiagnosticsMenu::resetWiFi() {
-    WiFi.disconnect(true, true);
-    WiFi.mode(WIFI_OFF);
-    delay(100);
-    WiFi.mode(WIFI_STA);
+    // Avoid driver teardown to prevent esp_wifi_init 257 on fragmented heap.
+    WiFiUtils::hardReset();
 }
 
 void DiagnosticsMenu::logHeapSnapshot() {
@@ -253,16 +255,44 @@ void DiagnosticsMenu::draw(M5Canvas& canvas) {
     canvas.drawString("MIN LRG:", 4, y);
     snprintf(heapBuf, sizeof(heapBuf), "%u", (unsigned)HeapHealth::getMinLargest());
     canvas.drawString(heapBuf, 80, y);
-    y += lineH + 4;
+    y += lineH;
 
-    // PSRAM (if present)
-    if (psramFound()) {
-        canvas.drawString("PSRAM:", 4, y);
-        char ps[32];
-        snprintf(ps, sizeof(ps), "%u/%u", (unsigned int)ESP.getFreePsram(), (unsigned int)ESP.getPsramSize());
-        canvas.drawString(ps, 80, y);
+    // Pressure level
+    {
+        static const char* const pressureLabels[] = {"NORMAL", "CAUTION", "WARNING", "CRITICAL"};
+        uint8_t pl = static_cast<uint8_t>(HeapHealth::getPressureLevel());
+        canvas.drawString("PRESSURE:", 4, y);
+        canvas.drawString(pl < 4 ? pressureLabels[pl] : "?", 80, y);
         y += lineH;
     }
+
+    // Knuth ratio (only meaningful when enabled via diagnostics)
+    {
+        char knBuf[16];
+        float kr = HeapHealth::getKnuthRatio();
+        snprintf(knBuf, sizeof(knBuf), "%.2f", kr);
+        canvas.drawString("KNUTH:", 4, y);
+        canvas.drawString(knBuf, 80, y);
+        y += lineH;
+    }
+
+    // Previous session watermarks
+    {
+        char prevBuf[16];
+        uint32_t pmf = HeapHealth::getPrevMinFree();
+        uint32_t pml = HeapHealth::getPrevMinLargest();
+        if (pmf > 0 || pml > 0) {
+            canvas.drawString("PREV MIN:", 4, y);
+            snprintf(prevBuf, sizeof(prevBuf), "%u", pmf);
+            canvas.drawString(prevBuf, 80, y);
+            y += lineH;
+            canvas.drawString("PREV LRG:", 4, y);
+            snprintf(prevBuf, sizeof(prevBuf), "%u", pml);
+            canvas.drawString(prevBuf, 80, y);
+            y += lineH;
+        }
+    }
+    y += 4;
 
     // WiFi
     bool wifiUp = WiFi.status() == WL_CONNECTED;
@@ -328,11 +358,6 @@ void DiagnosticsMenu::draw(M5Canvas& canvas) {
     y += lineH;
     canvas.drawString("CHARGING:", 4, y);
     canvas.drawString(M5.Power.isCharging() ? "YES" : "NO", 80, y);
-    y += lineH + 6;
-
-    // SD status
-    canvas.drawString("SD:", 4, y);
-    canvas.drawString(Config::isSDAvailable() ? "OK" : "MISSING", 80, y);
     y += lineH + 6;
 
     // Controls (compressed)

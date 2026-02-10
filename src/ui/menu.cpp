@@ -142,6 +142,11 @@ static const char* const H_ABOUT[] = {
     "CREDIT ROLLS. HEAP FALLS.",
     "DOCUMENT NOTHING."
 };
+static const char* const H_CHARGING[] = {
+    "PLUG IN. ZONE OUT. SAVE POWER.",
+    "BATTERY REST. SERVICES CEASED.",
+    "CHARGING VIBES. MAX CHILL."
+};
 
 // Root menu items
 const RootItem Menu::ROOT_ITEMS[] = {
@@ -200,6 +205,7 @@ const MenuItem Menu::GROUP_SYSTEM[] = {
     {"!!", "COREDUMP",  7,  H_CRASHES,  (uint8_t)(sizeof(H_CRASHES)/sizeof(H_CRASHES[0]))},
     {"::", "DIAGDATA",   19, H_DIAG,     (uint8_t)(sizeof(H_DIAG)/sizeof(H_DIAG[0]))},
     {"SD", "FORMATSD",  20, H_SDFMT,    (uint8_t)(sizeof(H_SDFMT)/sizeof(H_SDFMT[0]))},
+    {"~~", "CHARGING",  21, H_CHARGING, (uint8_t)(sizeof(H_CHARGING)/sizeof(H_CHARGING[0]))},
     {":?", "ABOUTPIG",   6,  H_ABOUT,    (uint8_t)(sizeof(H_ABOUT)/sizeof(H_ABOUT[0]))}
 };
 const uint8_t Menu::GROUP_SYSTEM_SIZE = sizeof(GROUP_SYSTEM) / sizeof(GROUP_SYSTEM[0]);

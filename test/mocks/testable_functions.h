@@ -10,9 +10,9 @@
 // From: src/core/xp.cpp
 // ============================================================================
 
-// XP thresholds for each level (1-40)
+// XP thresholds for each level (1-50)
 // Level N requires XP_THRESHOLDS[N-1] total XP
-static const uint32_t XP_THRESHOLDS[40] = {
+static const uint32_t XP_THRESHOLDS[50] = {
     0,       // Level 1: 0 XP
     100,     // Level 2: 100 XP
     300,     // Level 3: 300 XP
@@ -52,13 +52,23 @@ static const uint32_t XP_THRESHOLDS[40] = {
     404000,  // Level 37
     454000,  // Level 38
     514000,  // Level 39
-    600000   // Level 40: 600,000 XP
+    600000,  // Level 40
+    680000,  // Level 41
+    770000,  // Level 42
+    870000,  // Level 43
+    980000,  // Level 44
+    1100000, // Level 45
+    1230000, // Level 46
+    1370000, // Level 47
+    1520000, // Level 48
+    1680000, // Level 49
+    1850000  // Level 50: 1,850,000 XP
 };
 
-static const uint8_t MAX_LEVEL = 40;
+static const uint8_t MAX_LEVEL = 50;
 
 // Calculate level from total XP
-// Returns level 1-40
+// Returns level 1-50
 inline uint8_t calculateLevel(uint32_t xp) {
     for (uint8_t i = MAX_LEVEL - 1; i > 0; i--) {
         if (xp >= XP_THRESHOLDS[i]) return i + 1;
@@ -67,9 +77,10 @@ inline uint8_t calculateLevel(uint32_t xp) {
 }
 
 // Get XP required for a specific level
-// Returns 0 for invalid levels
+// Clamps to MAX_LEVEL for out-of-range levels, returns 0 for level 0
 inline uint32_t getXPForLevel(uint8_t level) {
-    if (level < 1 || level > MAX_LEVEL) return 0;
+    if (level <= 1) return 0;
+    if (level > MAX_LEVEL) level = MAX_LEVEL;
     return XP_THRESHOLDS[level - 1];
 }
 
@@ -120,8 +131,7 @@ inline double haversineMeters(double lat1, double lon1, double lat2, double lon2
 }
 
 // ============================================================================
-// Feature Extraction Helpers
-// From: src/ml/features.cpp
+// 802.11 Frame Parsing Helpers
 // ============================================================================
 
 // Check if MAC address is randomized (locally administered bit set)
@@ -156,55 +166,6 @@ inline uint16_t parseCapability(const uint8_t* frame, uint16_t len) {
     if (len < 36) return 0;
     // Capability at offset 34
     return frame[34] | (frame[35] << 8);
-}
-
-// ============================================================================
-// Anomaly Scoring
-// From: src/ml/inference.cpp
-// ============================================================================
-
-// Calculate anomaly score component for signal strength
-// Very strong signals (>-30 dBm) are suspicious
-inline float anomalyScoreRSSI(int8_t rssi) {
-    if (rssi > -30) return 0.3f;
-    return 0.0f;
-}
-
-// Calculate anomaly score component for beacon interval
-// Normal is ~100ms (100 TU), unusual intervals are suspicious
-inline float anomalyScoreBeaconInterval(uint16_t interval) {
-    if (interval < 50 || interval > 200) return 0.2f;
-    return 0.0f;
-}
-
-// Calculate anomaly score for open network
-inline float anomalyScoreOpenNetwork(bool hasWPA, bool hasWPA2, bool hasWPA3) {
-    if (!hasWPA && !hasWPA2 && !hasWPA3) return 0.2f;
-    return 0.0f;
-}
-
-// Calculate anomaly score for WPS on open network (honeypot pattern)
-inline float anomalyScoreWPSHoneypot(bool hasWPS, bool hasWPA, bool hasWPA2, bool hasWPA3) {
-    if (hasWPS && !hasWPA && !hasWPA2 && !hasWPA3) return 0.25f;
-    return 0.0f;
-}
-
-// Calculate anomaly score for VHT without HT (inconsistent capabilities)
-inline float anomalyScoreInconsistentPHY(bool hasVHT, bool hasHT) {
-    if (hasVHT && !hasHT) return 0.2f;
-    return 0.0f;
-}
-
-// Calculate anomaly score for beacon jitter (high jitter = software AP)
-inline float anomalyScoreBeaconJitter(float jitter) {
-    if (jitter > 10.0f) return 0.15f;
-    return 0.0f;
-}
-
-// Calculate anomaly score for missing vendor IEs (real routers have many)
-inline float anomalyScoreMissingVendorIEs(uint8_t vendorIECount) {
-    if (vendorIECount < 2) return 0.1f;
-    return 0.0f;
 }
 
 // ============================================================================
@@ -494,196 +455,6 @@ inline size_t escapeCSV(const char* input, char* output, size_t maxInputLen, siz
     }
     
     return outPos;
-}
-
-// ============================================================================
-// Feature Vector Mapping
-// From: src/ml/features.cpp (toFeatureVector)
-// ============================================================================
-
-// Feature vector indices (must match features.cpp toFeatureVector)
-enum FeatureIndex {
-    FI_RSSI = 0,
-    FI_NOISE = 1,
-    FI_SNR = 2,
-    FI_CHANNEL = 3,
-    FI_SECONDARY_CH = 4,
-    FI_BEACON_INTERVAL = 5,
-    FI_CAPABILITY_LO = 6,
-    FI_CAPABILITY_HI = 7,
-    FI_HAS_WPS = 8,
-    FI_HAS_WPA = 9,
-    FI_HAS_WPA2 = 10,
-    FI_HAS_WPA3 = 11,
-    FI_IS_HIDDEN = 12,
-    FI_RESPONSE_TIME = 13,
-    FI_BEACON_COUNT = 14,
-    FI_BEACON_JITTER = 15,
-    FI_RESPONDS_PROBE = 16,
-    FI_PROBE_RESPONSE_TIME = 17,
-    FI_VENDOR_IE_COUNT = 18,
-    FI_SUPPORTED_RATES = 19,
-    FI_HT_CAPABILITIES = 20,
-    FI_VHT_CAPABILITIES = 21,
-    FI_ANOMALY_SCORE = 22,
-    FI_PADDING_START = 23,
-    FI_VECTOR_SIZE = 32
-};
-
-// Simplified WiFiFeatures struct for testing (mirrors src/ml/features.h)
-struct TestWiFiFeatures {
-    int8_t rssi;
-    int8_t noise;
-    float snr;
-    uint8_t channel;
-    uint8_t secondaryChannel;
-    uint16_t beaconInterval;
-    uint16_t capability;
-    bool hasWPS;
-    bool hasWPA;
-    bool hasWPA2;
-    bool hasWPA3;
-    bool isHidden;
-    uint32_t responseTime;
-    uint16_t beaconCount;
-    float beaconJitter;
-    bool respondsToProbe;
-    uint16_t probeResponseTime;
-    uint8_t vendorIECount;
-    uint8_t supportedRates;
-    uint8_t htCapabilities;
-    uint8_t vhtCapabilities;
-    float anomalyScore;
-};
-
-// Convert WiFiFeatures to feature vector (pure function, no normalization)
-// Mirrors src/ml/features.cpp toFeatureVector but without normParams
-inline void toFeatureVectorRaw(const TestWiFiFeatures& features, float* output) {
-    output[FI_RSSI] = (float)features.rssi;
-    output[FI_NOISE] = (float)features.noise;
-    output[FI_SNR] = features.snr;
-    output[FI_CHANNEL] = (float)features.channel;
-    output[FI_SECONDARY_CH] = (float)features.secondaryChannel;
-    output[FI_BEACON_INTERVAL] = (float)features.beaconInterval;
-    output[FI_CAPABILITY_LO] = (float)(features.capability & 0xFF);
-    output[FI_CAPABILITY_HI] = (float)((features.capability >> 8) & 0xFF);
-    output[FI_HAS_WPS] = features.hasWPS ? 1.0f : 0.0f;
-    output[FI_HAS_WPA] = features.hasWPA ? 1.0f : 0.0f;
-    output[FI_HAS_WPA2] = features.hasWPA2 ? 1.0f : 0.0f;
-    output[FI_HAS_WPA3] = features.hasWPA3 ? 1.0f : 0.0f;
-    output[FI_IS_HIDDEN] = features.isHidden ? 1.0f : 0.0f;
-    output[FI_RESPONSE_TIME] = (float)features.responseTime;
-    output[FI_BEACON_COUNT] = (float)features.beaconCount;
-    output[FI_BEACON_JITTER] = features.beaconJitter;
-    output[FI_RESPONDS_PROBE] = features.respondsToProbe ? 1.0f : 0.0f;
-    output[FI_PROBE_RESPONSE_TIME] = (float)features.probeResponseTime;
-    output[FI_VENDOR_IE_COUNT] = (float)features.vendorIECount;
-    output[FI_SUPPORTED_RATES] = (float)features.supportedRates;
-    output[FI_HT_CAPABILITIES] = (float)features.htCapabilities;
-    output[FI_VHT_CAPABILITIES] = (float)features.vhtCapabilities;
-    output[FI_ANOMALY_SCORE] = features.anomalyScore;
-    
-    // Pad remaining with zeros
-    for (int i = FI_PADDING_START; i < FI_VECTOR_SIZE; i++) {
-        output[i] = 0.0f;
-    }
-}
-
-// ============================================================================
-// Classifier Score Normalization
-// From: src/ml/inference.cpp (runInference score normalization)
-// ============================================================================
-
-// Normalize an array of scores so they sum to 1.0
-// Returns false if all scores are zero (no normalization possible)
-inline bool normalizeScores(float* scores, size_t count) {
-    float sum = 0.0f;
-    for (size_t i = 0; i < count; i++) {
-        sum += scores[i];
-    }
-    if (sum <= 0.0f) return false;
-    for (size_t i = 0; i < count; i++) {
-        scores[i] /= sum;
-    }
-    return true;
-}
-
-// Find index of maximum value in array
-// Returns 0 if array is empty
-inline size_t findMaxIndex(const float* values, size_t count) {
-    if (count == 0) return 0;
-    size_t maxIdx = 0;
-    float maxVal = values[0];
-    for (size_t i = 1; i < count; i++) {
-        if (values[i] > maxVal) {
-            maxVal = values[i];
-            maxIdx = i;
-        }
-    }
-    return maxIdx;
-}
-
-// Clamp a value to [0, 1] range
-inline float clampScore(float value) {
-    if (value < 0.0f) return 0.0f;
-    if (value > 1.0f) return 1.0f;
-    return value;
-}
-
-// Calculate vulnerability score based on security features
-// From inference.cpp vuln scoring logic
-inline float calculateVulnScore(bool hasWPA, bool hasWPA2, bool hasWPA3, bool hasWPS, bool isHidden) {
-    float vulnScore = 0.0f;
-    
-    // Open network
-    if (!hasWPA && !hasWPA2 && !hasWPA3) {
-        vulnScore += 0.5f;
-    }
-    
-    // WPA1 only (TKIP vulnerable)
-    if (hasWPA && !hasWPA2 && !hasWPA3) {
-        vulnScore += 0.4f;
-    }
-    
-    // WPS enabled (PIN attack vulnerable)
-    if (hasWPS) {
-        vulnScore += 0.2f;
-    }
-    
-    // Hidden SSID with weak security
-    if (isHidden && vulnScore > 0.3f) {
-        vulnScore += 0.1f;
-    }
-    
-    return vulnScore;
-}
-
-// Calculate deauth target score based on network characteristics
-// From inference.cpp deauth scoring logic
-inline float calculateDeauthScore(int8_t rssi, bool hasWPA3) {
-    float deauthScore = 0.0f;
-    
-    // Good signal for reliable deauth (not too weak, not suspiciously strong)
-    if (rssi > -70 && rssi < -30) {
-        deauthScore += 0.2f;
-    }
-    
-    // Not WPA3 (PMF protected)
-    if (!hasWPA3) {
-        deauthScore += 0.3f;
-    }
-    
-    return deauthScore;
-}
-
-// Calculate evil twin score based on network characteristics
-// From inference.cpp evil twin detection
-inline float calculateEvilTwinScore(bool isHidden, int8_t rssi) {
-    float score = 0.0f;
-    if (isHidden && rssi > -50) {
-        score += 0.2f;
-    }
-    return score;
 }
 
 // ============================================================================

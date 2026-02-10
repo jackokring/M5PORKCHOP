@@ -15,7 +15,7 @@ public:
     static void onHandshakeCaptured(const char* apName = nullptr);
     static void onPMKIDCaptured(const char* apName = nullptr);
     static void onNewNetwork(const char* apName = nullptr, int8_t rssi = 0, uint8_t channel = 0);
-    static void setStatusMessage(const String& msg);  // For mode-specific info
+    static void setStatusMessage(const char* msg);  // For mode-specific info
     static void onMLPrediction(float confidence);
     static void onNoActivity(uint32_t seconds);
     static void onWiFiLost();
@@ -36,9 +36,10 @@ public:
     static void resetBLESniffState();  // Reset first-target sniff flag on mode start
     
     // Get current mood phrase
-    static const String& getCurrentPhrase();
+    static const char* getCurrentPhrase();
     static int getCurrentHappiness();
     static int getEffectiveHappiness();  // Happiness with momentum applied
+    static int getLastEffectiveHappiness();  // Cached effective happiness (no decay)
     static uint32_t getLastActivityTime();  // For buff/debuff idle detection
     static void adjustHappiness(int delta);  // Direct happiness adjustment
     
@@ -47,9 +48,9 @@ public:
     static bool isDialogueLocked();
     
     // Phase 6: Public for phrase chaining helper functions
-    static String currentPhrase;
+    static char currentPhrase[40];
     static uint32_t lastPhraseChange;
-    static String phraseQueue[4];  // Expanded for 5-line riddles
+    static char phraseQueue[4][40];  // Expanded for 5-line riddles
     static uint8_t phraseQueueCount;
     static uint32_t lastQueuePop;
     
@@ -57,14 +58,26 @@ private:
     static int happiness;  // -100 to 100 (base level)
     static uint32_t phraseInterval;
     static uint32_t lastActivityTime;
-    
+
     // Mood momentum system - recent boosts decay over time
     static int momentumBoost;           // Current boost amount (decays)
     static uint32_t lastBoostTime;      // When boost was applied
     static const uint32_t MOMENTUM_DECAY_MS = 30000;  // 30s full decay
-    
+
     static void selectPhrase();
     static void updateAvatarState();
     static void applyMomentumBoost(int amount);
     static void decayMomentum();
+
+    // === Situational Awareness State ===
+    static void updateSituationalAwareness(uint32_t now);
+    static bool pickTimePhraseIfDue(uint32_t now);
+    static bool pickHeapPhraseIfDue(uint32_t now);
+    static bool pickDensityPhraseIfDue(uint32_t now);
+    static bool pickChallengePhraseIfDue(uint32_t now);
+    static bool pickGPSPhraseIfDue(uint32_t now);
+    static bool pickFatiguePhraseIfDue(uint32_t now);
+    static bool pickEncryptionPhraseIfDue(uint32_t now);
+    static bool pickBuffPhraseIfDue(uint32_t now);
+    static bool pickChargingPhraseIfDue(uint32_t now);
 };

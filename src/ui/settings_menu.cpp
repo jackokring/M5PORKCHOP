@@ -4,6 +4,7 @@
 #include "settings_menu.h"
 #include "display.h"
 #include "../core/config.h"
+#include "../core/xp.h"
 #include "../core/sd_layout.h"
 #include "../core/sdlog.h"
 #include "../gps/gps.h"
@@ -38,10 +39,18 @@ enum SettingId : uint8_t {
     SET_WIGLE_TOKEN_STATUS,
     SET_WIGLE_LOAD,
     SET_CH_HOP,
+    SET_SPEC_SWEEP,
+    SET_SPEC_TILT,
     SET_LOCK_TIME,
     SET_DEAUTH,
     SET_RND_MAC,
+    SET_ATK_RSSI,
+    SET_SPEC_RSSI,
+    SET_SPEC_TOP,
+    SET_SPEC_STALE,
+    SET_SPEC_COLLAPSE,
     SET_GPS_ENABLED,
+    SET_GPS_SOURCE,
     SET_GPS_PWRSAVE,
     SET_GPS_SCAN_INTV,
     SET_GPS_BAUD,
@@ -50,7 +59,8 @@ enum SettingId : uint8_t {
     SET_GPS_TZ,
     SET_BLE_BURST,
     SET_BLE_ADV,
-    SET_SD_LOG
+    SET_SD_LOG,
+    SET_CALLSIGN
 };
 
 struct RootEntry {
@@ -79,7 +89,8 @@ static const EntryData kDirectEntries[] = {
     {SET_DIM_AFTER, "DIM AFTER", SettingType::VALUE, 0, 300, 10, "S", "0 = NEVER DIM"},
     {SET_DIM_LEVEL, "DIM LEVEL", SettingType::VALUE, 0, 50, 5, "%", "0 = SCREEN OFF"},
     {SET_G0_ACTION, "G0 ACTION", SettingType::VALUE, 0, (int)G0_ACTION_COUNT - 1, 1, "", "G0 HOTKEY"},
-    {SET_BOOT_MODE, "BOOT MODE", SettingType::VALUE, 0, (int)BOOT_MODE_COUNT - 1, 1, "", "AUTO MODE ON BOOT"}
+    {SET_BOOT_MODE, "BOOT MODE", SettingType::VALUE, 0, (int)BOOT_MODE_COUNT - 1, 1, "", "AUTO MODE ON BOOT"},
+    {SET_CALLSIGN, "C4LLS1GN", SettingType::TEXT, 0, 0, 0, "", "YOUR HANDLE"}
 };
 
 static const RootEntry kRootEntries[] = {
@@ -90,6 +101,7 @@ static const RootEntry kRootEntries[] = {
     {"DIM LEVEL", "0 = SCREEN OFF", false, GROUP_NONE, SET_DIM_LEVEL},
     {"G0 ACTION", "G0 HOTKEY", false, GROUP_NONE, SET_G0_ACTION},
     {"BOOT MODE", "AUTO MODE ON BOOT", false, GROUP_NONE, SET_BOOT_MODE},
+    {"C4LLS1GN", "YOUR HANDLE", false, GROUP_NONE, SET_CALLSIGN},
     {"NETWORK", "WIFI CREDENTIALS", true, GROUP_NET, SET_THEME},
     {"INTEGRATION", "API KEYS", true, GROUP_INTEG, SET_THEME},
     {"RADIO", "WIFI SCAN/ATTACK TIMING", true, GROUP_RADIO, SET_THEME},
@@ -110,14 +122,22 @@ static const EntryData kIntegEntries[] = {
 };
 
 static const EntryData kRadioEntries[] = {
-    {SET_CH_HOP, "STREET SW33P", SettingType::VALUE, 100, 2000, 100, "MS", "HOW FAST YOU SWEEP THE BAND"},
+    {SET_CH_HOP, "STREET SW33P", SettingType::VALUE, 50, 2000, 50, "MS", "HOP SPEED"},
+    {SET_SPEC_SWEEP, "SWEEP SPD", SettingType::VALUE, 50, 2000, 50, "MS", "SPECTRUM SWEEP"},
+    {SET_SPEC_TILT, "TILT TUNE", SettingType::TOGGLE, 0, 1, 1, "", "TILT TO TUNE"},
     {SET_LOCK_TIME, "GL4SS ST4R3", SettingType::VALUE, 1000, 10000, 500, "MS", "HOW LONG YOU HOLD A TARGET"},
     {SET_DEAUTH, "DEAUTH", SettingType::TOGGLE, 0, 1, 1, "", "KICK CLIENTS OFF APS"},
-    {SET_RND_MAC, "RND MAC", SettingType::TOGGLE, 0, 1, 1, "", "NEW MAC EACH MODE START"}
+    {SET_RND_MAC, "RND MAC", SettingType::TOGGLE, 0, 1, 1, "", "NEW MAC EACH MODE START"},
+    {SET_ATK_RSSI, "ATK RSSI", SettingType::VALUE, -90, -50, 5, "DB", "SKIP WEAK NETS IN OINK/DNH"},
+    {SET_SPEC_RSSI, "RSSI CUT", SettingType::VALUE, -95, -30, 5, "DB", "HIDE WEAK APS"},
+    {SET_SPEC_TOP, "TOP APS", SettingType::VALUE, 0, 100, 5, "AP", "0 = NO CAP"},
+    {SET_SPEC_STALE, "STALE SEC", SettingType::VALUE, 1, 20, 1, "S", "DROP QUIET APS"},
+    {SET_SPEC_COLLAPSE, "SSID MERG", SettingType::TOGGLE, 0, 1, 1, "", "MERGE SAME SSID"}
 };
 
 static const EntryData kGpsEntries[] = {
     {SET_GPS_ENABLED, "GPS", SettingType::TOGGLE, 0, 1, 1, "", "POSITION TRACKING"},
+    {SET_GPS_SOURCE, "GPS SRC", SettingType::VALUE, 0, (int)GPS_SOURCE_COUNT - 1, 1, "", "GROVE / LORACAP / CUSTOM"},
     {SET_GPS_PWRSAVE, "PWR SAVE", SettingType::TOGGLE, 0, 1, 1, "", "SLEEP WHEN NOT HUNTING"},
     {SET_GPS_SCAN_INTV, "SCAN INTV", SettingType::VALUE, 1, 30, 1, "S", "WARHOG SCAN FREQUENCY"},
     {SET_GPS_BAUD, "GPS BAUD", SettingType::VALUE, 0, 3, 1, "", "MATCH YOUR GPS MODULE"},
@@ -155,6 +175,12 @@ static const char* const kBootModeLabels[BOOT_MODE_COUNT] = {
 
 static const uint32_t kGpsBaudRates[] = {9600, 38400, 57600, 115200};
 
+static const char* const kGpsSourceLabels[GPS_SOURCE_COUNT] = {
+    "GROVE",
+    "LORACAP",
+    "CUSTOM"
+};
+
 static int clampValue(int value, int minVal, int maxVal) {
     if (value < minVal) return minVal;
     if (value > maxVal) return maxVal;
@@ -162,13 +188,14 @@ static int clampValue(int value, int minVal, int maxVal) {
 }
 
 static bool isTextEditable(SettingId id) {
+    if (id == SET_CALLSIGN) return XP::hasUnlockable(2);
     return id == SET_WIFI_SSID || id == SET_WIFI_PASS;
 }
 
 static bool isPersonalitySetting(SettingId id) {
     return id == SET_THEME || id == SET_BRIGHTNESS || id == SET_SOUND ||
            id == SET_DIM_AFTER || id == SET_DIM_LEVEL || id == SET_G0_ACTION ||
-           id == SET_BOOT_MODE;
+           id == SET_BOOT_MODE || id == SET_CALLSIGN;
 }
 
 static bool isConfigSetting(SettingId id) {
@@ -176,10 +203,18 @@ static bool isConfigSetting(SettingId id) {
         case SET_WIFI_SSID:
         case SET_WIFI_PASS:
         case SET_CH_HOP:
+        case SET_SPEC_SWEEP:
+        case SET_SPEC_TILT:
         case SET_LOCK_TIME:
         case SET_DEAUTH:
         case SET_RND_MAC:
+        case SET_ATK_RSSI:
+        case SET_SPEC_RSSI:
+        case SET_SPEC_TOP:
+        case SET_SPEC_STALE:
+        case SET_SPEC_COLLAPSE:
         case SET_GPS_ENABLED:
+        case SET_GPS_SOURCE:
         case SET_GPS_PWRSAVE:
         case SET_GPS_SCAN_INTV:
         case SET_GPS_BAUD:
@@ -364,6 +399,14 @@ static void getSettingTextBuf(SettingId id, char* out, size_t len) {
         case SET_WIGLE_TOKEN_STATUS:
             formatWigleTokenStatus(out, len);
             return;
+        case SET_CALLSIGN:
+            if (!XP::hasUnlockable(2)) {
+                strncpy(out, "[LOCKED]", len - 1);
+            } else {
+                strncpy(out, Config::personality().callsign, len - 1);
+            }
+            out[len - 1] = '\0';
+            return;
         default:
             out[0] = '\0';
             return;
@@ -382,6 +425,8 @@ static size_t getTextLimit(SettingId id) {
             return sizeof(Config::wifi().wigleApiName) - 1;
         case SET_WIGLE_TOKEN_STATUS:
             return sizeof(Config::wifi().wigleApiToken) - 1;
+        case SET_CALLSIGN:
+            return sizeof(Config::personality().callsign) - 1;
         default:
             return 32;
     }
@@ -431,6 +476,13 @@ static const char* getBootModeLabel(int idx) {
     return kBootModeLabels[idx];
 }
 
+static const char* getGpsSourceLabel(int idx) {
+    if (idx < 0 || idx >= (int)GPS_SOURCE_COUNT) {
+        return kGpsSourceLabels[0];
+    }
+    return kGpsSourceLabels[idx];
+}
+
 static int getSettingValue(SettingId id) {
     switch (id) {
         case SET_THEME:
@@ -449,14 +501,30 @@ static int getSettingValue(SettingId id) {
             return static_cast<int>(Config::personality().bootMode);
         case SET_CH_HOP:
             return Config::wifi().channelHopInterval;
+        case SET_SPEC_SWEEP:
+            return Config::wifi().spectrumHopInterval;
+        case SET_SPEC_TILT:
+            return Config::wifi().spectrumTiltEnabled ? 1 : 0;
         case SET_LOCK_TIME:
             return Config::wifi().lockTime;
         case SET_DEAUTH:
             return Config::wifi().enableDeauth ? 1 : 0;
         case SET_RND_MAC:
             return Config::wifi().randomizeMAC ? 1 : 0;
+        case SET_ATK_RSSI:
+            return Config::wifi().attackMinRssi;
+        case SET_SPEC_RSSI:
+            return Config::wifi().spectrumMinRssi;
+        case SET_SPEC_TOP:
+            return Config::wifi().spectrumTopN;
+        case SET_SPEC_STALE:
+            return (int)(Config::wifi().spectrumStaleMs / 1000);
+        case SET_SPEC_COLLAPSE:
+            return Config::wifi().spectrumCollapseSsid ? 1 : 0;
         case SET_GPS_ENABLED:
             return Config::gps().enabled ? 1 : 0;
+        case SET_GPS_SOURCE:
+            return static_cast<int>(Config::gps().source);
         case SET_GPS_PWRSAVE:
             return Config::gps().powerSave ? 1 : 0;
         case SET_GPS_SCAN_INTV:
@@ -540,6 +608,18 @@ static bool setSettingValue(SettingId id, int value) {
             Config::wifi().channelHopInterval = newVal;
             return true;
         }
+        case SET_SPEC_SWEEP: {
+            uint16_t newVal = static_cast<uint16_t>(value);
+            if (Config::wifi().spectrumHopInterval == newVal) return false;
+            Config::wifi().spectrumHopInterval = newVal;
+            return true;
+        }
+        case SET_SPEC_TILT: {
+            bool enabled = value != 0;
+            if (Config::wifi().spectrumTiltEnabled == enabled) return false;
+            Config::wifi().spectrumTiltEnabled = enabled;
+            return true;
+        }
         case SET_LOCK_TIME: {
             uint16_t newVal = static_cast<uint16_t>(value);
             if (Config::wifi().lockTime == newVal) return false;
@@ -558,10 +638,69 @@ static bool setSettingValue(SettingId id, int value) {
             Config::wifi().randomizeMAC = enabled;
             return true;
         }
+        case SET_ATK_RSSI: {
+            int newVal = value;
+            if (newVal < -90) newVal = -90;
+            if (newVal > -50) newVal = -50;
+            int8_t rssi = static_cast<int8_t>(newVal);
+            if (Config::wifi().attackMinRssi == rssi) return false;
+            Config::wifi().attackMinRssi = rssi;
+            return true;
+        }
+        case SET_SPEC_RSSI: {
+            int newVal = value;
+            if (newVal < -95) newVal = -95;
+            if (newVal > -30) newVal = -30;
+            int8_t rssi = static_cast<int8_t>(newVal);
+            if (Config::wifi().spectrumMinRssi == rssi) return false;
+            Config::wifi().spectrumMinRssi = rssi;
+            return true;
+        }
+        case SET_SPEC_TOP: {
+            int newVal = value;
+            if (newVal < 0) newVal = 0;
+            if (newVal > 100) newVal = 100;
+            uint8_t topN = static_cast<uint8_t>(newVal);
+            if (Config::wifi().spectrumTopN == topN) return false;
+            Config::wifi().spectrumTopN = topN;
+            return true;
+        }
+        case SET_SPEC_STALE: {
+            int newVal = value;
+            if (newVal < 1) newVal = 1;
+            if (newVal > 20) newVal = 20;
+            uint16_t staleMs = static_cast<uint16_t>(newVal * 1000);
+            if (Config::wifi().spectrumStaleMs == staleMs) return false;
+            Config::wifi().spectrumStaleMs = staleMs;
+            return true;
+        }
+        case SET_SPEC_COLLAPSE: {
+            bool enabled = value != 0;
+            if (Config::wifi().spectrumCollapseSsid == enabled) return false;
+            Config::wifi().spectrumCollapseSsid = enabled;
+            return true;
+        }
         case SET_GPS_ENABLED: {
             bool enabled = value != 0;
             if (Config::gps().enabled == enabled) return false;
             Config::gps().enabled = enabled;
+            return true;
+        }
+        case SET_GPS_SOURCE: {
+            uint8_t newVal = static_cast<uint8_t>(value);
+            if (newVal >= GPS_SOURCE_COUNT) newVal = 0;
+            GPSSource newSource = static_cast<GPSSource>(newVal);
+            if (Config::gps().source == newSource) return false;
+            Config::gps().source = newSource;
+            // Auto-set pins based on source selection
+            if (newSource == GPSSource::GROVE) {
+                Config::gps().rxPin = 1;
+                Config::gps().txPin = 2;
+            } else if (newSource == GPSSource::CAP_LORA) {
+                Config::gps().rxPin = CapLoraPins::GPS_RX;
+                Config::gps().txPin = CapLoraPins::GPS_TX;
+            }
+            // CUSTOM: leave pins as-is
             return true;
         }
         case SET_GPS_PWRSAVE: {
@@ -625,42 +764,41 @@ static bool setSettingValue(SettingId id, int value) {
     }
 }
 
-static bool setSettingText(SettingId id, const String& value) {
+static bool setSettingText(SettingId id, const char* value) {
     switch (id) {
         case SET_WIFI_SSID:
-            if (strcmp(Config::wifi().otaSSID, value.c_str()) == 0) return false;
-            strncpy(Config::wifi().otaSSID, value.c_str(), sizeof(Config::wifi().otaSSID) - 1);
+            if (strcmp(Config::wifi().otaSSID, value) == 0) return false;
+            strncpy(Config::wifi().otaSSID, value, sizeof(Config::wifi().otaSSID) - 1);
             Config::wifi().otaSSID[sizeof(Config::wifi().otaSSID) - 1] = '\0';
             return true;
         case SET_WIFI_PASS:
-            if (strcmp(Config::wifi().otaPassword, value.c_str()) == 0) return false;
-            strncpy(Config::wifi().otaPassword, value.c_str(), sizeof(Config::wifi().otaPassword) - 1);
+            if (strcmp(Config::wifi().otaPassword, value) == 0) return false;
+            strncpy(Config::wifi().otaPassword, value, sizeof(Config::wifi().otaPassword) - 1);
             Config::wifi().otaPassword[sizeof(Config::wifi().otaPassword) - 1] = '\0';
             return true;
         case SET_WPASEC_STATUS:
-            if (strcmp(Config::wifi().wpaSecKey, value.c_str()) == 0) return false;
-            strncpy(Config::wifi().wpaSecKey, value.c_str(), sizeof(Config::wifi().wpaSecKey) - 1);
+            if (strcmp(Config::wifi().wpaSecKey, value) == 0) return false;
+            strncpy(Config::wifi().wpaSecKey, value, sizeof(Config::wifi().wpaSecKey) - 1);
             Config::wifi().wpaSecKey[sizeof(Config::wifi().wpaSecKey) - 1] = '\0';
             return true;
         case SET_WIGLE_NAME_STATUS:
-            if (strcmp(Config::wifi().wigleApiName, value.c_str()) == 0) return false;
-            strncpy(Config::wifi().wigleApiName, value.c_str(), sizeof(Config::wifi().wigleApiName) - 1);
+            if (strcmp(Config::wifi().wigleApiName, value) == 0) return false;
+            strncpy(Config::wifi().wigleApiName, value, sizeof(Config::wifi().wigleApiName) - 1);
             Config::wifi().wigleApiName[sizeof(Config::wifi().wigleApiName) - 1] = '\0';
             return true;
         case SET_WIGLE_TOKEN_STATUS:
-            if (strcmp(Config::wifi().wigleApiToken, value.c_str()) == 0) return false;
-            strncpy(Config::wifi().wigleApiToken, value.c_str(), sizeof(Config::wifi().wigleApiToken) - 1);
+            if (strcmp(Config::wifi().wigleApiToken, value) == 0) return false;
+            strncpy(Config::wifi().wigleApiToken, value, sizeof(Config::wifi().wigleApiToken) - 1);
             Config::wifi().wigleApiToken[sizeof(Config::wifi().wigleApiToken) - 1] = '\0';
+            return true;
+        case SET_CALLSIGN:
+            if (strcmp(Config::personality().callsign, value) == 0) return false;
+            strncpy(Config::personality().callsign, value, sizeof(Config::personality().callsign) - 1);
+            Config::personality().callsign[sizeof(Config::personality().callsign) - 1] = '\0';
             return true;
         default:
             return false;
     }
-}
-
-static String getSettingText(SettingId id) {
-    char buf[80];
-    getSettingTextBuf(id, buf, sizeof(buf));
-    return String(buf);
 }
 }  // namespace
 bool SettingsMenu::active = false;
@@ -668,7 +806,8 @@ bool SettingsMenu::exitRequested = false;
 bool SettingsMenu::keyWasPressed = false;
 bool SettingsMenu::editing = false;
 bool SettingsMenu::textEditing = false;
-String SettingsMenu::textBuffer = "";
+char SettingsMenu::textBuffer[80] = "";
+uint8_t SettingsMenu::textLen = 0;
 uint8_t SettingsMenu::rootIndex = 0;
 uint8_t SettingsMenu::rootScroll = 0;
 uint8_t SettingsMenu::groupIndex = 0;
@@ -681,6 +820,7 @@ bool SettingsMenu::dirtyPersonality = false;
 uint8_t SettingsMenu::origGpsRxPin = 0;
 uint8_t SettingsMenu::origGpsTxPin = 0;
 uint32_t SettingsMenu::origGpsBaud = 0;
+uint8_t SettingsMenu::origGpsSource = 0;
 
 void SettingsMenu::init() {
     active = false;
@@ -693,7 +833,7 @@ void SettingsMenu::show() {
     keyWasPressed = true;
     editing = false;
     textEditing = false;
-    textBuffer = "";
+    textBuffer[0] = '\0'; textLen = 0;
     rootIndex = 0;
     rootScroll = 0;
     groupIndex = 0;
@@ -707,6 +847,7 @@ void SettingsMenu::show() {
     origGpsRxPin = Config::gps().rxPin;
     origGpsTxPin = Config::gps().txPin;
     origGpsBaud = Config::gps().baudRate;
+    origGpsSource = static_cast<uint8_t>(Config::gps().source);
 }
 
 void SettingsMenu::hide() {
@@ -741,15 +882,26 @@ void SettingsMenu::saveIfDirty(bool showToast) {
     }
 
     if (dirtyConfig) {
+        uint8_t curSource = static_cast<uint8_t>(Config::gps().source);
         bool gpsChanged = (Config::gps().rxPin != origGpsRxPin) ||
                           (Config::gps().txPin != origGpsTxPin) ||
-                          (Config::gps().baudRate != origGpsBaud);
+                          (Config::gps().baudRate != origGpsBaud) ||
+                          (curSource != origGpsSource);
         if (gpsChanged) {
             origGpsRxPin = Config::gps().rxPin;
             origGpsTxPin = Config::gps().txPin;
             origGpsBaud = Config::gps().baudRate;
+            origGpsSource = curSource;
             if (Config::gps().enabled) {
+                // Prepare CapLoRa hardware before GPS UART init
+                if (Config::gps().source == GPSSource::CAP_LORA) {
+                    Config::prepareCapLoraGpio();
+                }
                 GPS::reinit(origGpsRxPin, origGpsTxPin, origGpsBaud);
+                // Re-verify SD after CapLoRa GPS UART init
+                if (Config::gps().source == GPSSource::CAP_LORA) {
+                    Config::reinitSD();
+                }
                 if (showToast) {
                     Display::notify(NoticeKind::STATUS, "GPS REINIT");
                 }
@@ -892,6 +1044,14 @@ void SettingsMenu::handleInput() {
                     }
                 } else if (direct->type == SettingType::VALUE) {
                     editing = !editing;
+                } else if (direct->type == SettingType::TEXT) {
+                    if (isTextEditable(direct->id)) {
+                        textEditing = true;
+                        getSettingTextBuf(direct->id, textBuffer, sizeof(textBuffer));
+                        textLen = strlen(textBuffer);
+                        textEditId = direct->id;
+                        keyWasPressed = true;
+                    }
                 }
             }
         } else {
@@ -940,7 +1100,8 @@ void SettingsMenu::handleInput() {
                 case SettingType::TEXT:
                     if (isTextEditable(entry.id)) {
                         textEditing = true;
-                        textBuffer = getSettingText(entry.id);
+                        getSettingTextBuf(entry.id, textBuffer, sizeof(textBuffer));
+                        textLen = strlen(textBuffer);
                         textEditId = entry.id;
                         keyWasPressed = true;
                     }
@@ -984,18 +1145,20 @@ void SettingsMenu::handleTextInput() {
     lastInputMs = millis();
 
     if (keys.enter) {
-        bool changed = setSettingText(static_cast<SettingId>(textEditId), textBuffer);
+        SettingId sid = static_cast<SettingId>(textEditId);
+        bool changed = setSettingText(sid, textBuffer);
         if (changed) {
-            dirtyConfig = true;
+            if (isPersonalitySetting(sid)) dirtyPersonality = true;
+            else dirtyConfig = true;
         }
         textEditing = false;
-        textBuffer = "";
+        textBuffer[0] = '\0'; textLen = 0;
         return;
     }
 
     if (keys.del) {
-        if (textBuffer.length() > 0) {
-            textBuffer.remove(textBuffer.length() - 1);
+        if (textLen > 0) {
+            textBuffer[--textLen] = '\0';
         }
         return;
     }
@@ -1003,16 +1166,17 @@ void SettingsMenu::handleTextInput() {
     for (char c : keys.word) {
         if (c == '`') {
             textEditing = false;
-            textBuffer = "";
+            textBuffer[0] = '\0'; textLen = 0;
             return;
         }
     }
 
     const size_t limit = getTextLimit(static_cast<SettingId>(textEditId));
-    if (textBuffer.length() < limit) {
+    if (textLen < limit) {
         for (char c : keys.word) {
-            if (c >= 32 && c <= 126 && c != '`' && textBuffer.length() < limit) {
-                textBuffer += c;
+            if (c >= 32 && c <= 126 && c != '`' && textLen < limit) {
+                textBuffer[textLen++] = c;
+                textBuffer[textLen] = '\0';
             }
         }
     }
@@ -1067,6 +1231,38 @@ void SettingsMenu::draw(M5Canvas& canvas) {
             } else {
                 const EntryData* direct = findDirectEntry(entry.direct);
                 if (direct) {
+                    if (direct->type == SettingType::TEXT) {
+                        if (selected && textEditing && direct->id == static_cast<SettingId>(textEditId)) {
+                            char displayBuf[12];
+                            const char* textSrc = textBuffer;
+                            if (textLen > 5) {
+                                if (textLen >= 2) {
+                                    snprintf(displayBuf, sizeof(displayBuf), "...%c%c",
+                                             textSrc[textLen - 2], textSrc[textLen - 1]);
+                                } else {
+                                    strncpy(displayBuf, "...", sizeof(displayBuf) - 1);
+                                    displayBuf[sizeof(displayBuf) - 1] = '\0';
+                                }
+                            } else {
+                                strncpy(displayBuf, textSrc, sizeof(displayBuf) - 1);
+                                displayBuf[sizeof(displayBuf) - 1] = '\0';
+                            }
+                            snprintf(valBuf, sizeof(valBuf), "[%s_]", displayBuf);
+                        } else {
+                            char valueBuf[32];
+                            getSettingTextBuf(direct->id, valueBuf, sizeof(valueBuf));
+                            if (valueBuf[0] == '\0') {
+                                strncpy(valBuf, "<empty>", sizeof(valBuf) - 1);
+                            } else if (strlen(valueBuf) > 8) {
+                                char shortBuf[16];
+                                formatTruncated(valueBuf, shortBuf, sizeof(shortBuf), 8, "...");
+                                strncpy(valBuf, shortBuf, sizeof(valBuf) - 1);
+                            } else {
+                                strncpy(valBuf, valueBuf, sizeof(valBuf) - 1);
+                            }
+                            valBuf[sizeof(valBuf) - 1] = '\0';
+                        }
+                    } else {
                     int value = getSettingValue(direct->id);
                     if (direct->type == SettingType::TOGGLE) {
                         strncpy(valBuf, value ? "ON" : "OFF", sizeof(valBuf) - 1);
@@ -1101,6 +1297,7 @@ void SettingsMenu::draw(M5Canvas& canvas) {
                         snprintf(valBuf, sizeof(valBuf), "[%d%s]", value, direct->suffix);
                     } else {
                         snprintf(valBuf, sizeof(valBuf), "%d%s", value, direct->suffix);
+                    }
                     }
                 }
             }
@@ -1157,8 +1354,7 @@ void SettingsMenu::draw(M5Canvas& canvas) {
         } else if (entry.type == SettingType::TEXT) {
             if (selected && textEditing && entry.id == static_cast<SettingId>(textEditId)) {
                 char displayBuf[12];
-                const char* textSrc = textBuffer.c_str();
-                size_t textLen = textBuffer.length();
+                const char* textSrc = textBuffer;
                 if (textLen > 5) {
                     if (textLen >= 2) {
                         snprintf(displayBuf, sizeof(displayBuf), "...%c%c",
@@ -1204,6 +1400,14 @@ void SettingsMenu::draw(M5Canvas& canvas) {
                     snprintf(valBuf, sizeof(valBuf), "[%s]", baudBuf);
                 } else {
                     strncpy(valBuf, baudBuf, sizeof(valBuf) - 1);
+                    valBuf[sizeof(valBuf) - 1] = '\0';
+                }
+            } else if (entry.id == SET_GPS_SOURCE) {
+                const char* srcLabel = getGpsSourceLabel(value);
+                if (selected && editing) {
+                    snprintf(valBuf, sizeof(valBuf), "[%s]", srcLabel);
+                } else {
+                    strncpy(valBuf, srcLabel, sizeof(valBuf) - 1);
                     valBuf[sizeof(valBuf) - 1] = '\0';
                 }
             } else if (selected && editing) {

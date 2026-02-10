@@ -134,7 +134,7 @@ void StressTest::injectNetwork() {
     
     // Inject into whichever mode is running
     if (SpectrumMode::isRunning()) {
-        SpectrumMode::onBeacon(bssid, channel, rssi, ssid, auth, hasPMF, false);
+        SpectrumMode::onBeacon(bssid, channel, true, rssi, ssid, auth, hasPMF, false);
     }
     if (OinkMode::isRunning() && OinkMode::getNetworkCount() < STRESS_MAX_OINK_NETWORKS) {
         OinkMode::injectTestNetwork(bssid, ssid, channel, rssi, auth, hasPMF);
@@ -187,7 +187,7 @@ void StressTest::injectHidden() {
     const char* ssid = reveal ? "REVEALED_HIDDEN" : "";
     
     if (SpectrumMode::isRunning()) {
-        SpectrumMode::onBeacon(bssid, channel, rssi, ssid, WIFI_AUTH_WPA2_PSK, false, reveal);
+        SpectrumMode::onBeacon(bssid, channel, true, rssi, ssid, WIFI_AUTH_WPA2_PSK, false, reveal);
     }
     if (OinkMode::isRunning() && OinkMode::getNetworkCount() < STRESS_MAX_OINK_NETWORKS) {
         OinkMode::injectTestNetwork(bssid, ssid, channel, rssi, WIFI_AUTH_WPA2_PSK, false);
@@ -216,7 +216,7 @@ void StressTest::updateRSSIChaos() {
     int8_t rssi = randomRSSI();
     
     if (SpectrumMode::isRunning()) {
-        SpectrumMode::onBeacon(bssid, 6, rssi, "RSSI_TEST", WIFI_AUTH_WPA2_PSK, false, false);
+        SpectrumMode::onBeacon(bssid, 6, true, rssi, "RSSI_TEST", WIFI_AUTH_WPA2_PSK, false, false);
     }
     if (OinkMode::isRunning() && OinkMode::getNetworkCount() < STRESS_MAX_OINK_NETWORKS) {
         OinkMode::injectTestNetwork(bssid, "RSSI_TEST", 6, rssi, WIFI_AUTH_WPA2_PSK, false);

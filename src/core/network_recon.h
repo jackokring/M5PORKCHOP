@@ -7,9 +7,6 @@
 #include <esp_wifi.h>
 #include <vector>
 
-// Maximum clients to track per network (shared with modes)
-#define MAX_CLIENTS_PER_NETWORK 20
-
 // Maximum networks to track
 #define MAX_RECON_NETWORKS 200
 
@@ -48,6 +45,13 @@ void start();
  * Used when entering BLE modes (PIGGYBLUES) that need WiFi OFF
  */
 void stop();
+
+/**
+ * @brief Release the networks vector memory entirely
+ * Call after stop() when entering modes that don't use recon data (FILE_TRANSFER).
+ * start() will re-reserve and rescan on mode exit.
+ */
+void freeNetworks();
 
 /**
  * @brief Pause promiscuous mode but keep WiFi STA active
@@ -91,11 +95,34 @@ bool isHeapStable();
  * @brief Get current scanning channel
  */
 uint8_t getCurrentChannel();
+uint32_t getHopIntervalMs();
+
+/**
+ * @brief Override channel hop interval (0 = clear override)
+ */
+void setHopIntervalOverride(uint32_t intervalMs);
+void clearHopIntervalOverride();
 
 /**
  * @brief Get packet count since start
  */
 uint32_t getPacketCount();
+
+// ============================================================================
+// Quality + Client Estimates
+// ============================================================================
+
+/**
+ * @brief Approximate unique client count for a network
+ * Uses a small bitset updated from data frames (lower-bound estimate).
+ */
+uint8_t estimateClientCount(const DetectedNetwork& net);
+
+/**
+ * @brief Compute a 0-100 quality score for a network
+ * Combines RSSI (smoothed), recency, activity, and beacon stability.
+ */
+uint8_t getQualityScore(const DetectedNetwork& net);
 
 // ============================================================================
 // Shared Network Data Access

@@ -11,11 +11,30 @@
 #include <vector>
 #include <atomic>
 #include "../core/wifi_utils.h"
+#include "../core/heap_gates.h"
 #include "../core/heap_policy.h"
 #include "../core/xp.h"
 #include "../ui/swine_stats.h"
 #include "../core/sd_layout.h"
+#include "../core/config.h"
 #include "wigle.h"
+
+#ifndef PORKCHOP_LOG_ENABLED
+#define PORKCHOP_LOG_ENABLED 1
+#endif
+#ifndef FILESERVER_LOG_ENABLED
+#define FILESERVER_LOG_ENABLED PORKCHOP_LOG_ENABLED
+#endif
+
+#if FILESERVER_LOG_ENABLED
+#define FS_LOGF(...) Serial.printf(__VA_ARGS__)
+#define FS_LOGLN(msg) Serial.println(msg)
+#define FS_LOG(msg) Serial.print(msg)
+#else
+#define FS_LOGF(...) do {} while (0)
+#define FS_LOGLN(...) do {} while (0)
+#define FS_LOG(msg) do {} while (0)
+#endif
 
 // Static members
 WebServer* FileServer::server = nullptr;
@@ -59,8 +78,9 @@ static bool xpWpaLoaded = false;
 static bool xpWigleLoaded = false;
 static bool xpWpaCacheComplete = false;
 static bool xpWigleCacheComplete = false;
-static std::vector<String> xpAwardedWpa;
-static std::vector<String> xpAwardedWigle;
+struct XpAwardEntry { char key[40]; };  // 12-char BSSID or WiGLE filename (was 80)
+static std::vector<XpAwardEntry> xpAwardedWpa;
+static std::vector<XpAwardEntry> xpAwardedWigle;
 
 static void refreshSdPaths() {
     XP_WPA_AWARDED_FILE = SDLayout::xpAwardedWpaPath();
@@ -74,7 +94,7 @@ static void logWiFiStatus(const char* label) {
     (void)label;
     wifi_mode_t mode = WiFi.getMode();
     wl_status_t status = WiFi.status();
-    Serial.printf("[FILESERVER] %s WiFi mode=%d status=%d\n", label, (int)mode, (int)status);
+    FS_LOGF("[FILESERVER] %s WiFi mode=%d status=%d\n", label, (int)mode, (int)status);
 }
 
 static void logRequest(WebServer* srv, const char* label) {
@@ -89,34 +109,30 @@ static void logRequest(WebServer* srv, const char* label) {
         case HTTP_DELETE: method = "DELETE"; break;
         default: method = "OTHER"; break;  // Avoid String allocation for rare case
     }
-    Serial.printf("[FILESERVER] %s %s\n", method, srv->uri().c_str());
+    FS_LOGF("[FILESERVER] %s %s\n", method, srv->uri().c_str());
 }
 
 static void logHeapStatus(const char* label) {
     // Log current free heap and largest free block for debugging memory usage
     size_t freeHeap = ESP.getFreeHeap();
     size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-    Serial.printf("[FILESERVER] %s heap free=%u largest=%u\n", label ? label : "heap", (unsigned int)freeHeap, (unsigned int)largest);
+    FS_LOGF("[FILESERVER] %s heap free=%u largest=%u\n", label ? label : "heap", (unsigned int)freeHeap, (unsigned int)largest);
 }
 
 static void logHeapStatusIfLow(const char* label) {
-    // If free heap drops below 60k, log details to help trace memory issues
     size_t freeHeap = ESP.getFreeHeap();
-    if (freeHeap < 60000) {
+    if (freeHeap < HeapPolicy::kFileServerLogThreshold) {
         size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-        Serial.printf("[FILESERVER] %s low heap free=%u largest=%u\n", label ? label : "low heap", (unsigned int)freeHeap, (unsigned int)largest);
+        FS_LOGF("[FILESERVER] %s low heap free=%u largest=%u\n", label ? label : "low heap", (unsigned int)freeHeap, (unsigned int)largest);
     }
 }
-
-static const size_t UI_MIN_FREE = 12000;
-static const size_t UI_MIN_LARGEST = 8000;
 
 static bool isUiHeapLow(size_t* outFree, size_t* outLargest) {
     size_t freeHeap = ESP.getFreeHeap();
     size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
     if (outFree) *outFree = freeHeap;
     if (outLargest) *outLargest = largest;
-    return (freeHeap < UI_MIN_FREE) || (largest < UI_MIN_LARGEST);
+    return (freeHeap < HeapPolicy::kFileServerUiMinFree) || (largest < HeapPolicy::kFileServerUiMinLargest);
 }
 
 static size_t sendProgmemResponse(WebServer* srv, int status, const char* contentType, const char* data) {
@@ -195,9 +211,9 @@ static void resetUploadState(bool removePartial) {
     uploadDirBuf[0] = '\0';
 }
 
-static bool listContains(const std::vector<String>& list, const String& value) {
-    for (const auto& entry : list) {
-        if (entry == value) return true;
+static bool listContains(const std::vector<XpAwardEntry>& list, const char* value) {
+    for (size_t i = 0; i < list.size(); i++) {
+        if (strcmp(list[i].key, value) == 0) return true;
     }
     return false;
 }
@@ -269,7 +285,7 @@ static bool isSameOrSubPath(const String& parent, const String& child) {
     return (c.length() > p.length() && c.charAt(p.length()) == '/');
 }
 
-static void loadAwardedList(const char* path, std::vector<String>& out, bool& loaded, bool& complete) {
+static void loadAwardedList(const char* path, std::vector<XpAwardEntry>& out, bool& loaded, bool& complete) {
     if (loaded) return;
     if (!path || !path[0]) {
         out.clear();
@@ -278,19 +294,31 @@ static void loadAwardedList(const char* path, std::vector<String>& out, bool& lo
         return;
     }
     out.clear();
-    out.reserve(XP_AWARD_CACHE_MAX);  // FIX: Pre-allocate to avoid realloc fragmentation
+    // Reserve conservatively — full 512 entries may not fit alongside WebServer
+    size_t freeHeap = ESP.getFreeHeap();
+    size_t reserveCount = (freeHeap > 60000) ? XP_AWARD_CACHE_MAX : 64;
+    try { out.reserve(reserveCount); } catch (...) { /* grow on demand */ }
     complete = true;
     File f = SD.open(path, FILE_READ);
     if (f) {
-        String line;
-        line.reserve(128);  // Pre-allocate to reduce heap fragmentation
+        char lineBuf[128];
         while (f.available()) {
-            yield();  // FIX: Prevent WDT on large files
-            line = f.readStringUntil('\n');  // Reuses existing capacity
-            line.trim();
-            if (line.length()) {
+            yield();
+            size_t len = f.readBytesUntil('\n', lineBuf, sizeof(lineBuf) - 1);
+            lineBuf[len] = '\0';
+            while (len > 0 && (lineBuf[len - 1] == '\r' || lineBuf[len - 1] == ' ')) {
+                lineBuf[--len] = '\0';
+            }
+            if (len > 0) {
                 if (out.size() < XP_AWARD_CACHE_MAX) {
-                    out.push_back(line);
+                    // For WiGLE entries (full paths), store only the filename
+                    const char* stored = lineBuf;
+                    const char* slash = strrchr(lineBuf, '/');
+                    if (slash && *(slash + 1)) stored = slash + 1;
+                    XpAwardEntry entry;
+                    strncpy(entry.key, stored, sizeof(entry.key) - 1);
+                    entry.key[sizeof(entry.key) - 1] = '\0';
+                    try { out.push_back(entry); } catch (...) { complete = false; break; }
                 } else {
                     complete = false;
                     break;
@@ -302,30 +330,41 @@ static void loadAwardedList(const char* path, std::vector<String>& out, bool& lo
     loaded = true;
 }
 
-static bool appendAwarded(const char* path, std::vector<String>& out, const String& value) {
+static bool appendAwarded(const char* path, std::vector<XpAwardEntry>& out, const char* value) {
     if (!path || !path[0]) return false;
     if (listContains(out, value)) return false;
-    if (out.size() >= XP_AWARD_CACHE_MAX) return false;  // FIX: Cap vector size
+    if (out.size() >= XP_AWARD_CACHE_MAX) return false;
     File f = SD.open(path, FILE_APPEND);
     if (!f) return false;
     f.println(value);
     f.close();
-    out.push_back(value);
+    XpAwardEntry entry;
+    strncpy(entry.key, value, sizeof(entry.key) - 1);
+    entry.key[sizeof(entry.key) - 1] = '\0';
+    try { out.push_back(entry); } catch (...) { /* file written, cache just won't track it */ }
     return true;
 }
 
-static bool fileHasLine(const char* path, const String& value) {
+static bool fileHasLine(const char* path, const char* value) {
     if (!path || !path[0]) return false;
     File f = SD.open(path, FILE_READ);
     if (!f) return false;
-    String line;
-    line.reserve(128);  // Pre-allocate to reduce heap fragmentation
+    char lineBuf[128];
     while (f.available()) {
-        yield();  // FIX: Prevent WDT on large files
-        line = f.readStringUntil('\n');  // Reuses existing capacity
-        line.trim();
-        if (!line.length()) continue;
-        if (line == value) {
+        yield();
+        size_t len = f.readBytesUntil('\n', lineBuf, sizeof(lineBuf) - 1);
+        lineBuf[len] = '\0';
+        while (len > 0 && (lineBuf[len - 1] == '\r' || lineBuf[len - 1] == ' ')) {
+            lineBuf[--len] = '\0';
+        }
+        if (len == 0) continue;
+        // Compare directly, and also compare basename for backward compat with old full-path entries
+        if (strcmp(lineBuf, value) == 0) {
+            f.close();
+            return true;
+        }
+        const char* slash = strrchr(lineBuf, '/');
+        if (slash && *(slash + 1) && strcmp(slash + 1, value) == 0) {
             f.close();
             return true;
         }
@@ -335,8 +374,8 @@ static bool fileHasLine(const char* path, const String& value) {
 }
 
 static bool isAwarded(const char* path,
-                      const String& value,
-                      std::vector<String>& cache,
+                      const char* value,
+                      std::vector<XpAwardEntry>& cache,
                       bool& loaded,
                       bool& complete) {
     loadAwardedList(path, cache, loaded, complete);
@@ -346,17 +385,16 @@ static bool isAwarded(const char* path,
     return fileHasLine(path, value);
 }
 
-static String normalizeHexToken(const String& input, size_t maxLen) {
-    String out;
-    out.reserve(maxLen);
-    for (size_t i = 0; i < input.length(); i++) {
+static size_t normalizeHexToken(const char* input, char* out, size_t outLen, size_t maxHex) {
+    size_t j = 0;
+    for (size_t i = 0; input[i] && j < maxHex && j < outLen - 1; i++) {
         const char c = input[i];
         if (isxdigit(static_cast<unsigned char>(c))) {
-            out += (char)toupper(static_cast<unsigned char>(c));
-            if (out.length() >= maxLen) break;
+            out[j++] = (char)toupper(static_cast<unsigned char>(c));
         }
     }
-    return out;
+    out[j] = '\0';
+    return j;
 }
 
 // FIX: Accept const char* directly to avoid implicit String construction from char[]
@@ -394,7 +432,23 @@ static bool pcapLooksValid(const String& path) {
     return pcapLooksValid(path.c_str());
 }
 
-// FIX: Accept const char* directly to avoid implicit String construction from char[]
+// Case-insensitive substring search in a char buffer
+static bool containsCaseInsensitive(const char* haystack, size_t haystackLen, const char* needle) {
+    size_t needleLen = strlen(needle);
+    if (needleLen > haystackLen) return false;
+    for (size_t i = 0; i <= haystackLen - needleLen; i++) {
+        bool match = true;
+        for (size_t j = 0; j < needleLen; j++) {
+            if (tolower((unsigned char)haystack[i + j]) != tolower((unsigned char)needle[j])) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
 static bool wigleLooksValid(const char* path) {
     File f = SD.open(path, FILE_READ);
     if (!f) return false;
@@ -405,19 +459,28 @@ static bool wigleLooksValid(const char* path) {
     }
     const int maxLines = 5;
     bool valid = false;
-    String line;
-    line.reserve(256);  // Pre-allocate for header lines which can be long
+    char lineBuf[256];
     for (int i = 0; i < maxLines && f.available(); i++) {
-        line = f.readStringUntil('\n');  // Reuses existing capacity
-        line.trim();
-        if (!line.length()) continue;
-        if (line.startsWith("\xEF\xBB\xBF")) {
-            line = line.substring(3);
-            line.trim();
+        size_t len = f.readBytesUntil('\n', lineBuf, sizeof(lineBuf) - 1);
+        lineBuf[len] = '\0';
+        // Trim trailing whitespace/CR
+        while (len > 0 && (lineBuf[len - 1] == '\r' || lineBuf[len - 1] == ' ')) {
+            lineBuf[--len] = '\0';
         }
-        line.toLowerCase();  // FIX: In-place, no copy needed
-        if (line.indexOf("wigle") >= 0) { valid = true; break; }
-        if (line.startsWith("mac,") || line.startsWith("bssid,")) { valid = true; break; }
+        if (len == 0) continue;
+        // Skip BOM
+        const char* p = lineBuf;
+        size_t pLen = len;
+        if (pLen >= 3 && (uint8_t)p[0] == 0xEF && (uint8_t)p[1] == 0xBB && (uint8_t)p[2] == 0xBF) {
+            p += 3;
+            pLen -= 3;
+        }
+        // Skip leading whitespace
+        while (pLen > 0 && *p == ' ') { p++; pLen--; }
+        if (pLen == 0) continue;
+        if (containsCaseInsensitive(p, pLen, "wigle")) { valid = true; break; }
+        if (containsCaseInsensitive(p, pLen, "mac,")) { valid = true; break; }
+        if (containsCaseInsensitive(p, pLen, "bssid,")) { valid = true; break; }
     }
     f.close();
     if (valid) return true;
@@ -425,12 +488,7 @@ static bool wigleLooksValid(const char* path) {
     return false;
 }
 
-// Overload for String& - delegates to const char* version
-static bool wigleLooksValid(const String& path) {
-    return wigleLooksValid(path.c_str());
-}
-
-static bool awardXpEntry(const char* src, uint16_t per, const char* awardFile, std::vector<String>& awardList, const String& key) {
+static bool awardXpEntry(const char* src, uint16_t per, const char* awardFile, std::vector<XpAwardEntry>& awardList, const char* key) {
     if (xpSessionAwarded + per > XP_SESSION_CAP) {
         return false;
     }
@@ -439,7 +497,7 @@ static bool awardXpEntry(const char* src, uint16_t per, const char* awardFile, s
     }
     XP::addXP(per);
     xpSessionAwarded += per;
-    Serial.printf("[FILESERVER] XP AWARD %s +%u\n", src, (unsigned int)per);
+    FS_LOGF("[FILESERVER] XP AWARD %s +%u\n", src, (unsigned int)per);
     return true;
 }
 
@@ -449,6 +507,15 @@ static void scanXpAwards() {
         return;
     }
     if (xpSessionAwarded >= XP_SESSION_CAP) return;
+
+    // Gate: defer scan if heap is too low for SD reads + vector operations
+    HeapGates::GateStatus gate = HeapGates::checkGate(
+        HeapPolicy::kFileServerMinHeap,
+        HeapPolicy::kFileServerMinLargest);
+    if (gate.failure != HeapGates::TlsGateFailure::None) {
+        xpScanPending = true;
+        return;
+    }
     if (!XP_WPA_AWARDED_FILE || !XP_WIGLE_AWARDED_FILE || !WPA_SENT_FILE || !WIGLE_UPLOADED_FILE) {
         refreshSdPaths();
     }
@@ -459,69 +526,68 @@ static void scanXpAwards() {
     loadAwardedList(XP_WPA_AWARDED_FILE, xpAwardedWpa, xpWpaLoaded, xpWpaCacheComplete);
     loadAwardedList(XP_WIGLE_AWARDED_FILE, xpAwardedWigle, xpWigleLoaded, xpWigleCacheComplete);
 
-    // WPA-SEC awards
-    // FIX: Reuse String objects to reduce heap fragmentation
+    // WPA-SEC awards — zero String allocations in loop
     File wpaFile = SD.open(WPA_SENT_FILE, FILE_READ);
     if (!wpaFile) {
         wpaFile = SD.open(SDLayout::wpasecUploadedPath(), FILE_READ);
     }
     if (wpaFile) {
-        String line;
-        line.reserve(64);  // Pre-allocate for typical BSSID lines
-        String bssid;
-        bssid.reserve(16);
-        char pcapPathBuf[128];  // FIX: Stack buffer for path building
+        char lineBuf[64];
+        char bssid[16];
+        char pcapPathBuf[128];
         const char* hsDir = SDLayout::handshakesDir();
-        
+
         while (wpaFile.available() && xpSessionAwarded < XP_SESSION_CAP) {
-            yield();  // FIX: Prevent WDT on large files
-            line = wpaFile.readStringUntil('\n');
-            line.trim();
-            if (!line.length()) continue;
-            bssid = normalizeHexToken(line, 12);
-            if (bssid.length() < 12) continue;
+            yield();
+            size_t len = wpaFile.readBytesUntil('\n', lineBuf, sizeof(lineBuf) - 1);
+            lineBuf[len] = '\0';
+            while (len > 0 && (lineBuf[len - 1] == '\r' || lineBuf[len - 1] == ' ')) {
+                lineBuf[--len] = '\0';
+            }
+            if (len == 0) continue;
+            size_t hexLen = normalizeHexToken(lineBuf, bssid, sizeof(bssid), 12);
+            if (hexLen < 12) continue;
             if (isAwarded(XP_WPA_AWARDED_FILE, bssid, xpAwardedWpa, xpWpaLoaded, xpWpaCacheComplete)) continue;
-            snprintf(pcapPathBuf, sizeof(pcapPathBuf), "%s/%s.pcap", hsDir, bssid.c_str());
+            snprintf(pcapPathBuf, sizeof(pcapPathBuf), "%s/%s.pcap", hsDir, bssid);
             if (!pcapLooksValid(pcapPathBuf)) continue;
             awardXpEntry("WPA", XP_WPA_PER, XP_WPA_AWARDED_FILE, xpAwardedWpa, bssid);
         }
         wpaFile.close();
     }
 
-    // WiGLE awards
-    // FIX: Reuse String objects to reduce heap fragmentation
+    // WiGLE awards — zero String allocations in loop
     File wigleFile = SD.open(WIGLE_UPLOADED_FILE, FILE_READ);
     if (wigleFile) {
-        String line;
-        line.reserve(128);  // Pre-allocate for path lines
-        String path;
-        path.reserve(128);
-        char pathBuf[160];  // FIX: Stack buffer for path building
+        char lineBuf[128];
+        char pathBuf[160];
         const char* wdDir = SDLayout::wardrivingDir();
-        
+
         while (wigleFile.available() && xpSessionAwarded < XP_SESSION_CAP) {
-            yield();  // FIX: Prevent WDT on large files
-            line = wigleFile.readStringUntil('\n');
-            line.trim();
-            if (!line.length()) continue;
-            
-            // FIX: Build path in stack buffer when needed, else reuse line
-            if (line.charAt(0) != '/') {
-                snprintf(pathBuf, sizeof(pathBuf), "%s/%s", wdDir, line.c_str());
+            yield();
+            size_t len = wigleFile.readBytesUntil('\n', lineBuf, sizeof(lineBuf) - 1);
+            lineBuf[len] = '\0';
+            while (len > 0 && (lineBuf[len - 1] == '\r' || lineBuf[len - 1] == ' ')) {
+                lineBuf[--len] = '\0';
+            }
+            if (len == 0) continue;
+
+            const char* path;
+            if (lineBuf[0] != '/') {
+                snprintf(pathBuf, sizeof(pathBuf), "%s/%s", wdDir, lineBuf);
                 path = pathBuf;
             } else {
-                path = line;
+                path = lineBuf;
             }
-            
-            // FIX: Check extension without creating lowercase copy
-            size_t pathLen = path.length();
-            if (pathLen < 10) continue;  // ".wigle.csv" is 10 chars
-            const char* ext = path.c_str() + pathLen - 10;
-            if (strcasecmp(ext, ".wigle.csv") != 0) continue;
-            
-            if (isAwarded(XP_WIGLE_AWARDED_FILE, path, xpAwardedWigle, xpWigleLoaded, xpWigleCacheComplete)) continue;
+
+            size_t pathLen = strlen(path);
+            if (pathLen < 10) continue;
+            if (strcasecmp(path + pathLen - 10, ".wigle.csv") != 0) continue;
+
+            // Use filename-only as key (fits in 18-byte XpAwardEntry)
+            const char* fname = basenameFromPath(path);
+            if (isAwarded(XP_WIGLE_AWARDED_FILE, fname, xpAwardedWigle, xpWigleLoaded, xpWigleCacheComplete)) continue;
             if (!wigleLooksValid(path)) continue;
-            awardXpEntry("WIGLE", XP_WIGLE_PER, XP_WIGLE_AWARDED_FILE, xpAwardedWigle, path);
+            awardXpEntry("WIGLE", XP_WIGLE_PER, XP_WIGLE_AWARDED_FILE, xpAwardedWigle, fname);
         }
         wigleFile.close();
     }
@@ -1091,6 +1157,8 @@ body.mc{
   text-overflow:ellipsis;
   color: var(--dim);
 }
+.ops-meta-link{ cursor:pointer; }
+.ops-meta-link:hover{ color: var(--dr-cyan); text-decoration: underline; }
 .ops-actions{
   display:flex;
   gap: 6px;
@@ -1498,14 +1566,12 @@ async function loadConfigFromDevice() {
     creds.wigleUser = '';
     creds.wigleToken = '';
     try {
-        const text = await fetchDeviceText('/m5porkchop/config/porkchop.conf');
-        if (text) {
-            const cfg = JSON.parse(text);
-            if (cfg && cfg.wifi) {
-                creds.wpaKey = (cfg.wifi.wpaSecKey || '').trim();
-                creds.wigleUser = (cfg.wifi.wigleApiName || '').trim();
-                creds.wigleToken = (cfg.wifi.wigleApiToken || '').trim();
-            }
+        const r = await queuedFetch('/api/creds');
+        if (r.ok) {
+            const cfg = await r.json();
+            creds.wpaKey = (cfg.wpaSecKey || '').trim();
+            creds.wigleUser = (cfg.wigleApiName || '').trim();
+            creds.wigleToken = (cfg.wigleApiToken || '').trim();
         }
     } catch(e) {
         // keep defaults
@@ -1882,7 +1948,7 @@ function closeWpaAuthModal(result) {
 
 function openWpaAuthTab() {
     if (!creds.wpaKey) {
-        addWpaLog('AUTH BLOCKED: KEY MISSING IN /PORKCHOP.CONF');
+        addWpaLog('AUTH BLOCKED: KEY MISSING - CLICK STATUS TO CONFIGURE');
         return;
     }
     const url = 'https://wpa-sec.stanev.org/?submit&key=' + encodeURIComponent(creds.wpaKey);
@@ -2395,8 +2461,57 @@ function hideModal() {
     document.getElementById('newFolderModal').style.display = 'none';
     document.getElementById('helpModal').style.display = 'none';
     document.getElementById('renameModal').style.display = 'none';
+    document.getElementById('credsModal').style.display = 'none';
     const logModal = document.getElementById('logModal');
     if (logModal) logModal.style.display = 'none';
+}
+
+function showCredsModal() {
+    document.getElementById('credWpaKey').value = creds.wpaKey || '';
+    document.getElementById('credWigleName').value = creds.wigleUser || '';
+    document.getElementById('credWigleToken').value = creds.wigleToken || '';
+    document.getElementById('credsModal').style.display = 'flex';
+    setTimeout(() => document.getElementById('credWpaKey').focus(), 50);
+}
+
+function hideCredsModal() {
+    document.getElementById('credsModal').style.display = 'none';
+}
+
+async function saveCreds() {
+    const wpaKey = document.getElementById('credWpaKey').value.trim();
+    const wigleName = document.getElementById('credWigleName').value.trim();
+    const wigleToken = document.getElementById('credWigleToken').value.trim();
+    try {
+        const r = await queuedFetch('/api/creds', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                wpaSecKey: wpaKey,
+                wigleApiName: wigleName,
+                wigleApiToken: wigleToken
+            })
+        });
+        if (r.ok) {
+            creds.wpaKey = wpaKey;
+            creds.wigleUser = wigleName;
+            creds.wigleToken = wigleToken;
+            updateCredsStatus();
+            hideCredsModal();
+            addSysLog('CREDENTIALS SAVED');
+        } else {
+            addSysLog('CREDS SAVE FAILED: ' + r.status);
+        }
+    } catch(e) {
+        addSysLog('CREDS SAVE ERROR');
+    }
+}
+
+async function clearCreds() {
+    document.getElementById('credWpaKey').value = '';
+    document.getElementById('credWigleName').value = '';
+    document.getElementById('credWigleToken').value = '';
+    await saveCreds();
 }
 
 function getEditBytes(text) {
@@ -2858,7 +2973,7 @@ async function updateWigleUploadedList(fullPath) {
 async function wpaSync() {
     if (opsBusy) return;
     if (!creds.wpaKey) {
-        addWpaLog('KEY MISSING IN /PORKCHOP.CONF');
+        addWpaLog('KEY MISSING - CLICK STATUS TO CONFIGURE');
         return;
     }
     const pendingPre = wpaQueue.filter(item => item.status === 'LOCAL');
@@ -2899,7 +3014,7 @@ async function wpaSync() {
 
 function wpaOpenResults() {
     if (!creds.wpaKey) {
-        addWpaLog('KEY MISSING IN /PORKCHOP.CONF');
+        addWpaLog('KEY MISSING - CLICK STATUS TO CONFIGURE');
         return;
     }
     const url = 'https://wpa-sec.stanev.org/?api&dl=1&key=' + encodeURIComponent(creds.wpaKey);
@@ -2981,7 +3096,7 @@ async function wpaUploadItem(item) {
 async function wigleSync() {
     if (opsBusy) return;
     if (!creds.wigleUser || !creds.wigleToken) {
-        addWigleLog('CREDS MISSING IN /PORKCHOP.CONF');
+        addWigleLog('CREDS MISSING - CLICK STATUS TO CONFIGURE');
         return;
     }
     const pending = wigleQueue.filter(item => item.status === 'LOCAL');
@@ -3145,7 +3260,7 @@ static const char HTML_TEMPLATE[] PROGMEM = R"rawliteral(
                     <span class="ops-decor-left">────────────────────────────────────────────────────────────────────────────────┤</span>
                     <span class="ops-title-wrap">
                         <span class="ops-title">WPA-SEC QUEUE</span>
-                        <span class="ops-meta" id="wpaMeta">KEY: UNKNOWN</span>
+                        <span class="ops-meta ops-meta-link" id="wpaMeta" onclick="showCredsModal()">KEY: UNKNOWN</span>
                         <span class="ops-actions">
                             <button class="btn btn-outline" id="btnWpaOpen" onclick="wpaOpenResults()">POT FILE</button>
                         </span>
@@ -3165,7 +3280,7 @@ static const char HTML_TEMPLATE[] PROGMEM = R"rawliteral(
                     <span class="ops-decor-left">────────────────────────────────────────────────────────────────────────────────┤</span>
                     <span class="ops-title-wrap">
                         <span class="ops-title">WIGLE QUEUE</span>
-                        <span class="ops-meta" id="wigleMeta">CREDS: UNKNOWN</span>
+                        <span class="ops-meta ops-meta-link" id="wigleMeta" onclick="showCredsModal()">CREDS: UNKNOWN</span>
                         <span class="ops-actions">
                             <button class="btn" id="btnWigleSync" onclick="wigleSync()">SYNC</button>
                         </span>
@@ -3299,6 +3414,34 @@ BACKSPACE      PARENT FOLDER
         </div>
     </div>
 
+    <!-- Credentials Modal -->
+    <div class="modal" id="credsModal" onclick="if(event.target===this)hideCredsModal()">
+        <div class="modal-content">
+            <h3>API CREDENTIALS</h3>
+            <div style="margin-bottom:10px">
+                <div style="color:var(--dim);font-size:0.85em;margin-bottom:4px;text-transform:uppercase;letter-spacing:0.3px">WPA-SEC KEY (32 HEX CHARS)</div>
+                <input type="text" id="credWpaKey" placeholder="WPA-SEC API KEY" maxlength="32" spellcheck="false" autocomplete="off"
+                       onkeydown="if(event.key==='Escape')hideCredsModal()">
+            </div>
+            <div style="margin-bottom:10px">
+                <div style="color:var(--dim);font-size:0.85em;margin-bottom:4px;text-transform:uppercase;letter-spacing:0.3px">WIGLE API NAME</div>
+                <input type="text" id="credWigleName" placeholder="WIGLE API NAME" maxlength="64" spellcheck="false" autocomplete="off"
+                       onkeydown="if(event.key==='Escape')hideCredsModal()">
+            </div>
+            <div style="margin-bottom:10px">
+                <div style="color:var(--dim);font-size:0.85em;margin-bottom:4px;text-transform:uppercase;letter-spacing:0.3px">WIGLE API TOKEN</div>
+                <input type="text" id="credWigleToken" placeholder="WIGLE API TOKEN" maxlength="64" spellcheck="false" autocomplete="off"
+                       onkeydown="if(event.key==='Escape')hideCredsModal()">
+            </div>
+            <div class="modal-tip">SAVED TO DEVICE CONFIG. PERSISTS ACROSS REBOOTS.</div>
+            <div class="modal-actions">
+                <button class="btn" onclick="saveCreds()">SAVE</button>
+                <button class="btn btn-outline" onclick="clearCreds()">CLEAR ALL</button>
+                <button class="btn btn-outline" onclick="hideCredsModal()">CANCEL</button>
+            </div>
+        </div>
+    </div>
+
 <script src="/ui.js"></script>
 </body>
 </html>
@@ -3336,12 +3479,13 @@ bool FileServer::start(const char* ssid, const char* password) {
     }
 
     // Pre-start heap conditioning if contiguous block is below TLS threshold.
-    size_t largestBefore = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    HeapGates::HeapSnapshot heapBefore = HeapGates::snapshot();
+    size_t largestBefore = heapBefore.largestBlock;
     if (largestBefore < HeapPolicy::kMinContigForTls) {
-        Serial.printf("[FILESERVER] Pre-start conditioning: largest=%u < %u\n",
+        FS_LOGF("[FILESERVER] Pre-start conditioning: largest=%u < %u\n",
                       (unsigned)largestBefore, (unsigned)HeapPolicy::kMinContigForTls);
         size_t largestAfter = WiFiUtils::conditionHeapForTLS();
-        Serial.printf("[FILESERVER] Pre-start conditioning complete: %u -> %u (+%d)\n",
+        FS_LOGF("[FILESERVER] Pre-start conditioning complete: %u -> %u (+%d)\n",
                       (unsigned)largestBefore, (unsigned)largestAfter,
                       (int)(largestAfter - largestBefore));
     }
@@ -3365,69 +3509,38 @@ bool FileServer::start(const char* ssid, const char* password) {
 }
 
 void FileServer::startServer() {
-    // #region agent log
-    Serial.println("[DBG-H1] startServer() ENTRY");
-    // #endregion
-    
     snprintf(statusMessage, sizeof(statusMessage), "%s", WiFi.localIP().toString().c_str());
     logWiFiStatus("startServer");
-    
-    // #region agent log
-    Serial.printf("[DBG-H1] IP stored: %s\n", statusMessage);
-    // #endregion
-    
-    // Start mDNS
-    // #region agent log
-    Serial.printf("[DBG-H1] WiFi connected=%d, localIP=%s\n", 
-                  WiFi.isConnected(), WiFi.localIP().toString().c_str());
-    Serial.println("[DBG-H1] About to call MDNS.begin()");
-    // #endregion
-    
+
     bool mdnsOk = MDNS.begin("porkchop");
-    
-    // #region agent log
-    Serial.printf("[DBG-H1] MDNS.begin() returned %d\n", mdnsOk);
-    // #endregion
-    
-    // #region agent log
-    Serial.println("[DBG-H2] MDNS.begin() completed, creating WebServer");
-    // #endregion
-    
-    // FIX: Heap guard before WebServer allocation - prevent OOM on ADV/tight heap
+    FS_LOGF("[FILESERVER] mDNS %s\n", mdnsOk ? "ok" : "fail");
+
+    // Heap guard before WebServer allocation - prevent OOM on ADV/tight heap
     {
-        size_t freeHeap = ESP.getFreeHeap();
-        size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-        if (freeHeap < HeapPolicy::kFileServerMinHeap || largest < HeapPolicy::kFileServerMinLargest) {
-            Serial.printf("[FILESERVER] Low heap for WebServer: free=%u largest=%u\n",
-                          (unsigned)freeHeap, (unsigned)largest);
+        HeapGates::GateStatus gate = HeapGates::checkGate(
+            HeapPolicy::kFileServerMinHeap,
+            HeapPolicy::kFileServerMinLargest);
+        if (gate.failure != HeapGates::TlsGateFailure::None) {
+            FS_LOGF("[FILESERVER] Low heap for WebServer: free=%u largest=%u\n",
+                          (unsigned)gate.freeHeap, (unsigned)gate.largestBlock);
             strcpy(statusMessage, "Low heap");
-            MDNS.end();  // Clean up mDNS we just started
+            MDNS.end();
             WiFiUtils::shutdown();
             state = FileServerState::IDLE;
             return;
         }
     }
-    
-    // Create and configure web server
+
     server = new WebServer(80);
-    
-    // #region agent log
-    Serial.printf("[DBG-H2] WebServer created, ptr=%p\n", (void*)server);
-    // #endregion
-    
     if (!server) {
-        // #region agent log
-        Serial.println("[DBG-H2] ERROR: WebServer allocation failed!");
-        // #endregion
+        FS_LOGLN("[FILESERVER] WebServer allocation failed");
         strcpy(statusMessage, "Server alloc fail");
+        MDNS.end();
+        WiFiUtils::shutdown();
         state = FileServerState::IDLE;
         return;
     }
-    
-    // #region agent log
-    Serial.println("[DBG-H3] Registering handlers...");
-    // #endregion
-    
+
     server->on("/", HTTP_GET, handleRoot);
     server->on("/ui.css", HTTP_GET, handleStyle);
     server->on("/ui.js", HTTP_GET, handleScript);
@@ -3438,23 +3551,17 @@ void FileServer::startServer() {
     server->on("/api/rename", HTTP_GET, handleRename);
     server->on("/api/copy", HTTP_POST, handleCopy);
     server->on("/api/move", HTTP_POST, handleMove);
+    server->on("/api/creds", HTTP_GET, handleCreds);
+    server->on("/api/creds", HTTP_POST, handleCredsSave);
     server->on("/download", HTTP_GET, handleDownload);
     server->on("/upload", HTTP_POST, handleUpload, handleUploadProcess);
     server->on("/delete", HTTP_GET, handleDelete);
-    server->on("/rmdir", HTTP_GET, handleDelete);  // Same handler, will detect folder
+    server->on("/rmdir", HTTP_GET, handleDelete);
     server->on("/mkdir", HTTP_GET, handleMkdir);
     server->onNotFound(handleNotFound);
-    
-    // #region agent log
-    Serial.println("[DBG-H3] Handlers registered, calling server->begin()");
-    // #endregion
-    
+
     server->begin();
-    
-    // #region agent log
-    Serial.println("[DBG-H4] server->begin() completed");
-    // #endregion
-    
+
     state = FileServerState::RUNNING;
     lastReconnectCheck = millis();
 
@@ -3463,7 +3570,9 @@ void FileServer::startServer() {
     xpSessionAwarded = 0;
     xpScanPending = true;
     xpAwardedWpa.clear();
+    xpAwardedWpa.shrink_to_fit();
     xpAwardedWigle.clear();
+    xpAwardedWigle.shrink_to_fit();
     xpWpaLoaded = false;
     xpWigleLoaded = false;
     xpWpaCacheComplete = false;
@@ -3488,22 +3597,26 @@ void FileServer::stop() {
     MDNS.end();
     WiFiUtils::shutdown();
     
-    // Heap recovery: brief promiscuous cycle to coalesce fragments
-    // WebServer + mDNS allocations cause fragmentation; this triggers WiFi driver's
-    // internal buffer reorganization which helps defragment the heap
-    size_t largestBefore = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-    if (largestBefore < HeapPolicy::kFileServerRecoveryThreshold) {
-        // Short callback-enabled brew for reliable coalescing
-        Serial.printf("[FILESERVER] Heap recovery starting: largest=%u\n", (unsigned)largestBefore);
-        size_t largestAfter = WiFiUtils::brewHeap(2000, false);
-        if (largestAfter < HeapPolicy::kMinContigForTls) {
-            Serial.printf("[FILESERVER] Brew insufficient (largest=%u), running full conditioning\n",
-                          (unsigned)largestAfter);
-            largestAfter = WiFiUtils::conditionHeapForTLS();
+    // Wait for async LWIP cleanup after WiFi disconnect.
+    // WiFi.disconnect() frees TCP/IP buffers asynchronously on core 0.
+    {
+        size_t prevLargest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+        size_t prevFree = ESP.getFreeHeap();
+        uint32_t waitStart = millis();
+
+        while ((millis() - waitStart) < HeapPolicy::kFileServerLwipWaitMaxMs) {
+            delay(HeapPolicy::kFileServerLwipPollMs);
+            size_t curLargest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+            size_t curFree = ESP.getFreeHeap();
+            if (curFree == prevFree && curLargest == prevLargest) break;
+            prevFree = curFree;
+            prevLargest = curLargest;
         }
-        Serial.printf("[FILESERVER] Heap recovery complete: %u -> %u (+%d)\n",
-                      (unsigned)largestBefore, (unsigned)largestAfter,
-                      (int)(largestAfter - largestBefore));
+
+        FS_LOGF("[FILESERVER] LWIP cleanup: free=%u largest=%u (waited %ums)\n",
+                (unsigned)ESP.getFreeHeap(),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+                (unsigned)(millis() - waitStart));
     }
     
     state = FileServerState::IDLE;
@@ -3543,6 +3656,7 @@ void FileServer::updateConnecting() {
     uint32_t elapsed = millis() - connectStartTime;
     
     if (WiFi.status() == WL_CONNECTED) {
+        WiFiUtils::maybeSyncTimeForFileTransfer();
         startServer();
         return;
     }
@@ -3574,7 +3688,7 @@ void FileServer::updateRunning() {
     
     // FIX: Timeout safety for listActive - prevent permanent lockout
     if (listActive.load() && (millis() - listStartTime.load() > 60000)) {
-        Serial.println("[FILESERVER] List operation timeout, resetting listActive");
+        FS_LOGLN("[FILESERVER] List operation timeout, resetting listActive");
         listActive.store(false);
     }
 
@@ -3639,7 +3753,7 @@ void FileServer::handleRoot() {
     size_t freeHeap = 0;
     size_t largest = 0;
     if (isUiHeapLow(&freeHeap, &largest)) {
-        Serial.printf("[FILESERVER] Low heap for UI: free=%u largest=%u\n",
+        FS_LOGF("[FILESERVER] Low heap for UI: free=%u largest=%u\n",
                       (unsigned int)freeHeap, (unsigned int)largest);
         size_t sent = sendProgmemResponse(server, 503, "text/html; charset=utf-8", LOW_HEAP_PAGE);
         sessionTxBytes += sent;
@@ -3659,7 +3773,7 @@ void FileServer::handleStyle() {
     size_t freeHeap = 0;
     size_t largest = 0;
     if (isUiHeapLow(&freeHeap, &largest)) {
-        Serial.printf("[FILESERVER] Low heap for CSS: free=%u largest=%u\n",
+        FS_LOGF("[FILESERVER] Low heap for CSS: free=%u largest=%u\n",
                       (unsigned int)freeHeap, (unsigned int)largest);
         server->sendHeader("Connection", "close");
         server->send(503, "text/plain", "LOW HEAP");
@@ -3678,7 +3792,7 @@ void FileServer::handleScript() {
     size_t freeHeap = 0;
     size_t largest = 0;
     if (isUiHeapLow(&freeHeap, &largest)) {
-        Serial.printf("[FILESERVER] Low heap for JS: free=%u largest=%u\n",
+        FS_LOGF("[FILESERVER] Low heap for JS: free=%u largest=%u\n",
                       (unsigned int)freeHeap, (unsigned int)largest);
         server->sendHeader("Connection", "close");
         server->send(503, "text/plain", "LOW HEAP");
@@ -3734,6 +3848,98 @@ void FileServer::handleSDInfo() {
     server->send(200, "application/json", json);
     sessionTxBytes += strlen(json);
     logHeapStatusIfLow("after /api/sdinfo");
+}
+
+void FileServer::handleCreds() {
+    logRequest(server, "REQ");
+    if (isTransferBusy()) {
+        sendBusyResponse(server);
+        return;
+    }
+    const WiFiConfig& w = Config::wifi();
+    char json[256];
+    snprintf(json, sizeof(json),
+             "{\"wpaSecKey\":\"%s\",\"wigleApiName\":\"%s\",\"wigleApiToken\":\"%s\"}",
+             w.wpaSecKey, w.wigleApiName, w.wigleApiToken);
+    server->sendHeader("Connection", "close");
+    server->sendHeader("Cache-Control", "no-store");
+    server->send(200, "application/json", json);
+    sessionTxBytes += strlen(json);
+}
+
+// Helper: extract a JSON string value by key from a flat JSON object.
+// Returns pointer to static buffer (max 128 chars). Returns "" if not found.
+static const char* jsonExtractStr(const char* body, const char* key) {
+    static char buf[128];
+    buf[0] = '\0';
+    // Build search pattern: "key":"
+    char pattern[48];
+    snprintf(pattern, sizeof(pattern), "\"%s\":\"", key);
+    const char* start = strstr(body, pattern);
+    if (!start) return buf;
+    start += strlen(pattern);
+    const char* end = strchr(start, '"');
+    if (!end) return buf;
+    size_t len = end - start;
+    if (len >= sizeof(buf)) len = sizeof(buf) - 1;
+    memcpy(buf, start, len);
+    buf[len] = '\0';
+    return buf;
+}
+
+void FileServer::handleCredsSave() {
+    logRequest(server, "REQ");
+    if (isTransferBusy()) {
+        sendBusyResponse(server);
+        return;
+    }
+    if (!server->hasArg("plain")) {
+        server->sendHeader("Connection", "close");
+        server->send(400, "application/json", "{\"error\":\"Missing body\"}");
+        return;
+    }
+
+    String body = server->arg("plain");
+    if (body.length() > 512) {
+        server->sendHeader("Connection", "close");
+        server->send(413, "application/json", "{\"error\":\"Body too large\"}");
+        return;
+    }
+
+    const char* raw = body.c_str();
+    const char* wpaKey = jsonExtractStr(raw, "wpaSecKey");
+    // Re-extract into local buffers since jsonExtractStr uses static buf
+    char wpaKeyBuf[64];
+    strncpy(wpaKeyBuf, wpaKey, sizeof(wpaKeyBuf) - 1);
+    wpaKeyBuf[sizeof(wpaKeyBuf) - 1] = '\0';
+
+    const char* apiName = jsonExtractStr(raw, "wigleApiName");
+    char apiNameBuf[65];
+    strncpy(apiNameBuf, apiName, sizeof(apiNameBuf) - 1);
+    apiNameBuf[sizeof(apiNameBuf) - 1] = '\0';
+
+    const char* apiToken = jsonExtractStr(raw, "wigleApiToken");
+    char apiTokenBuf[65];
+    strncpy(apiTokenBuf, apiToken, sizeof(apiTokenBuf) - 1);
+    apiTokenBuf[sizeof(apiTokenBuf) - 1] = '\0';
+
+    // Write to config
+    WiFiConfig cfg = Config::wifi();
+    strncpy(cfg.wpaSecKey, wpaKeyBuf, sizeof(cfg.wpaSecKey) - 1);
+    cfg.wpaSecKey[sizeof(cfg.wpaSecKey) - 1] = '\0';
+    strncpy(cfg.wigleApiName, apiNameBuf, sizeof(cfg.wigleApiName) - 1);
+    cfg.wigleApiName[sizeof(cfg.wigleApiName) - 1] = '\0';
+    strncpy(cfg.wigleApiToken, apiTokenBuf, sizeof(cfg.wigleApiToken) - 1);
+    cfg.wigleApiToken[sizeof(cfg.wigleApiToken) - 1] = '\0';
+    Config::setWiFi(cfg);
+
+    Serial.printf("[FILESERVER] Creds saved: wpa=%s wigle=%s/%s\n",
+                  wpaKeyBuf[0] ? "(SET)" : "(EMPTY)",
+                  apiNameBuf[0] ? "(SET)" : "(EMPTY)",
+                  apiTokenBuf[0] ? "(SET)" : "(EMPTY)");
+
+    server->sendHeader("Connection", "close");
+    server->send(200, "application/json", "{\"ok\":true}");
 }
 
 void FileServer::handleFileList() {
@@ -4056,7 +4262,7 @@ void FileServer::handleUploadProcess() {
         if (uploadFile) {
             size_t written = uploadFile.write(upload.buf, upload.currentSize);
             if (written != upload.currentSize) {
-                Serial.printf("[FILESERVER] Upload write failed: wrote %u/%u\n",
+                FS_LOGF("[FILESERVER] Upload write failed: wrote %u/%u\n",
                               (unsigned int)written, (unsigned int)upload.currentSize);
                 resetUploadState(true);
                 return;
@@ -4066,7 +4272,7 @@ void FileServer::handleUploadProcess() {
             yield(); // Feed watchdog during upload
         } else {
             // Safety check: if uploadFile is not open, reject the upload
-            Serial.println("[FILESERVER] Upload write attempted but no file open");
+            FS_LOGLN("[FILESERVER] Upload write attempted but no file open");
             resetUploadState(true);
             return;
         }
@@ -4083,7 +4289,7 @@ void FileServer::handleUploadProcess() {
     
     // Additional safety check: if upload takes too long, reset to prevent hanging
     if (uploadActive.load() && (millis() - uploadLastProgress.load() > 30000)) {  // 30 second timeout
-        Serial.println("[FILESERVER] Upload timeout detected, resetting upload state");
+        FS_LOGLN("[FILESERVER] Upload timeout detected, resetting upload state");
         resetUploadState(true);
     }
 }
@@ -4109,7 +4315,7 @@ static void recursiveYieldCheck() {
 // FIX: Use char buffer for path building to avoid String allocs in recursion
 static bool deletePathRecursiveInternal(const char* path, size_t pathLen, uint8_t depth) {
     if (depth > MAX_RECURSION_DEPTH) {
-        Serial.printf("[FILESERVER] Delete depth limit exceeded at: %s\n", path);
+        FS_LOGF("[FILESERVER] Delete depth limit exceeded at: %s\n", path);
         return false;  // Refuse to go deeper to protect stack
     }
     
@@ -4144,7 +4350,7 @@ static bool deletePathRecursiveInternal(const char* path, size_t pathLen, uint8_
         
         // Build child path in stack buffer
         if (pathLen + 1 + entryNameLen >= sizeof(childPath)) {
-            Serial.printf("[FILESERVER] Path too long in delete: %s/%s\n", path, entryName);
+            FS_LOGF("[FILESERVER] Path too long in delete: %s/%s\n", path, entryName);
             entry.close();
             dir.close();
             return false;
@@ -4404,7 +4610,7 @@ bool FileServer::copyFileChunked(const String& srcPath, const String& dstPath) {
             // FIX: Check timeout BEFORE updating lastTimeout (was broken - always 0)
             uint32_t now = millis();
             if (now - lastTimeout > 30000) {
-                Serial.println("[FILESERVER] Copy operation timed out");
+                FS_LOGLN("[FILESERVER] Copy operation timed out");
                 success = false;
                 break;
             }
@@ -4426,7 +4632,7 @@ bool FileServer::copyFileChunked(const String& srcPath, const String& dstPath) {
 // FIX: Optimized to use char buffers for path building to reduce heap allocs in recursion
 bool FileServer::copyPathRecursive(const String& srcPath, const String& dstPath, uint8_t depth) {
     if (depth > MAX_RECURSION_DEPTH) {
-        Serial.printf("[FILESERVER] Copy depth limit exceeded at: %s\n", srcPath.c_str());
+        FS_LOGF("[FILESERVER] Copy depth limit exceeded at: %s\n", srcPath.c_str());
         return false;
     }
     
@@ -4468,7 +4674,7 @@ bool FileServer::copyPathRecursive(const String& srcPath, const String& dstPath,
             // Build paths in stack buffers
             if (srcLen + 1 + nameLen >= sizeof(newSrcBuf) || 
                 dstLen + 1 + nameLen >= sizeof(newDstBuf)) {
-                Serial.printf("[FILESERVER] Path too long in copy: %s\n", name);
+                FS_LOGF("[FILESERVER] Path too long in copy: %s\n", name);
                 entry.close();
                 dir.close();
                 return false;

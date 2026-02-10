@@ -11,6 +11,7 @@
 #include "../core/sdlog.h"
 #include "../core/xp.h"
 #include "../core/wifi_utils.h"
+#include "../core/network_recon.h"
 
 // Static member initialization
 bool BaconMode::running = false;
@@ -28,6 +29,8 @@ int8_t BaconMode::lastGeneralPhraseIdx = -1;
 bool BaconMode::scanInProgress = false;
 bool BaconMode::scanCompleted = false;
 uint32_t BaconMode::scanStartTime = 0;
+bool BaconMode::reconWasRunning = false;
+bool BaconMode::reconWasPaused = false;
 
 static const uint32_t BACON_STATUS_INTERVAL_MS = 5000;
 static const uint32_t BACON_SCAN_TIMEOUT_MS = 8000;
@@ -64,6 +67,8 @@ void BaconMode::init() {
     scanInProgress = false;
     scanCompleted = false;
     scanStartTime = 0;
+    reconWasRunning = false;
+    reconWasPaused = false;
     
     Serial.println("[BACON] Initialized");
 }
@@ -71,6 +76,14 @@ void BaconMode::init() {
 void BaconMode::start() {
     Serial.println("[BACON] Starting...");
     
+    // Pause NetworkRecon to avoid promiscuous conflicts during scan/tx
+    // Use pause() instead of stop() to preserve state for lighter resume
+    reconWasRunning = NetworkRecon::isRunning();
+    reconWasPaused = NetworkRecon::isPaused();
+    if (reconWasRunning) {
+        NetworkRecon::pause();
+    }
+
     // Show scanning toast and start async scan (non-blocking)
     Display::notify(NoticeKind::STATUS, "SCANNING REFS...", 5000, NoticeChannel::TOP_BAR);
     startAsyncScan();
@@ -116,7 +129,19 @@ void BaconMode::stop() {
     }
     
     // Full WiFi shutdown for clean BLE handoff (per BEST_PRACTICES section 14)
+    // Must stop() recon first since shutdown() kills WiFi out from under it
+    NetworkRecon::stop();
     WiFiUtils::shutdown();
+
+    // Restore NetworkRecon state if it was active before BACON
+    if (reconWasRunning) {
+        NetworkRecon::start();
+    } else if (reconWasPaused) {
+        NetworkRecon::start();
+        NetworkRecon::pause();
+    }
+    reconWasRunning = false;
+    reconWasPaused = false;
     
     // Clear bottom bar overlay
     Display::clearBottomOverlay();

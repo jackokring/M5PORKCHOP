@@ -10,6 +10,7 @@
 
 // Client monitoring constants
 #define MAX_SPECTRUM_CLIENTS 8
+#define MAX_SPECTRUM_NETWORKS 64  // Reduced from 100 for cleaner display
 #define CLIENT_STALE_TIMEOUT_MS 30000  // 30s before client considered gone
 #define VISIBLE_CLIENTS 4              // How many fit on screen
 #define SIGNAL_LOST_TIMEOUT_MS 15000   // 15s no beacon = signal lost
@@ -39,6 +40,38 @@ struct SpectrumNetwork {
     uint8_t clientCount;
 };
 
+// Render snapshot (heap-safe, no vector pointers)
+struct SpectrumRenderNet {
+    uint8_t bssid[6];
+    uint8_t channel;
+    int8_t rssi;
+    wifi_auth_mode_t authmode;
+    bool hasPMF;
+    bool isHidden;
+    float displayFreqMHz;
+};
+
+struct SpectrumRenderSelected {
+    bool valid;
+    uint8_t bssid[6];
+    char ssid[33];
+    uint8_t channel;
+    int8_t rssi;
+    wifi_auth_mode_t authmode;
+    bool hasPMF;
+    bool wasRevealed;
+};
+
+struct SpectrumRenderMonitor {
+    bool valid;
+    uint8_t bssid[6];
+    char ssid[33];
+    uint8_t channel;
+    int8_t rssi;
+    uint8_t clientCount;
+    SpectrumClient clients[MAX_SPECTRUM_CLIENTS];
+};
+
 // MAC comparison helper [P8]
 inline bool macEqual(const uint8_t* a, const uint8_t* b) {
     return memcmp(a, b, 6) == 0;
@@ -62,14 +95,14 @@ public:
     static bool isRunning() { return running; }
     
     // For promiscuous callback - updates network RSSI
-    static void onBeacon(const uint8_t* bssid, uint8_t channel, int8_t rssi, const char* ssid, wifi_auth_mode_t authmode, bool hasPMF, bool isProbeResponse);
+    static void onBeacon(const uint8_t* bssid, uint8_t channel, bool channelTrusted, int8_t rssi, const char* ssid, wifi_auth_mode_t authmode, bool hasPMF, bool isProbeResponse);
     
     // Bottom bar info
     static void getSelectedInfo(char* out, size_t len);
     
     // Client monitoring accessors [P3]
     static bool isMonitoring() { return monitoringNetwork; }
-    static String getMonitoredSSID();
+    static const char* getMonitoredSSID();
     static int getClientCount();
     static uint8_t getMonitoredChannel() { return monitoredChannel; }
     
@@ -77,13 +110,16 @@ private:
     static bool running;
     static std::atomic<bool> busy;   // Guard against callback race (atomic for cross-core visibility)
     static std::vector<SpectrumNetwork> networks;
+    static SpectrumRenderNet renderNets[MAX_SPECTRUM_NETWORKS];
+    static uint16_t renderCount;
+    static SpectrumRenderSelected renderSelected;
+    static SpectrumRenderMonitor renderMonitor;
     static float viewCenterMHz;      // Center of visible spectrum
     static float viewWidthMHz;       // Visible bandwidth
     static int selectedIndex;        // Currently highlighted network
     static uint32_t lastUpdateTime;
     static bool keyWasPressed;
     static uint8_t currentChannel;   // Current hop channel
-    static uint32_t lastHopTime;     // Last channel hop time
     static uint32_t startTime;       // When mode started (for achievement)
     
     // Filter state
@@ -94,7 +130,7 @@ private:
     static char pendingRevealSSID[33];
     
     // Deferred network add (avoid push_back in callback - ESP32 dual-core race)
-    static volatile bool pendingNetworkAdd;
+    static std::atomic<bool> pendingNetworkAdd;  // Atomic for cross-core visibility (WiFi task → main loop)
     static SpectrumNetwork pendingNetwork;
     
     // Client monitoring state [P1] [P2]
@@ -141,11 +177,15 @@ private:
     static void drawSpectrum(M5Canvas& canvas);
     static void drawClientOverlay(M5Canvas& canvas);  // Client list overlay
     static void drawClientDetail(M5Canvas& canvas);   // Client detail popup
-    static void drawGaussianLobe(M5Canvas& canvas, float centerFreqMHz, int8_t rssi, bool filled);
+    static void drawGaussianLobe(M5Canvas& canvas, float centerFreqMHz, int8_t rssi, bool filled, uint16_t activityPps, uint8_t seed);
     static void drawAxis(M5Canvas& canvas);
     static void drawChannelMarkers(M5Canvas& canvas);
     static void drawFilterBar(M5Canvas& canvas);     // Filter indicator bar
     static void drawDialInfo(M5Canvas& canvas);      // Dial mode info bar
+    static void drawNoiseFloor(M5Canvas& canvas);    // Animated noise at baseline
+    static void drawWaterfall(M5Canvas& canvas);     // Historical spectrum waterfall
+    static void updateSpectrumBuffers();             // Populate buffers from network data
+    static void updateWaterfall();                   // Push to waterfall history
     static void pruneStale();            // Remove networks not seen recently
     static void pruneStaleClients();     // Remove clients not seen recently
     static void updateDialChannel();     // Update dial mode tilt-to-tune
@@ -171,7 +211,10 @@ private:
     static bool isVulnerable(wifi_auth_mode_t mode);
     static const char* authModeToShortString(wifi_auth_mode_t mode);
     static bool detectPMF(const uint8_t* payload, uint16_t len);
+    static void detectPMFBits(const uint8_t* payload, uint16_t len, bool& mfpc, bool& mfpr);
     static bool matchesFilter(const SpectrumNetwork& net);  // Check if network passes filter
+    static bool matchesFilterRender(const SpectrumRenderNet& net);
+    static void updateRenderSnapshot();
     
     // Packet callback for visualization (called by NetworkRecon)
     static void promiscuousCallback(const wifi_promiscuous_pkt_t* pkt, wifi_promiscuous_pkt_type_t type);

@@ -22,7 +22,7 @@ public:
 private:
     static bool logEnabled;
     static bool initialized;
-    static String currentLogFile;
+    static char currentLogFile[64];
     
     static void ensureLogFile();
 };

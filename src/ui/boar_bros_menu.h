@@ -7,8 +7,8 @@
 
 struct BroInfo {
     uint64_t bssid;      // BSSID as uint64
-    String bssidStr;     // Formatted BSSID (AA:BB:CC:DD:EE:FF)
-    String ssid;         // SSID if known (from file comment)
+    char bssidStr[18];   // Formatted BSSID (AA:BB:CC:DD:EE:FF)
+    char ssid[33];       // SSID if known (from file comment)
 };
 
 class BoarBrosMenu {

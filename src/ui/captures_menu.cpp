@@ -11,6 +11,8 @@
 #include "../web/wpasec.h"
 #include "../core/config.h"
 #include "../core/sd_layout.h"
+#include "../core/wifi_utils.h"
+#include "../core/heap_health.h"
 
 // Static member initialization
 std::vector<CaptureInfo> CapturesMenu::captures;
@@ -29,6 +31,16 @@ size_t CapturesMenu::scanProgress = 0;
 bool CapturesMenu::wpasecUpdateInProgress = false;
 unsigned long CapturesMenu::lastWpasecUpdateTime = 0;
 size_t CapturesMenu::wpasecUpdateProgress = 0;
+
+// Hint rotation
+uint8_t CapturesMenu::hintIndex = 0;
+const char* const CapturesMenu::HINTS[] = {
+    "FEED YO HASHCAT.",
+    "COLLECTED PAIN. COMPRESSED.",
+    "ENT:DET  S:SYNC  D:NUKE",
+    "MALLOC SAID NAH.",
+    "YOUR LOOT. YOUR PROBLEM."
+};
 
 // WPA-SEC Sync state
 bool CapturesMenu::syncModalActive = false;
@@ -53,6 +65,7 @@ void CapturesMenu::show() {
     selectedIndex = 0;
     scrollOffset = 0;
     keyWasPressed = true;  // Ignore the Enter that selected us from menu
+    hintIndex = esp_random() % HINT_COUNT;
 
     // If scan fails, the captures list will remain empty
     // This is handled by the draw function which shows "No captures found"
@@ -104,11 +117,19 @@ void CapturesMenu::emergencyCleanup() {
 bool CapturesMenu::scanCaptures() {
     // Initialize async scan
     captures.clear();
-    captures.reserve(MAX_CAPTURES);
+    captures.reserve(MAX_CAPTURES);  // Full upfront reserve — no mid-scan reallocations
 
     // Guard: Skip if no SD card available
     if (!Config::isSDAvailable()) {
         Serial.println("[CAPTURES] No SD card available");
+        scanComplete = true;
+        scanInProgress = false;
+        return false;
+    }
+
+    // Guard: Skip SD scan at Warning+ pressure — file ops allocate FAT buffers
+    if (HeapHealth::getPressureLevel() >= HeapPressureLevel::Warning) {
+        Serial.println("[CAPTURES] Scan deferred: heap pressure");
         scanComplete = true;
         scanInProgress = false;
         return false;
@@ -143,29 +164,39 @@ bool CapturesMenu::scanCaptures() {
     return true;
 }
 
+// Helper: check if string of length n is all hex chars
+static bool isAllHex(const char* s, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        char c = s[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f')))
+            return false;
+    }
+    return true;
+}
+
 void CapturesMenu::processAsyncScan() {
     if (!scanInProgress || scanComplete) {
         return;
     }
-    
+
     // Throttle the scan to avoid blocking the UI
     if (millis() - lastScanTime < SCAN_DELAY) {
         return;
     }
-    
+
     lastScanTime = millis();
-    
+
     // Process a chunk of files
     size_t processed = 0;
     while (processed < SCAN_CHUNK_SIZE && !scanComplete) {
         currentFile = scanDir.openNextFile();
-        
+
         if (!currentFile) {
             // No more files, we're done with scanning
             scanComplete = true;
             scanInProgress = false;
             scanDir.close();
-            
+
             // Sort by capture time (newest first)
             std::sort(captures.begin(), captures.end(), [](const CaptureInfo& a, const CaptureInfo& b) {
                 return a.captureTime > b.captureTime;
@@ -181,19 +212,24 @@ void CapturesMenu::processAsyncScan() {
             Serial.printf("[CAPTURES] Async scan complete. Found %d captures\n", captures.size());
             break;
         }
-        
-        String name = currentFile.name();
-        bool isPCAP = name.endsWith(".pcap");
-        bool isPMKID = name.endsWith(".22000") && !name.endsWith("_hs.22000");
-        bool isHS22000 = name.endsWith("_hs.22000");
+
+        // Zero-String scan: use const char* from File directly
+        const char* name = currentFile.name();
+        size_t nameLen = strlen(name);
+
+        bool isPCAP = (nameLen > 5 && strcmp(name + nameLen - 5, ".pcap") == 0);
+        bool isHS22000 = (nameLen > 9 && strcmp(name + nameLen - 9, "_hs.22000") == 0);
+        bool isPMKID = !isHS22000 && (nameLen > 6 && strcmp(name + nameLen - 6, ".22000") == 0);
 
         // Skip PCAP if we have the corresponding _hs.22000 (avoid duplicates).
-        // Prefer showing _hs.22000 because it's hashcat-ready.
         if (isPCAP) {
-            String baseName = name.substring(0, name.indexOf('.'));
-            String hs22kPath = String(SDLayout::handshakesDir()) + "/" + baseName + "_hs.22000";
+            // Build base name: everything before the dot
+            const char* dot = strrchr(name, '.');
+            size_t baseLen = dot ? (size_t)(dot - name) : nameLen;
+            char hs22kPath[80];
+            snprintf(hs22kPath, sizeof(hs22kPath), "%s/%.*s_hs.22000",
+                     SDLayout::handshakesDir(), (int)baseLen, name);
             if (SD.exists(hs22kPath)) {
-                // Close current file and continue to next
                 currentFile.close();
                 processed++;
                 continue;
@@ -202,69 +238,94 @@ void CapturesMenu::processAsyncScan() {
 
         if (isPCAP || isPMKID || isHS22000) {
             CaptureInfo info;
-            info.filename = name;
+            memset(&info, 0, sizeof(info));
+            strncpy(info.filename, name, sizeof(info.filename) - 1);
             info.fileSize = currentFile.size();
             info.captureTime = currentFile.getLastWrite();
-            info.isPMKID = isPMKID;  // Only true for PMKID files
+            info.isPMKID = isPMKID;
 
-            // Extract BSSID from filename (e.g., "64EEB7208286.pcap" or "64EEB7208286_hs.22000")
-            String baseName = name.substring(0, name.indexOf('.'));
-            // Handle _hs suffix for handshake 22000 files
-            if (baseName.endsWith("_hs")) {
-                baseName = baseName.substring(0, baseName.length() - 3);
-            }
-            if (baseName.length() >= 12) {
-                info.bssid = baseName.substring(0, 2) + ":" +
-                             baseName.substring(2, 4) + ":" +
-                             baseName.substring(4, 6) + ":" +
-                             baseName.substring(6, 8) + ":" +
-                             baseName.substring(8, 10) + ":" +
-                             baseName.substring(10, 12);
-            } else {
-                info.bssid = baseName;
+            // Compute base name (strip extension and _hs suffix)
+            const char* dot = strrchr(name, '.');
+            size_t baseLen = dot ? (size_t)(dot - name) : nameLen;
+            if (baseLen > 3 && strncmp(name + baseLen - 3, "_hs", 3) == 0) {
+                baseLen -= 3;
             }
 
-            // Try to get SSID from companion .txt file if it exists. For PMKID we use _pmkid.txt suffix, otherwise .txt
-            String txtPath = isPMKID ?
-                (String(SDLayout::handshakesDir()) + "/" + baseName + "_pmkid.txt") :
-                (String(SDLayout::handshakesDir()) + "/" + baseName + ".txt");
-            if (SD.exists(txtPath)) {
-                File txtFile = SD.open(txtPath, FILE_READ);
-                if (txtFile) {
-                    info.ssid = txtFile.readStringUntil('\n');
-                    info.ssid.trim();
-                    txtFile.close();
+            // Dual-format detection:
+            // Legacy: base name is exactly 12 hex chars (BSSID only)
+            // New format: last 12 chars are hex, preceded by '_' (SSID_BSSID)
+            if (baseLen == 12 && isAllHex(name, 12)) {
+                // Legacy format: BSSID is first 12 chars
+                const char* b = name;
+                snprintf(info.bssid, sizeof(info.bssid),
+                         "%.2s:%.2s:%.2s:%.2s:%.2s:%.2s",
+                         b, b+2, b+4, b+6, b+8, b+10);
+
+                // Try companion .txt for SSID (legacy files)
+                char txtPath[80];
+                if (isPMKID) {
+                    snprintf(txtPath, sizeof(txtPath), "%s/%.12s_pmkid.txt",
+                             SDLayout::handshakesDir(), name);
+                } else {
+                    snprintf(txtPath, sizeof(txtPath), "%s/%.12s.txt",
+                             SDLayout::handshakesDir(), name);
                 }
-            }
-            if (info.ssid.isEmpty()) {
-                info.ssid = "[UNKNOWN]";
+                if (SD.exists(txtPath)) {
+                    File txtFile = SD.open(txtPath, FILE_READ);
+                    if (txtFile) {
+                        char buf[34];
+                        int n = txtFile.readBytesUntil('\n', buf, sizeof(buf) - 1);
+                        buf[n] = '\0';
+                        while (n > 0 && (buf[n-1] == ' ' || buf[n-1] == '\r' || buf[n-1] == '\t')) buf[--n] = '\0';
+                        if (n > 0) {
+                            strncpy(info.ssid, buf, sizeof(info.ssid) - 1);
+                        }
+                        txtFile.close();
+                    }
+                }
+            } else if (baseLen > 13 && name[baseLen - 13] == '_' &&
+                       isAllHex(name + baseLen - 12, 12)) {
+                // New format: SSID_BSSID — extract BSSID from last 12 chars
+                const char* b = name + baseLen - 12;
+                snprintf(info.bssid, sizeof(info.bssid),
+                         "%.2s:%.2s:%.2s:%.2s:%.2s:%.2s",
+                         b, b+2, b+4, b+6, b+8, b+10);
+
+                // Extract SSID from chars before _BSSID
+                size_t ssidLen = baseLen - 13;
+                if (ssidLen > sizeof(info.ssid) - 1) ssidLen = sizeof(info.ssid) - 1;
+                memcpy(info.ssid, name, ssidLen);
+                info.ssid[ssidLen] = '\0';
+            } else {
+                // Unknown format — use full base as BSSID display
+                size_t copyLen = baseLen < sizeof(info.bssid) - 1 ? baseLen : sizeof(info.bssid) - 1;
+                memcpy(info.bssid, name, copyLen);
+                info.bssid[copyLen] = '\0';
             }
 
-            // Default status and password
+            if (info.ssid[0] == '\0') {
+                strncpy(info.ssid, "[UNKNOWN]", sizeof(info.ssid) - 1);
+            }
+
             info.status = CaptureStatus::LOCAL;
-            info.password = "";
 
             captures.push_back(info);
-            
-            // Hard cap at 100 captures to prevent OOM on devices with limited heap
-            if (captures.size() >= 100) {
+
+            if (captures.size() >= MAX_CAPTURES) {
                 scanComplete = true;
                 scanInProgress = false;
                 currentFile.close();
                 scanDir.close();
-                Serial.println("[CAPTURES] Hit 100 capture limit, stopped scan");
+                Serial.println("[CAPTURES] Hit capture limit, stopped scan");
                 break;
             }
         }
 
-        // Close current file and increment counter
         currentFile.close();
         processed++;
         scanProgress++;
-        
-        // Yield periodically to allow other tasks to run
+
         if (processed >= SCAN_CHUNK_SIZE) {
-            // Still more to do, but yield control back to other tasks
             break;
         }
     }
@@ -277,7 +338,7 @@ void CapturesMenu::updateWPASecStatus() {
     char normalized[13] = {0};
     for (auto& cap : captures) {
         // Normalize BSSID for lookup (remove colons)
-        WPASec::normalizeBSSID_Char(cap.bssid.c_str(), normalized, sizeof(normalized));
+        WPASec::normalizeBSSID_Char(cap.bssid, normalized, sizeof(normalized));
         if (normalized[0] == '\0') {
             cap.status = CaptureStatus::LOCAL;
             continue;
@@ -285,7 +346,8 @@ void CapturesMenu::updateWPASecStatus() {
         
         if (WPASec::isCracked(normalized)) {
             cap.status = CaptureStatus::CRACKED;
-            cap.password = WPASec::getPassword(normalized);
+            strncpy(cap.password, WPASec::getPassword(normalized), sizeof(cap.password) - 1);
+            cap.password[sizeof(cap.password) - 1] = '\0';
         } else if (WPASec::isUploaded(normalized)) {
             cap.status = CaptureStatus::UPLOADED;
         } else {
@@ -314,12 +376,13 @@ void CapturesMenu::processAsyncWPASecUpdate() {
         
         // Normalize BSSID for lookup (remove colons)
         char normalized[13] = {0};
-        WPASec::normalizeBSSID_Char(cap.bssid.c_str(), normalized, sizeof(normalized));
+        WPASec::normalizeBSSID_Char(cap.bssid, normalized, sizeof(normalized));
         
         if (normalized[0] != '\0') {
             if (WPASec::isCracked(normalized)) {
                 cap.status = CaptureStatus::CRACKED;
-                cap.password = WPASec::getPassword(normalized);
+                strncpy(cap.password, WPASec::getPassword(normalized), sizeof(cap.password) - 1);
+                cap.password[sizeof(cap.password) - 1] = '\0';
             } else if (WPASec::isUploaded(normalized)) {
                 cap.status = CaptureStatus::UPLOADED;
             } else {
@@ -421,8 +484,9 @@ void CapturesMenu::handleInput() {
         return;  // Block other inputs while detail view is open
     }
     
-    // Navigation with ; (up) and . (down)
+    // Navigation with ; (up) and . (down) — also rotates hints
     if (M5Cardputer.Keyboard.isKeyPressed(';')) {
+        hintIndex = (hintIndex + 1) % HINT_COUNT;
         if (selectedIndex > 0) {
             selectedIndex--;
             if (selectedIndex < scrollOffset) {
@@ -430,8 +494,9 @@ void CapturesMenu::handleInput() {
             }
         }
     }
-    
+
     if (M5Cardputer.Keyboard.isKeyPressed('.')) {
+        hintIndex = (hintIndex + 1) % HINT_COUNT;
         if (!captures.empty() && selectedIndex < captures.size() - 1) {
             selectedIndex++;
             if (selectedIndex >= scrollOffset + VISIBLE_ITEMS) {
@@ -485,6 +550,17 @@ void CapturesMenu::formatTime(char* out, size_t len, time_t t) {
     strftime(out, len, "%b %d %H:%M", timeinfo);
 }
 
+static void formatSize(char* out, size_t len, uint32_t bytes) {
+    if (!out || len == 0) return;
+    if (bytes < 1024) {
+        snprintf(out, len, "%uB", (unsigned)bytes);
+    } else if (bytes < 1024 * 1024) {
+        snprintf(out, len, "%uKB", (unsigned)(bytes / 1024));
+    } else {
+        snprintf(out, len, "%uMB", (unsigned)(bytes / (1024 * 1024)));
+    }
+}
+
 void CapturesMenu::draw(M5Canvas& canvas) {
     if (!active) return;
 
@@ -502,7 +578,6 @@ void CapturesMenu::draw(M5Canvas& canvas) {
     }
 
     // Draw sync modal FIRST - takes precedence over empty captures message
-    // (captures are cleared for heap during sync, but modal should still show)
     if (syncModalActive) {
         drawSyncModal(canvas);
         return;
@@ -518,43 +593,38 @@ void CapturesMenu::draw(M5Canvas& canvas) {
         return;
     }
 
-    // Summary line
+    // Summary stats line
     uint16_t total = captures.size();
-    uint16_t hsCount = 0;
-    uint16_t pmkCount = 0;
-    uint16_t cracked = 0;
-    uint16_t uploaded = 0;
+    uint16_t cracked = 0, uploaded = 0, local = 0;
     for (const auto& cap : captures) {
-        if (cap.isPMKID) pmkCount++;
-        else hsCount++;
         if (cap.status == CaptureStatus::CRACKED) cracked++;
         else if (cap.status == CaptureStatus::UPLOADED) uploaded++;
+        else local++;
     }
     char summary[64];
-    snprintf(summary, sizeof(summary), "CAP %u HS %u PMK %u CRK %u UP %u",
-             (unsigned)total, (unsigned)hsCount, (unsigned)pmkCount,
-             (unsigned)cracked, (unsigned)uploaded);
+    snprintf(summary, sizeof(summary), "LOOT %u OK %u UP %u LOC %u",
+             (unsigned)total, (unsigned)cracked, (unsigned)uploaded, (unsigned)local);
     canvas.setCursor(4, 2);
     canvas.print(summary);
 
-    // Header row
+    // Column headers
     canvas.setCursor(4, 12);
     canvas.print("SSID");
-    canvas.setCursor(105, 12);
+    canvas.setCursor(120, 12);
     canvas.print("ST");
-    canvas.setCursor(135, 12);
-    canvas.print("TIME");
-    canvas.setCursor(210, 12);
+    canvas.setCursor(150, 12);
+    canvas.print("TYPE");
+    canvas.setCursor(190, 12);
     canvas.print("SIZE");
 
-    // Draw captures list
+    // Capture list
     int y = 22;
     int lineHeight = 16;
 
     for (uint8_t i = scrollOffset; i < captures.size() && i < scrollOffset + VISIBLE_ITEMS; i++) {
         const CaptureInfo& cap = captures[i];
 
-        // Highlight selected
+        // Inverted selection bar
         if (i == selectedIndex) {
             canvas.fillRect(0, y - 1, canvas.width(), lineHeight, COLOR_FG);
             canvas.setTextColor(COLOR_BG);
@@ -562,29 +632,26 @@ void CapturesMenu::draw(M5Canvas& canvas) {
             canvas.setTextColor(COLOR_FG);
         }
 
-        // SSID (truncated if needed) - show [P] prefix for PMKID, status indicator
+        // SSID column — uppercase, max 17 chars, truncate with ..
         canvas.setCursor(4, y);
-        char ssidBuf[24];
+        char ssidBuf[20];
         size_t pos = 0;
-        if (cap.isPMKID && sizeof(ssidBuf) > 4) {
-            ssidBuf[pos++] = '[';
-            ssidBuf[pos++] = 'P';
-            ssidBuf[pos++] = ']';
-        }
-        const char* ssidSrc = cap.ssid.c_str();
-        while (*ssidSrc && pos + 1 < sizeof(ssidBuf)) {
+        const char* ssidSrc = cap.ssid;
+        while (*ssidSrc && pos < 17) {
             ssidBuf[pos++] = (char)toupper((unsigned char)*ssidSrc++);
         }
         ssidBuf[pos] = '\0';
-        if (pos > 16 && sizeof(ssidBuf) > 16) {
-            ssidBuf[14] = '.';
-            ssidBuf[15] = '.';
-            ssidBuf[16] = '\0';
+        if (*ssidSrc) {
+            // Truncated — add ..
+            if (pos >= 2) {
+                ssidBuf[pos - 2] = '.';
+                ssidBuf[pos - 1] = '.';
+            }
         }
         canvas.print(ssidBuf);
 
-        // Status indicator
-        canvas.setCursor(105, y);
+        // Status column
+        canvas.setCursor(120, y);
         if (cap.status == CaptureStatus::CRACKED) {
             canvas.print("[OK]");
         } else if (cap.status == CaptureStatus::UPLOADED) {
@@ -593,28 +660,27 @@ void CapturesMenu::draw(M5Canvas& canvas) {
             canvas.print("[--]");
         }
 
-        // Date/time
-        canvas.setCursor(135, y);
-        char timeBuf[20];
-        formatTime(timeBuf, sizeof(timeBuf), cap.captureTime);
-        canvas.print(timeBuf);
+        // Type column
+        canvas.setCursor(150, y);
+        canvas.print(cap.isPMKID ? "PM" : "HS");
 
-        // File size (KB)
-        canvas.setCursor(210, y);
-        canvas.printf("%dK", cap.fileSize / 1024);
+        // Size column
+        canvas.setCursor(190, y);
+        char sizeBuf[12];
+        formatSize(sizeBuf, sizeof(sizeBuf), cap.fileSize);
+        canvas.print(sizeBuf);
 
         y += lineHeight;
     }
 
     // Scroll indicators
+    canvas.setTextColor(COLOR_FG);
     if (scrollOffset > 0) {
         canvas.setCursor(canvas.width() - 10, 22);
-        canvas.setTextColor(COLOR_FG);
         canvas.print("^");
     }
     if (scrollOffset + VISIBLE_ITEMS < captures.size()) {
         canvas.setCursor(canvas.width() - 10, 22 + (VISIBLE_ITEMS - 1) * lineHeight);
-        canvas.setTextColor(COLOR_FG);
         canvas.print("v");
     }
 
@@ -627,13 +693,11 @@ void CapturesMenu::draw(M5Canvas& canvas) {
     if (detailViewActive) {
         drawDetailView(canvas);
     }
-    
+
     // Draw sync modal if active
     if (syncModalActive) {
         drawSyncModal(canvas);
     }
-
-    // Bottom bar controls via getSelectedBSSID()
 }
 
 void CapturesMenu::drawNukeConfirm(M5Canvas& canvas) {
@@ -676,33 +740,37 @@ void CapturesMenu::nukeLoot() {
         return;
     }
     
-    // Collect filenames first (can't delete while iterating)
-    std::vector<String> files;
-    File file = dir.openNextFile();
-    uint8_t yieldCounter = 0;
-    while (file) {
-        const char* base = file.name();
-        int slash = String(base).lastIndexOf('/');
-        String name = (slash >= 0) ? String(base).substring(slash + 1) : String(base);
-        files.push_back(String(handshakesDir) + "/" + name);
-        // Always close file handle to avoid exhausting SD file descriptors
-        file.close();
-        file = dir.openNextFile();
-        
-        // Yield every 10 files to prevent WDT timeout
-        if (++yieldCounter >= 10) {
-            yieldCounter = 0;
-            yield();
-        }
-    }
-    dir.close();
-    
-    // Delete all files
+    // Batch collect + delete to avoid vector<String> fragmentation
+    // Can't delete while iterating SD, so collect batches of 20
     int deleted = 0;
-    for (const auto& path : files) {
-        if (SD.remove(path)) {
-            deleted++;
+    bool moreFiles = true;
+    while (moreFiles) {
+        char paths[20][80];
+        uint8_t batchCount = 0;
+
+        dir = SD.open(handshakesDir);
+        if (!dir) break;
+
+        File file = dir.openNextFile();
+        while (file && batchCount < 20) {
+            const char* base = file.name();
+            const char* slash = strrchr(base, '/');
+            const char* name = slash ? slash + 1 : base;
+            snprintf(paths[batchCount], sizeof(paths[0]), "%s/%s", handshakesDir, name);
+            batchCount++;
+            file.close();
+            file = dir.openNextFile();
         }
+        if (file) file.close();
+        dir.close();
+
+        if (batchCount == 0) break;
+        moreFiles = (batchCount == 20);  // Might have more
+
+        for (uint8_t i = 0; i < batchCount; i++) {
+            if (SD.remove(paths[i])) deleted++;
+        }
+        yield();
     }
     
     Serial.printf("[CAPTURES] Nuked %d files\n", deleted);
@@ -714,79 +782,210 @@ void CapturesMenu::nukeLoot() {
 }
 
 const char* CapturesMenu::getSelectedBSSID() {
-    return "ENT=DET S=SYNC D=NUKE";
+    return HINTS[hintIndex];
 }
+// HS detail parsing for .22000 files
+struct HSDetail {
+    uint8_t type;       // 1=PMKID, 2=4-way
+    uint8_t msgPair;
+    char anonce[17];    // first 16 hex of ANonce + null
+    char clientMac[18]; // AA:BB:CC:DD:EE:FF + null
+    char apMac[18];
+    bool valid;
+};
+
+static bool parseHS22000Line(const char* line, HSDetail* out) {
+    if (!line || !out) return false;
+    memset(out, 0, sizeof(HSDetail));
+
+    // WPA*TYPE*field2*MAC_AP*MAC_CLIENT*ESSID*ANONCE*...
+    if (strncmp(line, "WPA*", 4) != 0) return false;
+
+    // Tokenize on '*' using a stack copy
+    char buf[512];
+    strncpy(buf, line, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    char* fields[10] = {};
+    int fieldCount = 0;
+    char* p = buf;
+    fields[fieldCount++] = p;
+    while (*p && fieldCount < 10) {
+        if (*p == '*') {
+            *p = '\0';
+            fields[fieldCount++] = p + 1;
+        }
+        p++;
+    }
+
+    if (fieldCount < 5) return false;
+
+    // fields[0]="WPA", fields[1]=type, fields[2]=MIC/PMKID, fields[3]=MAC_AP,
+    // fields[4]=MAC_CLIENT, fields[5]=ESSID, fields[6]=ANONCE, ...
+    out->type = (uint8_t)atoi(fields[1]);
+
+    // MAC_AP -> formatted
+    const char* ap = fields[3];
+    if (strlen(ap) >= 12) {
+        snprintf(out->apMac, sizeof(out->apMac), "%.2s:%.2s:%.2s:%.2s:%.2s:%.2s",
+                 ap, ap+2, ap+4, ap+6, ap+8, ap+10);
+    }
+
+    // MAC_CLIENT -> formatted
+    const char* cl = fields[4];
+    if (strlen(cl) >= 12) {
+        snprintf(out->clientMac, sizeof(out->clientMac), "%.2s:%.2s:%.2s:%.2s:%.2s:%.2s",
+                 cl, cl+2, cl+4, cl+6, cl+8, cl+10);
+    }
+
+    // ANonce (field 6 for type 02)
+    if (out->type == 2 && fieldCount > 6 && strlen(fields[6]) >= 16) {
+        memcpy(out->anonce, fields[6], 16);
+        out->anonce[16] = '\0';
+    }
+
+    // Message pair is field index 8 (9th field) for type 02
+    // Format: WPA*02*MIC*MAC_AP*MAC_CLIENT*ESSID*ANONCE*EAPOL*MESSAGEPAIR
+    if (out->type == 2 && fieldCount >= 9 && fields[8][0] != '\0') {
+        out->msgPair = (uint8_t)strtol(fields[8], nullptr, 16);
+    }
+
+    out->valid = true;
+    return true;
+}
+
 void CapturesMenu::drawDetailView(M5Canvas& canvas) {
     if (selectedIndex >= captures.size()) return;
-    
+
     const CaptureInfo& cap = captures[selectedIndex];
-    
-    // Modal box dimensions
+
+    // Modal box dimensions (shrunk from 85 to 72)
     const int boxW = 220;
-    const int boxH = 85;
+    const int boxH = 72;
     const int boxX = (canvas.width() - boxW) / 2;
     const int boxY = (canvas.height() - boxH) / 2 - 5;
-    
+
     // Black border then pink fill
     canvas.fillRoundRect(boxX - 2, boxY - 2, boxW + 4, boxH + 4, 8, COLOR_BG);
     canvas.fillRoundRect(boxX, boxY, boxW, boxH, 8, COLOR_FG);
-    
+
     // Black text on pink background
     canvas.setTextColor(COLOR_BG, COLOR_FG);
     canvas.setTextDatum(top_center);
     canvas.setTextSize(1);
-    
+
     int centerX = canvas.width() / 2;
-    
+
     // SSID
     char ssidLine[24];
     size_t ssidPos = 0;
-    const char* ssidSrc = cap.ssid.c_str();
+    const char* ssidSrc = cap.ssid;
     while (*ssidSrc && ssidPos + 1 < sizeof(ssidLine)) {
         ssidLine[ssidPos++] = (char)toupper((unsigned char)*ssidSrc++);
     }
     ssidLine[ssidPos] = '\0';
-    if (ssidPos > 16 && sizeof(ssidLine) > 16) {
-        ssidLine[14] = '.';
-        ssidLine[15] = '.';
-        ssidLine[16] = '\0';
+    if (ssidPos > 20) {
+        ssidLine[18] = '.';
+        ssidLine[19] = '.';
+        ssidLine[20] = '\0';
     }
-    canvas.drawString(ssidLine, centerX, boxY + 6);
-    
-    // BSSID (already uppercase from storage)
-    canvas.drawString(cap.bssid.c_str(), centerX, boxY + 20);
-    
-    // Status and password
+    canvas.drawString(ssidLine, centerX, boxY + 4);
+
+    // BSSID
+    canvas.drawString(cap.bssid, centerX, boxY + 16);
+
+    // Cracked captures: show password (more useful than HS details)
     if (cap.status == CaptureStatus::CRACKED) {
-        canvas.drawString("** CR4CK3D **", centerX, boxY + 38);
-        
-        // Password in larger text
+        canvas.drawString("** CR4CK3D **", centerX, boxY + 32);
         char pwLine[24];
-        const char* pwSrc = cap.password.c_str();
-        size_t pwLen = strlen(pwSrc);
-        if (pwLen > 20 && sizeof(pwLine) > 20) {
-            size_t keep = 18;
-            memcpy(pwLine, pwSrc, keep);
-            pwLine[keep] = '.';
-            pwLine[keep + 1] = '.';
-            pwLine[keep + 2] = '\0';
+        size_t pwLen = strlen(cap.password);
+        if (pwLen > 20) {
+            memcpy(pwLine, cap.password, 18);
+            pwLine[18] = '.';
+            pwLine[19] = '.';
+            pwLine[20] = '\0';
         } else {
-            strncpy(pwLine, pwSrc, sizeof(pwLine) - 1);
+            strncpy(pwLine, cap.password, sizeof(pwLine) - 1);
             pwLine[sizeof(pwLine) - 1] = '\0';
         }
-        canvas.drawString(pwLine, centerX, boxY + 54);
-    } else if (cap.status == CaptureStatus::UPLOADED) {
-        canvas.drawString("UPLOADED - PENDING CRACK", centerX, boxY + 38);
-        canvas.drawString("PRESS [S] TO CHECK STATUS", centerX, boxY + 54);
-    } else if (cap.isPMKID) {
-        canvas.drawString("PMKID - LOCAL CRACK ONLY", centerX, boxY + 38);
-        canvas.drawString("hashcat -m 22000", centerX, boxY + 54);
-    } else {
-        canvas.drawString("NOT UPLOADED YET", centerX, boxY + 38);
-        canvas.drawString("PRESS [S] TO SYNC", centerX, boxY + 54);
+        canvas.drawString(pwLine, centerX, boxY + 48);
+        return;
     }
-    
-    canvas.drawString("[ENTER] CLOSE", centerX, boxY + 72);
+
+    // Try to parse .22000 file for HS details
+    // Build path to the .22000 file
+    char hsPath[80];
+    // Get base from filename
+    const char* dot = strrchr(cap.filename, '.');
+    size_t baseLen = dot ? (size_t)(dot - cap.filename) : strlen(cap.filename);
+    // Strip _hs if present
+    bool hasHsSuffix = (baseLen > 3 && strncmp(cap.filename + baseLen - 3, "_hs", 3) == 0);
+
+    if (cap.isPMKID) {
+        // PMKID: filename is already .22000
+        snprintf(hsPath, sizeof(hsPath), "%s/%s", SDLayout::handshakesDir(), cap.filename);
+    } else if (hasHsSuffix) {
+        // _hs.22000 file
+        snprintf(hsPath, sizeof(hsPath), "%s/%s", SDLayout::handshakesDir(), cap.filename);
+    } else {
+        // .pcap — try corresponding _hs.22000
+        snprintf(hsPath, sizeof(hsPath), "%s/%.*s_hs.22000",
+                 SDLayout::handshakesDir(), (int)baseLen, cap.filename);
+    }
+
+    // Cache: only parse once per detail view open
+    static HSDetail cachedDetail;
+    static char cachedFilename[48] = "";
+    if (strcmp(cachedFilename, cap.filename) != 0) {
+        memset(&cachedDetail, 0, sizeof(cachedDetail));
+        strncpy(cachedFilename, cap.filename, sizeof(cachedFilename) - 1);
+
+        if (SD.exists(hsPath)) {
+            File f = SD.open(hsPath, FILE_READ);
+            if (f) {
+                char lineBuf[512];
+                int n = f.readBytesUntil('\n', lineBuf, sizeof(lineBuf) - 1);
+                lineBuf[n] = '\0';
+                f.close();
+                parseHS22000Line(lineBuf, &cachedDetail);
+            }
+        }
+    }
+
+    if (cachedDetail.valid) {
+        if (cachedDetail.type == 2) {
+            // 4-way handshake — msgPair 0x00=M1+M2, 0x02=M2+M3
+            char typeLine[24];
+            snprintf(typeLine, sizeof(typeLine), "4-WAY HS (%s)",
+                     cachedDetail.msgPair == 0x02 ? "M2+M3" : "M1+M2");
+            canvas.drawString(typeLine, centerX, boxY + 30);
+            char anLine[24];
+            snprintf(anLine, sizeof(anLine), "AN: %s", cachedDetail.anonce);
+            canvas.drawString(anLine, centerX, boxY + 42);
+            char clLine[24];
+            snprintf(clLine, sizeof(clLine), "CL: %s", cachedDetail.clientMac);
+            canvas.drawString(clLine, centerX, boxY + 54);
+        } else if (cachedDetail.type == 1) {
+            // PMKID
+            canvas.drawString("PMKID CAPTURE", centerX, boxY + 30);
+            char clLine[24];
+            snprintf(clLine, sizeof(clLine), "CL: %s", cachedDetail.clientMac);
+            canvas.drawString(clLine, centerX, boxY + 42);
+            canvas.drawString("hashcat -m 22000", centerX, boxY + 54);
+        }
+    } else {
+        // Fallback if no .22000 parseable
+        if (cap.status == CaptureStatus::UPLOADED) {
+            canvas.drawString("UPLOADED - PENDING CRACK", centerX, boxY + 34);
+            canvas.drawString("PRESS [S] TO CHECK", centerX, boxY + 50);
+        } else if (cap.isPMKID) {
+            canvas.drawString("PMKID - LOCAL CRACK ONLY", centerX, boxY + 34);
+            canvas.drawString("hashcat -m 22000", centerX, boxY + 50);
+        } else {
+            canvas.drawString("NOT UPLOADED YET", centerX, boxY + 34);
+            canvas.drawString("PRESS [S] TO SYNC", centerX, boxY + 50);
+        }
+    }
 }
 
 // ============================================================================
@@ -826,8 +1025,8 @@ bool CapturesMenu::connectToWiFi() {
     
     if (WiFi.status() != WL_CONNECTED) {
         strncpy(syncError, "WIFI CONNECT FAILED", sizeof(syncError) - 1);
-        WiFi.disconnect(true);
-        WiFi.mode(WIFI_OFF);
+        // Keep driver alive to avoid esp_wifi_init 257 on fragmented heap.
+        WiFiUtils::shutdown();
         return false;
     }
     
@@ -836,8 +1035,8 @@ bool CapturesMenu::connectToWiFi() {
 }
 
 void CapturesMenu::disconnectWiFi() {
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_OFF);
+    // Keep driver alive to avoid esp_wifi_init 257 on fragmented heap.
+    WiFiUtils::shutdown();
     Serial.println("[CAPTURES] WiFi disconnected");
 }
 
@@ -900,13 +1099,8 @@ void CapturesMenu::processSyncState() {
             
         case SyncState::FREEING_MEMORY:
             strncpy(syncStatusText, "PREPARING...", sizeof(syncStatusText) - 1);
-            // Check heap
-            if (!WPASec::canSync()) {
-                strncpy(syncError, "LOW HEAP", sizeof(syncError) - 1);
-                syncState = SyncState::ERROR;
-            } else {
-                syncState = SyncState::UPLOADING;
-            }
+            // Defer heap gating to WPASec::syncCaptures() so conditioning can run.
+            syncState = SyncState::UPLOADING;
             break;
             
         case SyncState::UPLOADING:

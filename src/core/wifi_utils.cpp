@@ -8,6 +8,8 @@
 #include <time.h>
 #include <NimBLEDevice.h>  // For BLE deinit during heap conditioning
 #include "heap_health.h"
+#include "heap_policy.h"
+#include "heap_gates.h"
 
 namespace WiFiUtils {
 
@@ -18,6 +20,7 @@ static size_t tlsReserveSize = 0;
 static bool tlsReserveReleased = false;
 static SemaphoreHandle_t timeSyncMutex = nullptr;
 static uint32_t lastTimeSyncMs = 0;
+static bool timeSyncedThisBoot = false;
 
 // Initialize all mutexes safely during setup
 static bool initialized = false;
@@ -52,25 +55,8 @@ static void ensureNvsReady() {
 }
 
 void stopPromiscuous() {
-    // #region agent log - HEAP INSTRUMENTATION
-    Serial.printf("[WIFI-HEAP] stopPromiscuous() ENTRY: free=%u largest=%u\n",
-                  ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-    // #endregion
-    
-    // Promiscuous must be off before switching modes / reconnecting
     esp_wifi_set_promiscuous(false);
-    
-    // #region agent log
-    Serial.printf("[WIFI-HEAP] After esp_wifi_set_promiscuous(false): free=%u largest=%u\n",
-                  ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-    // #endregion
-    
     esp_wifi_set_promiscuous_rx_cb(nullptr);
-    
-    // #region agent log
-    Serial.printf("[WIFI-HEAP] stopPromiscuous() EXIT: free=%u largest=%u\n",
-                  ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-    // #endregion
 }
 
 void lockTls() {
@@ -217,6 +203,43 @@ bool ensureTimeSynced(uint32_t timeoutMs, bool force) {
     return isTimeValid();
 }
 
+TimeSyncStatus maybeSyncTimeForFileTransfer() {
+    // Respect one successful sync per boot.
+    if (timeSyncedThisBoot && isTimeValid()) {
+        return TimeSyncStatus::SKIP_ALREADY_SYNCED;
+    }
+
+    if (WiFi.status() != WL_CONNECTED) {
+        return TimeSyncStatus::SKIP_NOT_CONNECTED;
+    }
+
+    int rssi = WiFi.RSSI();
+    if (rssi < HeapPolicy::kNtpRssiMinDbm) {
+        return TimeSyncStatus::SKIP_LOW_RSSI;
+    }
+
+    HeapGates::GateStatus gate = HeapGates::checkGate(
+        HeapPolicy::kNtpMinFreeHeap,
+        HeapPolicy::kNtpMinContig);
+    if (gate.failure != HeapGates::TlsGateFailure::None) {
+        return TimeSyncStatus::SKIP_LOW_HEAP;
+    }
+
+    uint32_t now = millis();
+    if (lastTimeSyncMs != 0 &&
+        (now - lastTimeSyncMs) < HeapPolicy::kNtpRetryCooldownMs) {
+        return TimeSyncStatus::SKIP_ALREADY_SYNCED;
+    }
+
+    bool ok = ensureTimeSynced(HeapPolicy::kNtpTimeoutMs, false);
+    lastTimeSyncMs = now;
+    if (ok) {
+        timeSyncedThisBoot = true;
+        return TimeSyncStatus::OK;
+    }
+    return TimeSyncStatus::FAIL_TIMEOUT;
+}
+
 void hardReset() {
     stopPromiscuous();
 
@@ -235,48 +258,19 @@ void hardReset() {
     // wifioff=true causes driver teardown ? RX buffer allocation failure later
     WiFi.disconnect(false, true);
 
-    delay(80);
+    delay(HeapPolicy::kWiFiShutdownDelayMs);
     ensureNvsReady();
 }
 
 void shutdown() {
-    // #region agent log - HEAP INSTRUMENTATION
-    Serial.printf("[WIFI-HEAP] shutdown() ENTRY: free=%u largest=%u\n",
-                  ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-    // #endregion
-    
     stopPromiscuous();
-    
-    // #region agent log
-    Serial.printf("[WIFI-HEAP] After stopPromiscuous(): free=%u largest=%u\n",
-                  ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-    // #endregion
 
     // Soft shutdown (no driver teardown)
     WiFi.persistent(false);
-
-    // Same fix here: never power off WiFi driver
     WiFi.disconnect(false, true);
-    
-    // #region agent log
-    Serial.printf("[WIFI-HEAP] After WiFi.disconnect(): free=%u largest=%u\n",
-                  ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-    // #endregion
-
-    // Keep STA mode (do not go WIFI_OFF)
     WiFi.mode(WIFI_STA);
-    
-    // #region agent log
-    Serial.printf("[WIFI-HEAP] After WiFi.mode(STA): free=%u largest=%u\n",
-                  ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-    // #endregion
 
-    delay(80);
-    
-    // #region agent log
-    Serial.printf("[WIFI-HEAP] shutdown() EXIT (after 80ms delay): free=%u largest=%u\n",
-                  ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-    // #endregion
+    delay(HeapPolicy::kWiFiShutdownDelayMs);
 }
 
 size_t conditionHeapForTLS() {
@@ -299,18 +293,18 @@ size_t conditionHeapForTLS() {
         NimBLEScan* pScan = NimBLEDevice::getScan();
         if (pScan && pScan->isScanning()) {
             pScan->stop();
-            delay(50);
+            delay(HeapPolicy::kBleStopDelayMs);
         }
         
         NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
         if (pAdv && pAdv->isAdvertising()) {
             pAdv->stop();
-            delay(50);
+            delay(HeapPolicy::kBleStopDelayMs);
         }
         
         // Deinit BLE completely (clearAll=true to reset all state)
         NimBLEDevice::deinit(true);
-        delay(100);  // Give BLE stack time to fully shut down
+        delay(HeapPolicy::kBleDeinitDelayMs);  // Give BLE stack time to fully shut down
         
         Serial.printf("[HEAP] BLE deinit complete: free=%u largest=%u\n",
                       ESP.getFreeHeap(), 
@@ -328,7 +322,9 @@ size_t conditionHeapForTLS() {
     // CRITICAL: Must set promiscuous callback and filter like OINK does!
     // The driver only reorganizes when actually receiving packets.
     
-    Serial.println("[HEAP] Phase 2: WiFi promiscuous brewing (3s)...");
+    const uint32_t dwellMs = HeapPolicy::kConditioningDwellMs;
+    Serial.printf("[HEAP] Phase 2: WiFi promiscuous brewing (%ums)...\n",
+                  (unsigned)dwellMs);
     uint32_t brewStart = millis();
     brewPacketCount = 0;  // Reset packet counter
     
@@ -336,14 +332,14 @@ size_t conditionHeapForTLS() {
     WiFi.persistent(false);
     WiFi.setSleep(false);
     WiFi.mode(WIFI_STA);
-    delay(50);
+    delay(HeapPolicy::kWiFiModeDelayMs);
     
     Serial.printf("[HEAP] After WiFi.mode(STA): free=%u largest=%u\n",
                   ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     
     // Step 2: Enable promiscuous mode WITH CALLBACK (like OINK does!)
     WiFi.disconnect();
-    delay(50);
+    delay(HeapPolicy::kWiFiDisconnectDelayMs);
     esp_wifi_set_promiscuous_rx_cb(brewPromiscuousCallback);  // ← Critical: set callback!
     esp_wifi_set_promiscuous_filter(nullptr);                  // ← Critical: receive all packets!
     esp_wifi_set_promiscuous(true);
@@ -353,26 +349,40 @@ size_t conditionHeapForTLS() {
                   ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     
     // Step 3: Dwell time with channel hopping - THIS IS THE KEY
-    // The WiFi driver's internal task needs time to reorganize buffers
-    // Channel hopping ensures we receive packets on multiple channels
+    // WHY THIS WORKS (TLSF allocator theory):
+    // The ESP-IDF WiFi task allocates temporary RX/TX buffers per-packet from the
+    // same TLSF heap pool. Each alloc/free cycle triggers TLSF's O(1) immediate
+    // coalescing — adjacent freed blocks merge automatically (Masmano et al. 2004).
+    // Channel hopping ensures packets arrive on each channel, driving the WiFi
+    // task's internal alloc/free churn. After 2-3 seconds, this churn consolidates
+    // scattered free blocks near WiFi driver allocations into larger contiguous
+    // regions. The net effect is that free blocks adjacent to the WiFi driver's
+    // permanent buffers coalesce, recovering contiguous space for TLS (35KB+).
+    // See heap_research.md for Robson bounds proving this is necessary.
     const uint8_t channels[] = {1, 6, 11, 2, 7, 12, 3, 8, 13, 4, 9, 5, 10};
-    for (int i = 0; i < 30; i++) {  // 30 iterations × 100ms = 3 seconds
+    const uint32_t stepMs = HeapPolicy::kConditioningStepMs;
+    uint32_t steps = (dwellMs + stepMs - 1) / stepMs;
+    if (steps < 1) steps = 1;
+    for (uint32_t i = 0; i < steps; i++) {
         esp_wifi_set_channel(channels[i % 13], WIFI_SECOND_CHAN_NONE);
-        delay(100);
+        delay(stepMs);
         yield();  // Let background tasks run
         
         // Check if heap has improved (early exit if already good)
         size_t currentLargest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-        if (i > 10 && currentLargest > 50000) {
+        uint32_t elapsedMs = (i + 1) * stepMs;
+        if (elapsedMs > HeapPolicy::kConditioningWarmupMs &&
+            currentLargest > HeapPolicy::kHeapStableThreshold) {
             Serial.printf("[HEAP] Early exit at %dms - heap stabilized (pkts=%u)\n", 
-                          (i + 1) * 100, brewPacketCount);
+                          (int)elapsedMs, brewPacketCount);
             break;
         }
         
         // Log progress every second
-        if ((i + 1) % 10 == 0) {
+        if (HeapPolicy::kConditioningLogIntervalMs > 0 &&
+            (elapsedMs % HeapPolicy::kConditioningLogIntervalMs) == 0) {
             Serial.printf("[HEAP] Brew %ds: free=%u largest=%u pkts=%u\n",
-                          (i + 1) / 10,
+                          (unsigned)(elapsedMs / 1000),
                           ESP.getFreeHeap(), currentLargest, brewPacketCount);
         }
     }
@@ -386,14 +396,14 @@ size_t conditionHeapForTLS() {
     esp_wifi_set_promiscuous_rx_cb(nullptr);
     WiFi.disconnect(false, true);
     WiFi.mode(WIFI_STA);
-    delay(80);
+    delay(HeapPolicy::kWiFiShutdownDelayMs);
     
     Serial.printf("[HEAP] Brew complete (%ums): free=%u largest=%u\n",
                   millis() - brewStart,
                   ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     
     // Final consolidation delay
-    delay(50);
+    delay(HeapPolicy::kConditioningFinalDelayMs);
     yield();
     
     size_t finalLargest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
@@ -408,6 +418,13 @@ size_t conditionHeapForTLS() {
     return finalLargest;
 }
 
+// Configurable heap conditioning via WiFi promiscuous mode churn.
+// Exploits TLSF's immediate coalescing property: the WiFi task's
+// internal alloc/free cycles during packet processing cause adjacent
+// free blocks to merge, recovering contiguous heap space.
+// BLE cleanup reclaims 20-30KB (NimBLE internal RAM buffers).
+// The delay() calls after BLE deinit give FreeRTOS idle task time
+// to run deferred cleanup callbacks that free BLE memory.
 size_t brewHeap(uint32_t dwellMs, bool includeBleCleanup) {
     size_t initialLargest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
     size_t initialFree = ESP.getFreeHeap();
@@ -419,44 +436,56 @@ size_t brewHeap(uint32_t dwellMs, bool includeBleCleanup) {
         NimBLEScan* pScan = NimBLEDevice::getScan();
         if (pScan && pScan->isScanning()) {
             pScan->stop();
-            delay(50);
+            delay(HeapPolicy::kBleStopDelayMs);
         }
         NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
         if (pAdv && pAdv->isAdvertising()) {
             pAdv->stop();
-            delay(50);
+            delay(HeapPolicy::kBleStopDelayMs);
         }
         NimBLEDevice::deinit(true);
-        delay(100);
+        delay(HeapPolicy::kBleDeinitDelayMs);
     }
 
     brewPacketCount = 0;
     WiFi.persistent(false);
     WiFi.setSleep(false);
     WiFi.mode(WIFI_STA);
-    delay(50);
+    delay(HeapPolicy::kWiFiModeDelayMs);
 
     WiFi.disconnect();
-    delay(50);
+    delay(HeapPolicy::kWiFiDisconnectDelayMs);
     esp_wifi_set_promiscuous_rx_cb(brewPromiscuousCallback);
     esp_wifi_set_promiscuous_filter(nullptr);
     esp_wifi_set_promiscuous(true);
     esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
 
     const uint8_t channels[] = {1, 6, 11, 2, 7, 12, 3, 8, 13, 4, 9, 5, 10};
-    uint32_t steps = dwellMs / 100;
+    const uint32_t stepMs = HeapPolicy::kConditioningStepMs;
+    uint32_t steps = (dwellMs + stepMs - 1) / stepMs;
     if (steps < 1) steps = 1;
     for (uint32_t i = 0; i < steps; i++) {
         esp_wifi_set_channel(channels[i % 13], WIFI_SECOND_CHAN_NONE);
-        delay(100);
+        delay(stepMs);
         yield();
+
+        // Early exit if heap has stabilized (same check as conditionHeapForTLS)
+        uint32_t elapsedMs = (i + 1) * stepMs;
+        if (elapsedMs > HeapPolicy::kConditioningWarmupMs) {
+            size_t currentLargest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+            if (currentLargest > HeapPolicy::kHeapStableThreshold) {
+                Serial.printf("[HEAP] Brew early exit at %ums (largest=%u)\n",
+                              elapsedMs, (unsigned)currentLargest);
+                break;
+            }
+        }
     }
 
     esp_wifi_set_promiscuous(false);
     esp_wifi_set_promiscuous_rx_cb(nullptr);
     WiFi.disconnect(false, true);
     WiFi.mode(WIFI_STA);
-    delay(80);
+    delay(HeapPolicy::kWiFiShutdownDelayMs);
 
     size_t finalLargest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
     size_t finalFree = ESP.getFreeHeap();

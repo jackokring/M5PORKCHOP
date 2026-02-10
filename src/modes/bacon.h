@@ -68,6 +68,8 @@ private:
     static bool scanInProgress;
     static bool scanCompleted;
     static uint32_t scanStartTime;
+    static bool reconWasRunning;
+    static bool reconWasPaused;
     
     // Internal methods
     static void startAsyncScan();

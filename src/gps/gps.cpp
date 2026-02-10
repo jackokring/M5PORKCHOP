@@ -174,57 +174,40 @@ void GPS::updateData() {
 void GPS::sleep() {
     if (!active) return;
     if (!serial) return;  // Safety check
-    
-    // Send sleep command to AT6668 (UBX protocol)
-    // CFG-RXM - Power Save Mode
-    uint8_t sleepCmd[] = {
-        0xB5, 0x62,  // Sync
-        0x06, 0x11,  // CFG-RXM
-        0x02, 0x00,  // Length
-        0x08, 0x01,  // reserved, Power Save Mode
-        0x22, 0x92   // Checksum
-    };
-    
-    serial->write(sleepCmd, sizeof(sleepCmd));
+
+    // AT6668 (ATGM336H) does not support u-blox UBX protocol.
+    // Stop UART to cease processing and reduce CPU overhead.
+    Serial2.end();
+    serial = nullptr;
     active = false;
-    Serial.println("[GPS] Entering sleep mode");
+    Serial.println("[GPS] Entering sleep mode (UART stopped)");
 }
 
 void GPS::wake() {
     if (active) return;
-    if (!serial) return;  // Safety check
-    
-    // Send wake command
-    uint8_t wakeCmd[] = {
-        0xB5, 0x62,  // Sync
-        0x06, 0x11,  // CFG-RXM
-        0x02, 0x00,  // Length
-        0x08, 0x00,  // reserved, Continuous Mode
-        0x21, 0x91   // Checksum
-    };
-    
-    serial->write(wakeCmd, sizeof(wakeCmd));
+
+    // Restart UART to resume GPS data processing.
+    // AT6668 (ATGM336H) runs continuously — re-opening the port is sufficient.
+    uint8_t rxPin = Config::gps().rxPin;
+    uint8_t txPin = Config::gps().txPin;
+    uint32_t baud = Config::gps().baudRate;
+    Serial2.begin(baud, SERIAL_8N1, rxPin, txPin);
+    serial = &Serial2;
     active = true;
-    Serial.println("[GPS] Waking up");
+    Serial.println("[GPS] Waking up (UART restarted)");
 }
 
 void GPS::ensureContinuousMode() {
-    if (!serial) return;  // Safety check
-    
-    // Always send continuous mode command regardless of software state
-    // Ensures GPS hardware is in correct mode even if previous sleep command
-    // failed or was ignored by the hardware
-    // FIX: Addresses issue where GPS doesn't show until mode restart
-    uint8_t cmd[] = {
-        0xB5, 0x62,  // Sync
-        0x06, 0x11,  // CFG-RXM
-        0x02, 0x00,  // Length
-        0x08, 0x00,  // reserved, Continuous Mode
-        0x21, 0x91   // Checksum
-    };
-    
-    serial->write(cmd, sizeof(cmd));
-    active = true;  // Ensure software flag matches hardware intent
+    // AT6668 (ATGM336H) runs continuously by default.
+    // If UART was stopped (sleep), restart it. Otherwise just ensure flag is set.
+    if (!serial) {
+        uint8_t rxPin = Config::gps().rxPin;
+        uint8_t txPin = Config::gps().txPin;
+        uint32_t baud = Config::gps().baudRate;
+        Serial2.begin(baud, SERIAL_8N1, rxPin, txPin);
+        serial = &Serial2;
+    }
+    active = true;
     Serial.println("[GPS] Continuous mode enforced");
 }
 
@@ -260,15 +243,6 @@ GPSData GPS::getData() {
     return data;
 }
 
-String GPS::getLocationString() {
-    char buf[64]; // Larger buffer to accommodate coordinates safely
-    if (getLocationString(buf, sizeof(buf))) {
-        return String(buf);
-    } else {
-        return "No fix";
-    }
-}
-
 bool GPS::getLocationString(char* out, size_t len) {
     if (!out || len == 0) return false;
     if (mutex == nullptr) {  // FIX: Prevent crash if GPS not initialized
@@ -293,12 +267,6 @@ bool GPS::getLocationString(char* out, size_t len) {
         out[len - 1] = '\0';
         return false;
     }
-}
-
-String GPS::getTimeString() {
-    char buf[16]; // Increased buffer size for time string
-    getTimeString(buf, sizeof(buf));
-    return String(buf);
 }
 
 void GPS::getTimeString(char* out, size_t len) {

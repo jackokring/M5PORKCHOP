@@ -15,17 +15,18 @@ bool UnlockablesMenu::active = false;
 bool UnlockablesMenu::keyWasPressed = false;
 bool UnlockablesMenu::exitRequested = false;
 bool UnlockablesMenu::textEditing = false;
-String UnlockablesMenu::textBuffer = "";
+char UnlockablesMenu::textBuffer[33] = "";
+uint8_t UnlockablesMenu::textLen = 0;
 
 // The unlockables - secrets for those who seek
 // Hash: SHA256(phrase) - lowercase hex, lowercase input
 static const UnlockableItem UNLOCKABLES[] = {
     // Bit 0: commit messages speak in riddles
-    { 
-        "PROPHECY", 
+    {
+        "PROPHECY",
         "THE PROPHECY SPEAKS THE KEY",
         "13ca9c448763034b2d1b1ec33b449ae90433634c16b50a0a9fba6f4b5a67a72a",
-        0 
+        0
     },
     // Bit 1: persistence is immortality
     {
@@ -33,6 +34,20 @@ static const UnlockableItem UNLOCKABLES[] = {
         "PIG SURVIVES M5BURNER",
         "6c58bc00fea09c8d7fdb97c7b58741ad37bd7ba8e5c76d35076e3b57071b172b",
         1
+    },
+    // Bit 2: classic unix identity crisis
+    {
+        "C4LLS1GN",
+        "UNIX KNOWS. DO YOU?",
+        "73d7b7288d31175792d8a1f51b63936d5683718082f5a401b4e9d6829de967d3",
+        2
+    },
+    // Bit 3: jah bless di herb
+    {
+        "B4K3D_P1G",
+        "JAH PROVIDES. PIG RESTS.",
+        "af062b87461d9caa433210fc29a6c1c2aaf28c09c6c54578f16160d7d6a8caa0",
+        3
     },
 };
 
@@ -42,7 +57,7 @@ void UnlockablesMenu::init() {
     selectedIndex = 0;
     scrollOffset = 0;
     textEditing = false;
-    textBuffer = "";
+    textBuffer[0] = '\0'; textLen = 0;
 }
 
 void UnlockablesMenu::show() {
@@ -51,7 +66,7 @@ void UnlockablesMenu::show() {
     selectedIndex = 0;
     scrollOffset = 0;
     textEditing = false;
-    textBuffer = "";
+    textBuffer[0] = '\0'; textLen = 0;
     keyWasPressed = true;  // Ignore the Enter that selected us from menu
     updateBottomOverlay();
 }
@@ -59,7 +74,7 @@ void UnlockablesMenu::show() {
 void UnlockablesMenu::hide() {
     active = false;
     textEditing = false;
-    textBuffer = "";
+    textBuffer[0] = '\0'; textLen = 0;
     Display::clearBottomOverlay();
 }
 
@@ -137,7 +152,7 @@ void UnlockablesMenu::handleInput() {
         } else {
             // Enter text input mode
             textEditing = true;
-            textBuffer = "";
+            textBuffer[0] = '\0'; textLen = 0;
             keyWasPressed = true;
         }
     }
@@ -173,16 +188,18 @@ void UnlockablesMenu::handleTextInput() {
         // Safety check
         if (TOTAL_UNLOCKABLES == 0 || selectedIndex >= TOTAL_UNLOCKABLES) {
             textEditing = false;
-            textBuffer = "";
+            textBuffer[0] = '\0'; textLen = 0;
             return;
         }
         
         // Convert to lowercase for comparison
-        String phrase = textBuffer;
-        phrase.toLowerCase();
-        
+        char phrase[33];
+        for (uint8_t i = 0; i <= textLen && i < sizeof(phrase); i++) {
+            phrase[i] = (char)tolower((unsigned char)textBuffer[i]);
+        }
+
         // Validate against hash
-        if (validatePhrase(phrase.c_str(), UNLOCKABLES[selectedIndex].hashHex)) {
+        if (validatePhrase(phrase, UNLOCKABLES[selectedIndex].hashHex)) {
             // SUCCESS!
             XP::setUnlockable(UNLOCKABLES[selectedIndex].bitIndex);
             Display::showToast("UNLOCKED");
@@ -195,14 +212,14 @@ void UnlockablesMenu::handleTextInput() {
         }
 
         textEditing = false;
-        textBuffer = "";
+        textBuffer[0] = '\0'; textLen = 0;
         return;
     }
     
     // Backspace to delete
     if (keys.del) {
-        if (textBuffer.length() > 0) {
-            textBuffer.remove(textBuffer.length() - 1);
+        if (textLen > 0) {
+            textBuffer[--textLen] = '\0';
         }
         return;
     }
@@ -211,16 +228,17 @@ void UnlockablesMenu::handleTextInput() {
     for (char c : keys.word) {
         if (c == '`') {
             textEditing = false;
-            textBuffer = "";
+            textBuffer[0] = '\0'; textLen = 0;
             return;
         }
     }
     
     // Add typed characters (max 32)
-    if (textBuffer.length() < 32) {
+    if (textLen < 32) {
         for (char c : keys.word) {
-            if (c >= 32 && c <= 126 && c != '`' && textBuffer.length() < 32) {
-                textBuffer += c;
+            if (c >= 32 && c <= 126 && c != '`' && textLen < 32) {
+                textBuffer[textLen++] = c;
+                textBuffer[textLen] = '\0';
             }
         }
     }
@@ -304,8 +322,7 @@ void UnlockablesMenu::drawTextInput(M5Canvas& canvas) {
     
     // Input field (show what they're typing)
     char displayText[24];
-    const char* textSrc = textBuffer.c_str();
-    size_t textLen = textBuffer.length();
+    const char* textSrc = textBuffer;
     if (textLen > 20) {
         const char* tail = textSrc + (textLen - 17);
         snprintf(displayText, sizeof(displayText), "...%s", tail);

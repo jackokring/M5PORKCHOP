@@ -15,7 +15,6 @@ namespace SDLayout {
     // Directories (resolved to legacy or new layout)
     const char* handshakesDir();
     const char* wardrivingDir();
-    const char* mldataDir();
     const char* modelsDir();
     const char* logsDir();
     const char* crashDir();
@@ -41,6 +40,7 @@ namespace SDLayout {
     const char* xpAwardedWiglePath();
     const char* boarBrosPath();
     const char* heapLogPath();
+    const char* heapWatermarksPath();
     const char* wpasecKeyPath();
     const char* wigleKeyPath();
 
@@ -49,6 +49,12 @@ namespace SDLayout {
     const char* legacyPersonalityPath();
     const char* legacyWpasecKeyPath();
     const char* legacyWigleKeyPath();
+
+    // Filename helpers
+    void sanitizeSsid(const char* ssid, char* out, size_t outLen);
+    void buildCaptureFilename(char* out, size_t outLen, const char* dir,
+                              const char* ssid, const uint8_t bssid[6],
+                              const char* suffix);
 
     // Layout helpers
     bool migrateIfNeeded();     // create backup + move legacy content

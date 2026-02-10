@@ -14,9 +14,11 @@ static void formatDisplayName(const char* path, char* out, size_t len);
 static void truncateWithEllipsis(char* text, size_t maxLen);
 static void formatTimeLine(time_t t, char* out, size_t len);
 
+static const size_t MAX_CRASH_FILES = 32;
+
 bool CrashViewer::active = false;
 std::vector<CrashViewer::CrashEntry> CrashViewer::crashFiles;
-std::vector<String> CrashViewer::fileLines;
+std::vector<CrashViewer::LogLine> CrashViewer::fileLines;
 uint16_t CrashViewer::listScroll = 0;
 uint16_t CrashViewer::fileScroll = 0;
 uint16_t CrashViewer::totalLines = 0;
@@ -24,7 +26,7 @@ uint8_t CrashViewer::selectedIndex = 0;
 bool CrashViewer::fileViewActive = false;
 bool CrashViewer::nukeConfirmActive = false;
 bool CrashViewer::keyWasPressed = false;
-String CrashViewer::activeFile = "";
+char CrashViewer::activeFile[64] = {0};
 
 static const uint16_t MAX_LOG_LINES = 120;
 static const uint8_t VISIBLE_LINES = 9;
@@ -39,35 +41,12 @@ void CrashViewer::init() {
     selectedIndex = 0;
     fileViewActive = false;
     nukeConfirmActive = false;
-    activeFile = "";
-}
-
-String CrashViewer::getDisplayName(const String& path) {
-    String name = path;
-    int slash = name.lastIndexOf('/');
-    if (slash >= 0) {
-        name = name.substring(slash + 1);
-    }
-    if (name.endsWith(".txt")) {
-        name = name.substring(0, name.length() - 4);
-    }
-    return name;
-}
-
-String CrashViewer::formatTime(time_t t) {
-    if (t == 0) return "-- -- --:--";
-
-    struct tm* timeinfo = localtime(&t);
-    if (!timeinfo) return "-- -- --:--";
-
-    char buf[20];
-    // Format: "Dec 06 14:32"
-    strftime(buf, sizeof(buf), "%b %d %H:%M", timeinfo);
-    return String(buf);
+    activeFile[0] = '\0';
 }
 
 void CrashViewer::scanCrashFiles() {
     crashFiles.clear();
+    crashFiles.reserve(MAX_CRASH_FILES);  // Cap at 32 — avoids unbounded growth
     selectedIndex = 0;
     listScroll = 0;
 
@@ -86,27 +65,28 @@ void CrashViewer::scanCrashFiles() {
     }
 
     uint8_t yieldCounter = 0;
-    while (true) {
+    while (crashFiles.size() < MAX_CRASH_FILES) {
         File entry = dir.openNextFile();
         if (!entry) break;
 
         if (!entry.isDirectory()) {
-            String name = entry.name();
+            const char* name = entry.name();
             time_t lastWrite = entry.getLastWrite();
             entry.close();
 
-            if (!name.endsWith(".txt")) {
+            // Check .txt extension without String
+            size_t nameLen = strlen(name);
+            if (nameLen < 4 || strcmp(name + nameLen - 4, ".txt") != 0) {
                 continue;
             }
 
-            String base = name;
-            int slash = base.lastIndexOf('/');
-            if (slash >= 0) {
-                base = base.substring(slash + 1);
-            }
-            String path = String(crashDir) + "/" + base;
+            // Extract basename without String
+            const char* base = strrchr(name, '/');
+            base = base ? base + 1 : name;
+
             CrashEntry entryInfo;
-            entryInfo.path = path;
+            memset(&entryInfo, 0, sizeof(entryInfo));
+            snprintf(entryInfo.path, sizeof(entryInfo.path), "%s/%s", crashDir, base);
             entryInfo.timestamp = lastWrite;
             crashFiles.push_back(entryInfo);
         } else {
@@ -127,40 +107,60 @@ void CrashViewer::scanCrashFiles() {
     });
 }
 
-void CrashViewer::loadCrashFile(const String& path) {
+static void pushLogLine(std::vector<CrashViewer::LogLine>& lines, const char* text) {
+    CrashViewer::LogLine entry;
+    strncpy(entry.text, text, sizeof(entry.text) - 1);
+    entry.text[sizeof(entry.text) - 1] = '\0';
+    lines.push_back(entry);
+}
+
+void CrashViewer::loadCrashFile(const char* path) {
     fileLines.clear();
     fileScroll = 0;
     totalLines = 0;
-    activeFile = path;
+    strncpy(activeFile, path, sizeof(activeFile) - 1);
+    activeFile[sizeof(activeFile) - 1] = '\0';
 
-    File f = SD.open(path.c_str(), FILE_READ);
+    File f = SD.open(path, FILE_READ);
     if (!f) {
-        fileLines.push_back("FAILED TO OPEN");
-        fileLines.push_back(getDisplayName(path));
+        pushLogLine(fileLines, "FAILED TO OPEN");
+        char displayName[32];
+        formatDisplayName(path, displayName, sizeof(displayName));
+        pushLogLine(fileLines, displayName);
         totalLines = fileLines.size();
         return;
     }
 
-    std::vector<String> allLines;
-    allLines.reserve(MAX_LOG_LINES);  // FIX: Pre-allocate to avoid realloc fragmentation
+    // Read last MAX_LOG_LINES non-empty lines using ring buffer approach
+    fileLines.reserve(MAX_LOG_LINES);
+    char lineBuf[80];
+    uint16_t lineCount = 0;
     while (f.available()) {
-        String line = f.readStringUntil('\n');
-        line.trim();
-        if (line.length() == 0) {
-            continue;
+        size_t len = f.readBytesUntil('\n', lineBuf, sizeof(lineBuf) - 1);
+        lineBuf[len] = '\0';
+        while (len > 0 && (lineBuf[len - 1] == '\r' || lineBuf[len - 1] == ' ')) {
+            lineBuf[--len] = '\0';
         }
-        allLines.push_back(line);
-        if (allLines.size() > MAX_LOG_LINES) {
-            allLines.erase(allLines.begin());
+        if (len == 0) continue;
+
+        if (lineCount < MAX_LOG_LINES) {
+            pushLogLine(fileLines, lineBuf);
+        } else {
+            // Shift left by 1 and replace last
+            for (uint16_t i = 1; i < fileLines.size(); i++) {
+                fileLines[i - 1] = fileLines[i];
+            }
+            strncpy(fileLines.back().text, lineBuf, sizeof(LogLine::text) - 1);
+            fileLines.back().text[sizeof(LogLine::text) - 1] = '\0';
         }
+        lineCount++;
     }
     f.close();
 
-    fileLines = allLines;
     totalLines = fileLines.size();
 
     if (fileLines.empty()) {
-        fileLines.push_back("EMPTY FILE");
+        pushLogLine(fileLines, "EMPTY FILE");
         totalLines = 1;
     }
 }
@@ -170,7 +170,7 @@ void CrashViewer::show() {
     keyWasPressed = true;
     fileViewActive = false;
     nukeConfirmActive = false;
-    activeFile = "";
+    activeFile[0] = '\0';
     fileLines.clear();
     scanCrashFiles();
 }
@@ -183,7 +183,7 @@ void CrashViewer::hide() {
     fileLines.shrink_to_fit();
     fileViewActive = false;
     nukeConfirmActive = false;
-    activeFile = "";
+    activeFile[0] = '\0';
     Display::clearBottomOverlay();
 }
 
@@ -204,15 +204,18 @@ void CrashViewer::nukeCrashFiles() {
         if (!entry) break;
 
         if (!entry.isDirectory()) {
-            String name = entry.name();
+            const char* name = entry.name();
             entry.close();
 
-            int slash = name.lastIndexOf('/');
-            String base = (slash >= 0) ? name.substring(slash + 1) : name;
-            String path = String(crashDir) + "/" + base;
+            const char* base = strrchr(name, '/');
+            base = base ? (base + 1) : name;
+            char path[80];
+            snprintf(path, sizeof(path), "%s/%s", crashDir, base);
+            size_t plen = strlen(path);
 
-            if (path.endsWith(".txt") || path.endsWith(".elf")) {
-                SD.remove(path.c_str());
+            if ((plen > 4 && strcmp(path + plen - 4, ".txt") == 0) ||
+                (plen > 4 && strcmp(path + plen - 4, ".elf") == 0)) {
+                SD.remove(path);
             }
         } else {
             entry.close();
@@ -248,7 +251,7 @@ void CrashViewer::drawList(M5Canvas& canvas) {
     for (uint8_t i = 0; i < VISIBLE_LINES && (listScroll + i) < count; i++) {
         uint8_t idx = listScroll + i;
         char displayLine[32];
-        formatDisplayName(crashFiles[idx].path.c_str(), displayLine, sizeof(displayLine));
+        formatDisplayName(crashFiles[idx].path, displayLine, sizeof(displayLine));
         size_t nameLen = strlen(displayLine);
         if (nameLen > 22 && sizeof(displayLine) > 22) {
             displayLine[21] = '~';
@@ -291,9 +294,9 @@ void CrashViewer::drawFile(M5Canvas& canvas) {
     uint8_t y = 2;
 
     for (uint8_t i = 0; i < VISIBLE_LINES && (fileScroll + i) < totalLines; i++) {
-        const String& line = fileLines[fileScroll + i];
+        const LogLine& line = fileLines[fileScroll + i];
         char displayLine[48];
-        strncpy(displayLine, line.c_str(), sizeof(displayLine) - 1);
+        strncpy(displayLine, line.text, sizeof(displayLine) - 1);
         displayLine[sizeof(displayLine) - 1] = '\0';
         size_t lineLen = strlen(displayLine);
         if (lineLen > 39 && sizeof(displayLine) > 39) {
@@ -381,7 +384,7 @@ void CrashViewer::update() {
             fileViewActive = false;
             fileLines.clear();
             totalLines = 0;
-            activeFile = "";
+            activeFile[0] = '\0';
         }
         return;
     }
@@ -488,13 +491,13 @@ void CrashViewer::getStatusLine(char* out, size_t len) {
     if (!active) return;
 
     const char* path = nullptr;
-    if (fileViewActive && activeFile.length() > 0) {
-        path = activeFile.c_str();
+    if (fileViewActive && activeFile[0] != '\0') {
+        path = activeFile;
     } else if (crashFiles.empty()) {
         snprintf(out, len, "NO CRASH FILES");
         return;
     } else if (selectedIndex < crashFiles.size()) {
-        path = crashFiles[selectedIndex].path.c_str();
+        path = crashFiles[selectedIndex].path;
     } else {
         snprintf(out, len, "CRASH FILES");
         return;

@@ -35,6 +35,20 @@ void (*XP::levelUpCallback)(uint8_t, uint8_t) = nullptr;
 // Protected by achQueueMutex to prevent race conditions
 static bool pendingSaveFlag = false;
 
+static uint32_t lastSavedCRC = 0;
+
+static uint32_t computeDataCRC(const PorkXPData* d) {
+    uint32_t crc = 0xFFFFFFFF;
+    const uint8_t* bytes = (const uint8_t*)d;
+    for (size_t i = 0; i < sizeof(PorkXPData); i++) {
+        crc ^= bytes[i];
+        for (int j = 0; j < 8; j++) {
+            crc = (crc >> 1) ^ (0xEDB88320 & -(crc & 1));
+        }
+    }
+    return crc ^ 0xFFFFFFFF;
+}
+
 // Mutex for protecting achievement queue operations AND pendingSaveFlag
 static SemaphoreHandle_t achQueueMutex = nullptr;
 
@@ -172,6 +186,61 @@ static const char* RANK_TITLES[] = {
     "B4C0NM4NC3R"      // Lv50
 };
 static const uint8_t MAX_LEVEL = 50;
+
+// XP thresholds for each level (shared by calculateLevel and getXPForLevel)
+// Designed for: L1-5 quick, L6-20 steady, L21-50 grind
+static const uint32_t XP_THRESHOLDS[50] = {
+    0,      // L1
+    100,    // L2
+    300,    // L3
+    600,    // L4
+    1000,   // L5
+    1500,   // L6
+    2300,   // L7
+    3400,   // L8
+    4800,   // L9
+    6500,   // L10
+    8500,   // L11
+    11000,  // L12
+    14000,  // L13
+    17500,  // L14
+    21500,  // L15
+    26000,  // L16
+    31000,  // L17
+    36500,  // L18
+    42500,  // L19
+    49000,  // L20
+    56000,  // L21
+    64000,  // L22
+    73000,  // L23
+    83000,  // L24
+    94000,  // L25
+    106000, // L26
+    120000, // L27
+    136000, // L28
+    154000, // L29
+    174000, // L30
+    197000, // L31
+    223000, // L32
+    252000, // L33
+    284000, // L34
+    319000, // L35
+    359000,  // L36
+    404000,  // L37
+    454000,  // L38
+    514000,  // L39
+    600000,  // L40
+    680000,  // L41
+    770000,  // L42
+    870000,  // L43
+    980000,  // L44
+    1100000, // L45
+    1230000, // L46
+    1370000, // L47
+    1520000, // L48
+    1680000, // L49
+    1850000  // L50
+};
 
 // Achievement names (must match enum order)
 static const char* ACHIEVEMENT_NAMES[] = {
@@ -494,9 +563,13 @@ void XP::load() {
     data.cachedLevel = calculateLevel(data.totalXP);
     
     prefs.end();
+    lastSavedCRC = computeDataCRC(&data);
 }
 
 void XP::save() {
+    uint32_t currentCRC = computeDataCRC(&data);
+    if (currentCRC == lastSavedCRC) return;
+
     prefs.begin("porkxp", false);  // Read-write
     
     prefs.putUInt("totalxp", data.totalXP);
@@ -529,7 +602,8 @@ void XP::save() {
     prefs.putUInt("unlock", data.unlockables);  // Unlockables v0.1.8
     
     prefs.end();
-    
+    lastSavedCRC = currentCRC;
+
     Serial.printf("[XP] Saved - LV%d (%lu XP)\n", getLevel(), data.totalXP);
     
     // Backup to SD - pig survives M5Burner / NVS wipes
@@ -1076,63 +1150,8 @@ void XP::updateSessionTime() {
 }
 
 uint8_t XP::calculateLevel(uint32_t xp) {
-    // XP thresholds for each level
-    // Designed for: L1-5 quick, L6-20 steady, L21-50 grind
-    uint32_t thresholds[MAX_LEVEL] = {
-        0,      // L1
-        100,    // L2
-        300,    // L3
-        600,    // L4
-        1000,   // L5
-        1500,   // L6
-        2300,   // L7
-        3400,   // L8
-        4800,   // L9
-        6500,   // L10
-        8500,   // L11
-        11000,  // L12
-        14000,  // L13
-        17500,  // L14
-        21500,  // L15
-        26000,  // L16
-        31000,  // L17
-        36500,  // L18
-        42500,  // L19
-        49000,  // L20
-        56000,  // L21
-        64000,  // L22
-        73000,  // L23
-        83000,  // L24
-        94000,  // L25
-        106000, // L26
-        120000, // L27
-        136000, // L28
-        154000, // L29
-        174000, // L30
-        197000, // L31
-        223000, // L32
-        252000, // L33
-        284000, // L34
-        319000, // L35
-        359000,  // L36
-        404000,  // L37
-        454000,  // L38
-        514000,  // L39
-        600000,  // L40
-        680000,  // L41
-        770000,  // L42
-        870000,  // L43
-        980000,  // L44
-        1100000, // L45
-        1230000, // L46
-        1370000, // L47
-        1520000, // L48
-        1680000, // L49
-        1850000  // L50
-    };
-    
     for (uint8_t i = MAX_LEVEL - 1; i > 0; i--) {
-        if (xp >= thresholds[i]) {
+        if (xp >= XP_THRESHOLDS[i]) {
             return i + 1;  // Levels are 1-indexed
         }
     }
@@ -1142,17 +1161,7 @@ uint8_t XP::calculateLevel(uint32_t xp) {
 uint32_t XP::getXPForLevel(uint8_t level) {
     if (level <= 1) return 0;
     if (level > MAX_LEVEL) level = MAX_LEVEL;
-    
-    // Same thresholds as calculateLevel
-    uint32_t thresholds[MAX_LEVEL] = {
-        0, 100, 300, 600, 1000, 1500, 2300, 3400, 4800, 6500,
-        8500, 11000, 14000, 17500, 21500, 26000, 31000, 36500, 42500, 49000,
-        56000, 64000, 73000, 83000, 94000, 106000, 120000, 136000, 154000, 174000,
-        197000, 223000, 252000, 284000, 319000, 359000, 404000, 454000, 514000, 600000,
-        680000, 770000, 870000, 980000, 1100000, 1230000, 1370000, 1520000, 1680000, 1850000
-    };
-    
-    return thresholds[level - 1];
+    return XP_THRESHOLDS[level - 1];
 }
 
 uint8_t XP::getLevel() {
@@ -1724,6 +1733,7 @@ void XP::checkAchievements() {
             unlockAchievement(ACH_FULL_CLEAR);
         }
     }
+
 }
 
 const PorkXPData& XP::getData() {

@@ -10,6 +10,9 @@
 *.bin
 **/build_info.h
 *_builds/
+.cl*
 docs/
 compile_commands.json
 scripts/heap_analyzer.py
+*.ski*
+!./docs/images/*

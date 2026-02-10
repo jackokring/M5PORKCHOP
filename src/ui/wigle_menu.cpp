@@ -9,6 +9,8 @@
 #include "../web/wigle.h"
 #include "../core/config.h"
 #include "../core/sd_layout.h"
+#include "../core/wifi_utils.h"
+#include "../core/heap_health.h"
 
 // Static member initialization
 std::vector<WigleFileInfo> WigleMenu::files;
@@ -38,13 +40,12 @@ uint8_t WigleMenu::syncSkipped = 0;
 bool WigleMenu::syncStatsFetched = false;
 char WigleMenu::syncError[48] = "";
 
-static void formatDisplayName(const String& filename, char* out, size_t len, size_t maxChars,
+static void formatDisplayName(const char* filename, char* out, size_t len, size_t maxChars,
                               const char* ellipsis, bool stripDecorators) {
     if (!out || len == 0) return;
     out[0] = '\0';
-    if (len == 0) return;
 
-    const char* name = filename.c_str();
+    const char* name = filename;
     size_t total = strlen(name);
     size_t start = 0;
     size_t end = total;
@@ -112,10 +113,18 @@ void WigleMenu::hide() {
 void WigleMenu::scanFiles() {
     // Initialize async scan
     files.clear();
-    files.reserve(50);
+    files.reserve(8);  // Grow naturally — reserve(50) was 6.8KB contiguous
     
     if (!Config::isSDAvailable()) {
         Serial.println("[WIGLE_MENU] SD card not available");
+        scanComplete = true;
+        scanInProgress = false;
+        return;
+    }
+
+    // Guard: Skip SD scan at Warning+ pressure — file ops allocate FAT buffers
+    if (HeapHealth::getPressureLevel() >= HeapPressureLevel::Warning) {
+        Serial.println("[WIGLE_MENU] Scan deferred: heap pressure");
         scanComplete = true;
         scanInProgress = false;
         return;
@@ -162,7 +171,7 @@ void WigleMenu::processAsyncScan() {
             
             // Sort by filename (newest first - filenames include timestamp)
             std::sort(files.begin(), files.end(), [](const WigleFileInfo& a, const WigleFileInfo& b) {
-                return a.filename > b.filename;
+                return strcmp(a.filename, b.filename) > 0;
             });
             
             Serial.printf("[WIGLE_MENU] Async scan complete. Found %d WiGLE files\n", files.size());
@@ -170,20 +179,22 @@ void WigleMenu::processAsyncScan() {
         }
         
         if (!currentFile.isDirectory()) {
-            String name = currentFile.name();
+            const char* name = currentFile.name();
+            size_t nameLen = strlen(name);
             // Only show WiGLE format files (*.wigle.csv)
-            if (name.endsWith(".wigle.csv")) {
+            if (nameLen > 10 && strcmp(name + nameLen - 10, ".wigle.csv") == 0) {
                 WigleFileInfo info;
-                int slash = name.lastIndexOf('/');
-                String base = (slash >= 0) ? name.substring(slash + 1) : name;
-                info.filename = base;
-                info.fullPath = String(SDLayout::wardrivingDir()) + "/" + base;
+                memset(&info, 0, sizeof(info));
+                const char* slash = strrchr(name, '/');
+                const char* base = slash ? slash + 1 : name;
+                strncpy(info.filename, base, sizeof(info.filename) - 1);
+                snprintf(info.fullPath, sizeof(info.fullPath), "%s/%s", SDLayout::wardrivingDir(), base);
                 info.fileSize = currentFile.size();
                 // Estimate network count: ~150 bytes per line after header
                 info.networkCount = info.fileSize > 300 ? (info.fileSize - 300) / 150 : 0;
-                
+
                 // Check upload status
-                info.status = WiGLE::isUploaded(info.fullPath.c_str()) ? 
+                info.status = WiGLE::isUploaded(info.fullPath) ?
                     WigleFileStatus::UPLOADED : WigleFileStatus::LOCAL;
                 
                 files.push_back(info);
@@ -546,21 +557,26 @@ void WigleMenu::nukeTrack() {
     
     const WigleFileInfo& file = files[selectedIndex];
     
-    Serial.printf("[WIGLE_MENU] Nuking track: %s\n", file.fullPath.c_str());
-    
+    Serial.printf("[WIGLE_MENU] Nuking track: %s\n", file.fullPath);
+
     // Delete the .wigle.csv file
     bool deleted = SD.remove(file.fullPath);
-    
+
     // Also delete matching internal CSV if exists (same name without .wigle)
-    String internalPath = file.fullPath;
-    internalPath.replace(".wigle.csv", ".csv");
-    if (SD.exists(internalPath)) {
-        SD.remove(internalPath);
-        Serial.printf("[WIGLE_MENU] Also nuked: %s\n", internalPath.c_str());
+    char internalPath[80];
+    strncpy(internalPath, file.fullPath, sizeof(internalPath) - 1);
+    internalPath[sizeof(internalPath) - 1] = '\0';
+    char* wigleSuffix = strstr(internalPath, ".wigle.csv");
+    if (wigleSuffix) {
+        strcpy(wigleSuffix, ".csv");
+        if (SD.exists(internalPath)) {
+            SD.remove(internalPath);
+            Serial.printf("[WIGLE_MENU] Also nuked: %s\n", internalPath);
+        }
     }
-    
+
     // Remove from uploaded tracking if present
-    WiGLE::removeFromUploaded(file.fullPath.c_str());
+    WiGLE::removeFromUploaded(file.fullPath);
     
     if (deleted) {
         Display::setTopBarMessage("TRACK NUKED!", 4000);
@@ -620,8 +636,8 @@ bool WigleMenu::connectToWiFi() {
     
     if (WiFi.status() != WL_CONNECTED) {
         strncpy(syncError, "WIFI CONNECT FAILED", sizeof(syncError) - 1);
-        WiFi.disconnect(true);
-        WiFi.mode(WIFI_OFF);
+        // Keep driver alive to avoid esp_wifi_init 257 on fragmented heap.
+        WiFiUtils::shutdown();
         return false;
     }
     
@@ -630,8 +646,8 @@ bool WigleMenu::connectToWiFi() {
 }
 
 void WigleMenu::disconnectWiFi() {
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_OFF);
+    // Keep driver alive to avoid esp_wifi_init 257 on fragmented heap.
+    WiFiUtils::shutdown();
     Serial.println("[WIGLE_MENU] WiFi disconnected");
 }
 
@@ -695,13 +711,8 @@ void WigleMenu::processSyncState() {
             
         case WigleSyncState::FREEING_MEMORY:
             strncpy(syncStatusText, "PREPARING...", sizeof(syncStatusText) - 1);
-            // Check heap
-            if (!WiGLE::canSync()) {
-                strncpy(syncError, "LOW HEAP", sizeof(syncError) - 1);
-                syncState = WigleSyncState::ERROR;
-            } else {
-                syncState = WigleSyncState::UPLOADING;
-            }
+            // Defer heap gating to WiGLE::syncFiles() so conditioning can run.
+            syncState = WigleSyncState::UPLOADING;
             break;
             
         case WigleSyncState::UPLOADING:

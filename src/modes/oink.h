@@ -5,12 +5,11 @@
 #include <esp_wifi.h>
 #include <vector>
 #include <set>
-#include <map>
 #include <FS.h>
 #include "../core/network_recon.h"
 
-// Maximum clients to track per network
-#define MAX_CLIENTS_PER_NETWORK 20  // Dense environment support (conferences, airports)
+// Maximum clients to track for the current target (dense environments)
+#define MAX_CLIENTS_PER_NETWORK 20
 
 struct DetectedClient {
     uint8_t mac[6];
@@ -22,19 +21,23 @@ struct DetectedNetwork {
     uint8_t bssid[6];
     char ssid[33];
     int8_t rssi;
+    int8_t rssiAvg;          // Smoothed RSSI (EMA), helps quality scoring
     uint8_t channel;
     wifi_auth_mode_t authmode;
+    uint32_t firstSeen;      // millis() when first detected
     uint32_t lastSeen;
+    uint32_t lastBeaconSeen; // millis() of last beacon (for interval EMA)
     uint16_t beaconCount;
+    uint16_t beaconIntervalEmaMs; // Smoothed beacon interval (ms), 0 if unknown
     bool isTarget;
     bool hasPMF;  // Protected Management Frames (immune to deauth)
     bool hasHandshake;  // Already captured handshake for this network
     uint8_t attackAttempts;  // Number of attack attempts (for retry logic)
     bool isHidden;  // Hidden SSID (needs probe response)
-    DetectedClient clients[MAX_CLIENTS_PER_NETWORK];
-    uint8_t clientCount;
-    uint32_t lastClientSeen;   // millis() of most recent client activity
+    uint32_t lastDataSeen;     // millis() of most recent client data frame
     uint32_t cooldownUntil;    // millis() until eligible for auto-target
+    uint64_t clientBitset;     // Approximate unique client tracker (bits 0-63)
+    uint64_t clientBitsetHigh; // Extended client tracker (bits 64-127)
 };
 
 // Frame storage for PCAP export - stores full 802.11 frame with headers
@@ -163,7 +166,10 @@ public:
     static bool isExcluded(const uint8_t* bssid);  // Check if BSSID is excluded
     static uint16_t getExcludedCount();   // Number of excluded networks
     static void removeBoarBro(uint64_t bssid);  // Remove from exclusion list
-    static const std::map<uint64_t, String>& getExcludedMap() { return boarBros; }
+
+    // BOAR BROS data structure
+    struct BoarBro { uint64_t bssid; char ssid[33]; };
+    static const BoarBro* getExcludedList() { return boarBros; }
     
     // Stress test injection (no RF)
     static void injectTestNetwork(const uint8_t* bssid, const char* ssid, uint8_t channel, int8_t rssi, wifi_auth_mode_t authmode, bool hasPMF);
@@ -191,6 +197,8 @@ private:
     static uint8_t targetBssidCache[6];
     static bool targetHiddenCache;
     static bool targetCacheValid;
+    static DetectedClient targetClients[MAX_CLIENTS_PER_NETWORK];
+    static uint8_t targetClientCount;
     static int selectionIndex;  // Cursor for network selection
     static volatile uint32_t packetCount;
     static uint32_t deauthCount;
@@ -212,7 +220,8 @@ private:
     static void sendDisassocFrame(const uint8_t* bssid, const uint8_t* station, uint8_t reason);
     static void sendAssociationRequest(const uint8_t* bssid, const char* ssid, uint8_t ssidLen);
     static void hopChannel();
-    static void trackClient(const uint8_t* bssid, const uint8_t* clientMac, int8_t rssi);
+    static void trackTargetClient(const uint8_t* bssid, const uint8_t* clientMac, int8_t rssi);
+    static void clearTargetClients();
     static bool detectPMF(const uint8_t* payload, uint16_t len);
 
     static int findNetwork(const uint8_t* bssid);
@@ -227,8 +236,9 @@ private:
     static void writePCAPHeader(fs::File& f);
     static void writePCAPPacket(fs::File& f, const uint8_t* data, uint16_t len, uint32_t ts);
     
-    // BOAR BROS storage
-    static std::map<uint64_t, String> boarBros;  // Excluded BSSIDs -> SSID
+    // BOAR BROS storage (fixed array, zero heap allocation)
+    static BoarBro boarBros[50];
+    static uint16_t boarBrosCount;
     static uint64_t bssidToUint64(const uint8_t* bssid);  // Convert 6-byte BSSID to uint64
     static void recordFilteredNetwork(const uint8_t* bssid);
     static uint16_t filteredCount;

@@ -12,6 +12,7 @@
 #include "../core/config.h"
 #include "../core/wifi_utils.h"
 #include "../core/heap_policy.h"
+#include "../core/heap_health.h"
 #include "../core/network_recon.h"
 #include "../core/wsl_bypasser.h"
 #include "../core/sdlog.h"
@@ -20,20 +21,18 @@
 #include "../ui/display.h"
 #include "../piglet/mood.h"
 #include "../piglet/avatar.h"
-// ML disabled for heap savings
 #include <M5Cardputer.h>
 #include <WiFi.h>
 #include <SD.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
-#include <freertos/semphr.h>
 #include <math.h>
 #include <string.h>
 #include <esp_heap_caps.h>
 
 // Bloom filter for seen BSSIDs (fixed memory, no heap churn)
-// 8KB = 65,536 bits -> ~0.8% false positives around 5k entries with 3 hashes
-static const size_t SEEN_BLOOM_BYTES = 8192;
+// 4KB = 32,768 bits -> ~1.5% false positives around 5k entries with 3 hashes
+static const size_t SEEN_BLOOM_BYTES = 4096;
 static const size_t SEEN_BLOOM_BITS = SEEN_BLOOM_BYTES * 8;
 static const size_t SEEN_BLOOM_MASK = SEEN_BLOOM_BITS - 1;
 static const uint8_t SEEN_BLOOM_HASHES = 3;
@@ -64,6 +63,8 @@ static const size_t WIGLE_FILE_MAX_SIZE = 400000;
 
 // Graceful stop request flag for background scan task
 static volatile bool stopRequested = false;
+// Set by scan task just before self-deleting, used for safe cleanup in stop()
+static volatile bool scanTaskExited = false;
 
 // Helper: Open SD file with retry logic
 static File openFileWithRetry(const char* path, const char* mode) {
@@ -104,26 +105,17 @@ static uint8_t capturedBloom[CAPTURED_BLOOM_BYTES];
 static uint64_t bountyPool[BOUNTY_POOL_SIZE];
 static uint16_t bountyPoolCount = 0;
 static uint32_t bountySeenTotal = 0;
-static SemaphoreHandle_t beaconMutex = nullptr;
 uint32_t WarhogMode::totalNetworks = 0;
 uint32_t WarhogMode::openNetworks = 0;
 uint32_t WarhogMode::wepNetworks = 0;
 uint32_t WarhogMode::wpaNetworks = 0;
 uint32_t WarhogMode::savedCount = 0;      // Geotagged networks (CSV)
-uint32_t WarhogMode::mlOnlyCount = 0;     // Networks without GPS (ML only)
-String WarhogMode::currentFilename = "";
-String WarhogMode::currentMLFilename = "";
-String WarhogMode::currentWigleFilename = "";
+char WarhogMode::currentFilename[128] = {0};
+char WarhogMode::currentWigleFilename[128] = {0};
 
 // Scan state
 bool WarhogMode::scanInProgress = false;
 uint32_t WarhogMode::scanStartTime = 0;
-
-// Enhanced mode statics
-bool WarhogMode::enhancedMode = false;
-std::map<uint64_t, WiFiFeatures> WarhogMode::beaconFeatures;
-std::atomic<uint32_t> WarhogMode::beaconCount{0};  // Atomic for thread-safe callback + main access
-volatile bool WarhogMode::beaconMapBusy = false;
 
 // Background scan task statics
 TaskHandle_t WarhogMode::scanTaskHandle = NULL;
@@ -180,24 +172,6 @@ static void seedCapturedFromOink() {
     }
 }
 
-void WarhogMode::clearBeaconFeatures() {
-    beaconMapBusy = true;
-    // Ensure we're not stuck waiting indefinitely for the mutex
-    if (beaconMutex) {
-        if (xSemaphoreTake(beaconMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            beaconFeatures.clear();
-            beaconCount = 0;  // Also reset beacon count when clearing features
-            xSemaphoreGive(beaconMutex);
-        }
-        // If we couldn't acquire the mutex, we still set beaconMapBusy to allow
-        // other code to know that a clear operation is happening conceptually
-    } else {
-        beaconFeatures.clear();
-        beaconCount = 0;
-    }
-    beaconMapBusy = false;
-}
-
 static uint32_t clampScanIntervalMs(uint32_t intervalMs) {
     return (intervalMs < SCAN_INTERVAL_MIN_MS) ? SCAN_INTERVAL_MIN_MS : intervalMs;
 }
@@ -216,61 +190,34 @@ static void writeCSVField(File& f, const char* ssid) {
 }
 
 void WarhogMode::init() {
-    if (!beaconMutex) {
-        beaconMutex = xSemaphoreCreateMutex();
-    }
-
     totalNetworks = 0;
     openNetworks = 0;
     wepNetworks = 0;
     wpaNetworks = 0;
     savedCount = 0;
-    mlOnlyCount = 0;
-    currentFilename = "";
-    currentMLFilename = "";
-    currentWigleFilename = "";
+    currentFilename[0] = '\0';
+    currentWigleFilename[0] = '\0';
 
     resetSeenTracking();
-    
-    // ML disabled for heap savings
-    enhancedMode = false;
-    // Guard beacon map in case callback still registered from abnormal shutdown
-    clearBeaconFeatures();
-    beaconCount = 0;
-    
+
     scanInterval = clampScanIntervalMs(Config::gps().updateInterval * 1000UL);
 }
 
 void WarhogMode::start() {
     if (running) return;
 
-    // Initialize mutex if not already done
-    if (!beaconMutex) {
-        beaconMutex = xSemaphoreCreateMutex();
-        if (!beaconMutex) {
-            // Critical error - can't operate safely without mutex
-            return;
-        }
-    }
-    
     // Clear previous session data
     totalNetworks = 0;
     openNetworks = 0;
     wepNetworks = 0;
     wpaNetworks = 0;
     savedCount = 0;
-    mlOnlyCount = 0;
-    currentFilename = "";
-    currentMLFilename = "";
-    currentWigleFilename = "";
+    currentFilename[0] = '\0';
+    currentWigleFilename[0] = '\0';
 
     resetSeenTracking();
     seedCapturedFromOink();
-    
-    // Guard beacon map in case callback still registered from previous session
-    clearBeaconFeatures();
-    beaconCount = 0;
-    
+
     // Reset distance tracking for XP
     lastGPSLat = 0;
     lastGPSLon = 0;
@@ -281,15 +228,12 @@ void WarhogMode::start() {
     
     // Reset stop flag for clean start
     stopRequested = false;
-    
-    // ML disabled for heap savings
-    enhancedMode = false;
-    
+
     // Stop NetworkRecon before WiFi manipulation (uses promiscuous mode, incompatible with STA scanning)
     NetworkRecon::stop();
     
-    // Full WiFi reinitialization for clean slate
-    WiFi.disconnect(true);  // Disconnect and clear settings
+    // Soft WiFi reset — keep driver alive to avoid esp_wifi_init() RX buffer failures
+    WiFi.disconnect(false, true);  // Keep driver, erase AP credentials
     delay(200);             // Let it settle
     WiFi.mode(WIFI_STA);    // Station mode for scanning
     
@@ -303,9 +247,7 @@ void WarhogMode::start() {
     // Reset scan state (critical for proper operation after restart)
     scanInProgress = false;
     scanStartTime = 0;
-    
-    // ML features disabled
-    
+
     // Ensure GPS is in continuous mode regardless of software state
     // FIX: Addresses issue where GPS doesn't show until mode restart
     GPS::ensureContinuousMode();
@@ -328,12 +270,8 @@ void WarhogMode::stop() {
     
     // Signal task to stop gracefully
     stopRequested = true;
-    
-    // Stop Enhanced mode capture first
-    if (enhancedMode) {
-        stopEnhancedCapture();
-    }
-    
+    scanTaskExited = false;
+
     // Wait briefly for background scan to notice stopRequested
     if (scanInProgress && scanTaskHandle != NULL) {
         // Give task up to 500ms to exit gracefully
@@ -342,11 +280,19 @@ void WarhogMode::stop() {
         }
         // Force cleanup if task didn't exit in time
         if (scanTaskHandle != NULL) {
+            Serial.println("[WARHOG] Force-deleting scan task");
             vTaskDelete(scanTaskHandle);
             scanTaskHandle = NULL;
         }
-        // Always clean up scan data
-        WiFi.scanDelete();
+        // Only call scanDelete if task exited cleanly (not mid-scan-processing)
+        if (scanTaskExited) {
+            WiFi.scanDelete();
+        } else {
+            // Task was force-killed — WiFi state may be inconsistent.
+            // Soft reset keeps driver alive (avoid RX buffer realloc on fragmented heap).
+            WiFi.disconnect(false, true);
+            delay(50);
+        }
     }
     scanInProgress = false;
     scanResult = -2;
@@ -375,19 +321,21 @@ void WarhogMode::scanTask(void* pvParameters) {
     // Check for early abort request
     if (shouldAbortScan()) {
         scanResult = -2;
+        scanTaskExited = true;
         scanTaskHandle = NULL;
         vTaskDelete(NULL);
         return;
     }
-    
-    // Do full WiFi reset for reliable scanning
+
+    // Soft WiFi reset — keep driver alive to avoid RX buffer realloc failures
     WiFi.scanDelete();
-    WiFi.disconnect(true);
+    WiFi.disconnect(false, true);
         vTaskDelay(pdMS_TO_TICKS(100));
-    
+
     // Check abort between WiFi operations
     if (shouldAbortScan()) {
         scanResult = -2;
+        scanTaskExited = true;
         scanTaskHandle = NULL;
         vTaskDelete(NULL);
         return;
@@ -401,21 +349,14 @@ void WarhogMode::scanTask(void* pvParameters) {
     
     // Store result for main loop to pick up
     scanResult = result;
-    
-    // Re-enable promiscuous mode for beacon capture if Enhanced mode
-    // Must re-register callback after WiFi reset - need delay for WiFi to be ready
-    if (enhancedMode) {
-        vTaskDelay(pdMS_TO_TICKS(50));  // Let WiFi stabilize
-        
-        wifi_promiscuous_filter_t filter = {
-            .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT
-        };
-        esp_err_t err1 = esp_wifi_set_promiscuous_filter(&filter);
-        esp_wifi_set_promiscuous_rx_cb(promiscuousCallback);
-        esp_err_t err2 = esp_wifi_set_promiscuous(true);
-    }
-    
-    // Clean up task handle and self-delete
+
+    // Log stack usage for sizing decisions
+    UBaseType_t hwm = uxTaskGetStackHighWaterMark(NULL);
+    Serial.printf("[WARHOG] Scan task stack HWM: %u bytes unused of 4096\n",
+                  (unsigned)(hwm * sizeof(StackType_t)));
+
+    // Signal clean exit, then self-delete
+    scanTaskExited = true;
     scanTaskHandle = NULL;
     vTaskDelete(NULL);
 }
@@ -430,40 +371,12 @@ void WarhogMode::update() {
     
     // Periodic heap monitoring (every 30 seconds)
     if (now - lastHeapCheck >= 30000) {
-        uint32_t freeHeap = ESP.getFreeHeap();
-        
-        if (freeHeap < HeapPolicy::kWarhogHeapCritical) {
+        if (HeapHealth::getPressureLevel() >= HeapPressureLevel::Critical) {
             Display::showToast("LOW MEMORY!");
-            // Emergency: clear beacon feature cache (heap heavy)
-            // Guard beacon map from promiscuous callback during clear
-            if (enhancedMode) {
-                esp_wifi_set_promiscuous(false);
-            }
-            clearBeaconFeatures();
-            if (enhancedMode) {
-                esp_wifi_set_promiscuous(true);
-            }
         }
         lastHeapCheck = now;
     }
-    
-    // Periodic beacon map cleanup to prevent unbounded growth (every 10s - Phase 3B fix)
-    // Clear stale beacon features to reclaim heap before it becomes critical
-    static uint32_t lastBeaconCleanup = 0;
-    if (enhancedMode && now - lastBeaconCleanup > 10000) {
-        // Only clear if map is getting large (>200 entries = ~25KB)
-        if (beaconFeatures.size() > 200) {
-            beaconMapBusy = true;
-            if (beaconMutex && xSemaphoreTake(beaconMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                beaconFeatures.clear();
-                beaconCount = 0;
-                xSemaphoreGive(beaconMutex);
-            }
-            beaconMapBusy = false;
-        }
-        lastBeaconCleanup = now;
-    }
-    
+
     // Update grass animation based on GPS fix status
     bool hasGPSFix = GPS::hasFix();
     if (hasGPSFix != lastGPSState) {
@@ -536,16 +449,12 @@ bool WarhogMode::isScanComplete() {
 void WarhogMode::performScan() {
     if (scanInProgress) return;
     if (scanTaskHandle != NULL) return;  // Previous task still running
-    
-    // Temporarily disable promiscuous mode for scanning (conflicts with scan API)
-    if (enhancedMode) {
-        esp_wifi_set_promiscuous(false);
-    }
-    
+
     scanInProgress = true;
     scanStartTime = millis();
     scanResult = -1;  // Running
-    
+    scanTaskExited = false;
+
     // Create background task for sync scan
     xTaskCreatePinnedToCore(
         scanTask,           // Function
@@ -570,8 +479,8 @@ void WarhogMode::performScan() {
 
 // Ensure CSV file exists with header
 bool WarhogMode::ensureCSVFileReady() {
-    if (currentFilename.length() > 0) return true;
-    
+    if (currentFilename[0] != '\0') return true;
+
     // Ensure wardriving directory exists
     const char* wardrivingDir = SDLayout::wardrivingDir();
     if (!SD.exists(wardrivingDir)) {
@@ -579,55 +488,16 @@ bool WarhogMode::ensureCSVFileReady() {
             return false;
         }
     }
-    
-    currentFilename = generateFilename("csv");
-    
-    File f = openFileWithRetry(currentFilename.c_str(), FILE_WRITE);
+
+    generateFilename(currentFilename, sizeof(currentFilename), "csv");
+
+    File f = openFileWithRetry(currentFilename, FILE_WRITE);
     if (!f) {
-        currentFilename = "";
+        currentFilename[0] = '\0';
         return false;
     }
     
     f.println("BSSID,SSID,RSSI,Channel,AuthMode,Latitude,Longitude,Altitude,Timestamp");
-    f.close();
-    
-    return true;
-}
-
-// Ensure ML file exists with header
-bool WarhogMode::ensureMLFileReady() {
-    if (currentMLFilename.length() > 0) return true;
-    
-    // Ensure mldata directory exists
-    const char* wardrivingDir = SDLayout::wardrivingDir();
-    const char* mldataDir = SDLayout::mldataDir();
-    if (!SD.exists(mldataDir)) {
-        if (!SD.mkdir(mldataDir)) {
-            return false;
-        }
-    }
-    
-    currentMLFilename = generateFilename("ml.csv");
-    // Put ML files in /mldata folder
-    String wardrivingPrefix = String(wardrivingDir) + "/warhog_";
-    String mldataPrefix = String(mldataDir) + "/ml_training_";
-    currentMLFilename.replace(wardrivingPrefix, mldataPrefix);
-    
-    File f = openFileWithRetry(currentMLFilename.c_str(), FILE_WRITE);
-    if (!f) {
-        currentMLFilename = "";
-        return false;
-    }
-    
-    // CSV header - all 32 feature vector values + label + metadata
-    f.print("bssid,ssid,");
-    f.print("rssi,noise,snr,channel,secondary_ch,beacon_interval,");
-    f.print("capability_lo,capability_hi,has_wps,has_wpa,has_wpa2,has_wpa3,");
-    f.print("is_hidden,response_time,beacon_count,beacon_jitter,");
-    f.print("responds_probe,probe_response_time,vendor_ie_count,");
-    f.print("supported_rates,ht_cap,vht_cap,anomaly_score,");
-    f.print("f23,f24,f25,f26,f27,f28,f29,f30,f31,");
-    f.println("label,latitude,longitude");
     f.close();
     
     return true;
@@ -639,61 +509,31 @@ void WarhogMode::appendCSVEntry(const uint8_t* bssid, const char* ssid,
                                  double lat, double lon, double alt) {
     if (!ensureCSVFileReady()) return;
     
-    File f = openFileWithRetry(currentFilename.c_str(), FILE_APPEND);
+    File f = openFileWithRetry(currentFilename, FILE_APPEND);
     if (!f) return;
-    
+
     f.printf("%02X:%02X:%02X:%02X:%02X:%02X,",
             bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
     writeCSVField(f, ssid);
     f.print(",");
     f.printf("%d,%d,%s,%.6f,%.6f,%.1f,%lu\n",
-            rssi, channel, authModeToString(auth).c_str(),
+            rssi, channel, authModeToString(auth),
             lat, lon, alt, millis());
-    f.close();
-}
-
-// Append single network to ML file
-void WarhogMode::appendMLEntry(const uint8_t* bssid, const char* ssid,
-                                const WiFiFeatures& features, uint8_t label,
-                                double lat, double lon) {
-    if (!ensureMLFileReady()) return;
-    
-    File f = openFileWithRetry(currentMLFilename.c_str(), FILE_APPEND);
-    if (!f) return;
-    
-    // BSSID
-    f.printf("%02X:%02X:%02X:%02X:%02X:%02X,",
-            bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
-    
-    // SSID (escaped)
-    writeCSVField(f, ssid);
-    f.print(",");
-    
-    // Convert features to vector and write
-    float featureVec[FEATURE_VECTOR_SIZE];
-    FeatureExtractor::toFeatureVector(features, featureVec);
-    
-    for (int i = 0; i < FEATURE_VECTOR_SIZE; i++) {
-        f.printf("%.4f,", featureVec[i]);
-    }
-    
-    // Label and GPS
-    f.printf("%d,%.6f,%.6f\n", label, lat, lon);
     f.close();
 }
 
 // Check if WiGLE file needs rotation due to size
 void WarhogMode::checkWigleFileRotation() {
-    if (currentWigleFilename.length() == 0) return;
-    
-    File f = SD.open(currentWigleFilename.c_str(), FILE_READ);
+    if (currentWigleFilename[0] == '\0') return;
+
+    File f = SD.open(currentWigleFilename, FILE_READ);
     if (!f) return;
-    
+
     size_t fileSize = f.size();
     f.close();
-    
+
     if (fileSize >= WIGLE_FILE_MAX_SIZE) {
-        currentWigleFilename = "";  // Force new file creation on next append
+        currentWigleFilename[0] = '\0';  // Force new file creation on next append
     }
 }
 
@@ -702,8 +542,8 @@ bool WarhogMode::ensureWigleFileReady() {
     // Check if current file needs rotation
     checkWigleFileRotation();
     
-    if (currentWigleFilename.length() > 0) return true;
-    
+    if (currentWigleFilename[0] != '\0') return true;
+
     // Ensure wardriving directory exists
     const char* wardrivingDir = SDLayout::wardrivingDir();
     if (!SD.exists(wardrivingDir)) {
@@ -711,12 +551,12 @@ bool WarhogMode::ensureWigleFileReady() {
             return false;
         }
     }
-    
-    currentWigleFilename = generateFilename("wigle.csv");
-    
-    File f = openFileWithRetry(currentWigleFilename.c_str(), FILE_WRITE);
+
+    generateFilename(currentWigleFilename, sizeof(currentWigleFilename), "wigle.csv");
+
+    File f = openFileWithRetry(currentWigleFilename, FILE_WRITE);
     if (!f) {
-        currentWigleFilename = "";
+        currentWigleFilename[0] = '\0';
         return false;
     }
     
@@ -736,27 +576,18 @@ bool WarhogMode::ensureWigleFileReady() {
     return true;
 }
 
-// Convert auth mode to WiGLE capability string format
-String WarhogMode::authModeToWigleString(wifi_auth_mode_t mode) {
+// Convert auth mode to WiGLE capability string format (returns string literal, zero allocation)
+const char* WarhogMode::authModeToWigleString(wifi_auth_mode_t mode) {
     switch (mode) {
-        case WIFI_AUTH_OPEN:
-            return "[ESS]";
-        case WIFI_AUTH_WEP:
-            return "[WEP][ESS]";
-        case WIFI_AUTH_WPA_PSK:
-            return "[WPA-PSK-CCMP][ESS]";
-        case WIFI_AUTH_WPA2_PSK:
-            return "[WPA2-PSK-CCMP][ESS]";
-        case WIFI_AUTH_WPA_WPA2_PSK:
-            return "[WPA-PSK-CCMP+TKIP][WPA2-PSK-CCMP+TKIP][ESS]";
-        case WIFI_AUTH_WPA3_PSK:
-            return "[WPA3-SAE][ESS]";
-        case WIFI_AUTH_WPA2_WPA3_PSK:
-            return "[WPA2-PSK-CCMP][WPA3-SAE][ESS]";
-        case WIFI_AUTH_WAPI_PSK:
-            return "[WAPI-PSK][ESS]";
-        default:
-            return "[ESS]";
+        case WIFI_AUTH_OPEN:          return "[ESS]";
+        case WIFI_AUTH_WEP:           return "[WEP][ESS]";
+        case WIFI_AUTH_WPA_PSK:       return "[WPA-PSK-CCMP][ESS]";
+        case WIFI_AUTH_WPA2_PSK:      return "[WPA2-PSK-CCMP][ESS]";
+        case WIFI_AUTH_WPA_WPA2_PSK:  return "[WPA-PSK-CCMP+TKIP][WPA2-PSK-CCMP+TKIP][ESS]";
+        case WIFI_AUTH_WPA3_PSK:      return "[WPA3-SAE][ESS]";
+        case WIFI_AUTH_WPA2_WPA3_PSK: return "[WPA2-PSK-CCMP][WPA3-SAE][ESS]";
+        case WIFI_AUTH_WAPI_PSK:      return "[WAPI-PSK][ESS]";
+        default:                      return "[ESS]";
     }
 }
 
@@ -782,7 +613,7 @@ void WarhogMode::appendWigleEntry(const uint8_t* bssid, const char* ssid,
                                    double lat, double lon, double alt, double accuracy) {
     if (!ensureWigleFileReady()) return;
     
-    File f = openFileWithRetry(currentWigleFilename.c_str(), FILE_APPEND);
+    File f = openFileWithRetry(currentWigleFilename, FILE_APPEND);
     if (!f) return;
     
     // MAC (BSSID with colons)
@@ -881,9 +712,11 @@ void WarhogMode::processScanResults() {
             }
         }
         
-        // Extract network info
-        String ssidStr = WiFi.SSID(i);
-        const char* ssid = ssidStr.c_str();
+        // Extract SSID to stack buffer — avoids heap String for each of 50+ networks
+        char ssidBuf[33];
+        strncpy(ssidBuf, WiFi.SSID(i).c_str(), sizeof(ssidBuf) - 1);
+        ssidBuf[sizeof(ssidBuf) - 1] = '\0';
+        const char* ssid = ssidBuf;
         int8_t rssi = WiFi.RSSI(i);
         uint8_t channel = WiFi.channel(i);
         wifi_auth_mode_t authmode = WiFi.encryptionType(i);
@@ -891,29 +724,7 @@ void WarhogMode::processScanResults() {
         // Validate extracted data to prevent potential crashes
         if (!ssid || strlen(ssid) > 32) continue;
         if (channel == 0 || channel > 165) continue; // Valid WiFi channels are 1-165
-        
-        // Extract ML features
-        WiFiFeatures features;
-        if (enhancedMode && beaconMutex && !beaconMapBusy) {
-            bool found = false;
-            // Use timeout for mutex to prevent indefinite blocking
-            if (xSemaphoreTake(beaconMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                auto it = beaconFeatures.find(bssidKey);
-                if (it != beaconFeatures.end()) {
-                    features = it->second;
-                    features.rssi = rssi;
-                    features.snr = (float)(rssi - features.noise);
-                    found = true;
-                }
-                xSemaphoreGive(beaconMutex);
-            }
-            if (!found) {
-                features = FeatureExtractor::extractBasic(rssi, channel, authmode);
-            }
-        } else {
-            features = FeatureExtractor::extractBasic(rssi, channel, authmode);
-        }
-        
+
         // Update statistics
         totalNetworks++;
         newThisScan++;
@@ -954,17 +765,6 @@ void WarhogMode::processScanResults() {
                 savedCount++;
                 geotaggedThisScan++;
                 XP::addXP(XPEvent::WARHOG_LOGGED);  // +2 XP for geotagged network
-                
-                if (enhancedMode) {
-                    appendMLEntry(bssidPtr, ssid, features, 0,
-                                 gpsData.latitude, gpsData.longitude);
-                }
-            } else {
-                // No GPS: ML only (if Enhanced mode)
-                if (enhancedMode) {
-                    appendMLEntry(bssidPtr, ssid, features, 0, 0, 0);
-                    mlOnlyCount++;
-                }
             }
         }
     }
@@ -976,11 +776,6 @@ void WarhogMode::processScanResults() {
     }
     
     WiFi.scanDelete();
-    
-    // Re-enable promiscuous mode for beacon capture if Enhanced mode
-    if (enhancedMode) {
-        esp_wifi_set_promiscuous(true);
-    }
 }
 
 bool WarhogMode::hasGPSFix() {
@@ -997,41 +792,21 @@ GPSData WarhogMode::getGPSData() {
 bool WarhogMode::exportCSV(const char* path) {
     // Data is already in currentFilename as CSV
     // This function would copy/rename, but for now just return status
-    return currentFilename.length() > 0;
+    return currentFilename[0] != '\0';
 }
 
-// Helper to escape XML special characters
-static String escapeXML(const char* str) {
-    String result;
-    for (int i = 0; str[i] && i < 64; i++) {
-        switch (str[i]) {
-            case '&':  result += "&amp;"; break;
-            case '<':  result += "&lt;"; break;
-            case '>':  result += "&gt;"; break;
-            case '"':  result += "&quot;"; break;
-            case '\'': result += "&apos;"; break;
-            default:   result += str[i]; break;
-        }
-    }
-    return result;
-}
 
-bool WarhogMode::exportMLTraining(const char* path) {
-    // ML data is already on disk in currentMLFilename
-    return currentMLFilename.length() > 0;
-}
-
-String WarhogMode::authModeToString(wifi_auth_mode_t mode) {
+const char* WarhogMode::authModeToString(wifi_auth_mode_t mode) {
     switch (mode) {
-        case WIFI_AUTH_OPEN: return "OPEN";
-        case WIFI_AUTH_WEP: return "WEP";
-        case WIFI_AUTH_WPA_PSK: return "WPA";
-        case WIFI_AUTH_WPA2_PSK: return "WPA2";
-        case WIFI_AUTH_WPA_WPA2_PSK: return "WPA/WPA2";
-        case WIFI_AUTH_WPA3_PSK: return "WPA3";
+        case WIFI_AUTH_OPEN:          return "OPEN";
+        case WIFI_AUTH_WEP:           return "WEP";
+        case WIFI_AUTH_WPA_PSK:       return "WPA";
+        case WIFI_AUTH_WPA2_PSK:      return "WPA2";
+        case WIFI_AUTH_WPA_WPA2_PSK:  return "WPA/WPA2";
+        case WIFI_AUTH_WPA3_PSK:      return "WPA3";
         case WIFI_AUTH_WPA2_WPA3_PSK: return "WPA2/WPA3";
-        case WIFI_AUTH_WAPI_PSK: return "WAPI";
-        default: return "UNKNOWN";
+        case WIFI_AUTH_WAPI_PSK:      return "WAPI";
+        default:                      return "UNKNOWN";
     }
 }
 
@@ -1084,90 +859,25 @@ void WarhogMode::buildBountyList(uint8_t* buffer, uint8_t* count) {
     }
 }
 
-String WarhogMode::generateFilename(const char* ext) {
-    char buf[64];
+void WarhogMode::generateFilename(char* buf, size_t bufSize, const char* ext) {
     GPSData gps = GPS::getData();
     const char* wardrivingDir = SDLayout::wardrivingDir();
-    
+
     if (gps.date > 0 && gps.time > 0) {
-        // date format: DDMMYY, time format: HHMMSSCC (centiseconds)
         uint8_t day = gps.date / 10000;
         uint8_t month = (gps.date / 100) % 100;
         uint8_t year = gps.date % 100;
         uint8_t hour = gps.time / 1000000;
         uint8_t minute = (gps.time / 10000) % 100;
         uint8_t second = (gps.time / 100) % 100;
-        
-        snprintf(buf, sizeof(buf), "%s/warhog_20%02d%02d%02d_%02d%02d%02d.%s",
+
+        snprintf(buf, bufSize, "%s/warhog_20%02d%02d%02d_%02d%02d%02d.%s",
                 wardrivingDir,
                 year, month, day, hour, minute, second, ext);
     } else {
-        // No GPS time - use millis with random suffix for uniqueness
-        snprintf(buf, sizeof(buf), "%s/warhog_%lu_%04X.%s", 
+        snprintf(buf, bufSize, "%s/warhog_%lu_%04X.%s",
                 wardrivingDir,
                 millis(), (uint16_t)esp_random(), ext);
     }
-    
-    return String(buf);
 }
 
-// Enhanced ML Mode - Promiscuous beacon capture
-
-void WarhogMode::promiscuousCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
-    if (type != WIFI_PKT_MGMT) return;
-    if (beaconMapBusy) return;
-    if (!buf) return;  // Null check for safety
-    
-    wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
-    const uint8_t* frame = pkt->payload;
-    uint16_t len = pkt->rx_ctrl.sig_len;
-    int8_t rssi = pkt->rx_ctrl.rssi;
-    
-    if (len < 24 || len > 2048) return;  // Bounds check to prevent invalid lengths
-    
-    uint16_t frameControl = frame[0] | (frame[1] << 8);
-    uint8_t frameType = (frameControl >> 2) & 0x03;
-    uint8_t frameSubtype = (frameControl >> 4) & 0x0F;
-    
-    if (frameType != 0) return;
-    if (frameSubtype != 8 && frameSubtype != 5) return;
-    
-    const uint8_t* bssid = frame + 16;
-    uint64_t key = bssidToKey(bssid);
-    
-    WiFiFeatures features = FeatureExtractor::extractFromBeacon(frame, len, rssi);
-
-    // Use timeout for mutex to prevent blocking indefinitely in interrupt context
-    if (beaconMutex && xSemaphoreTake(beaconMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-        // Limit beaconFeatures size to prevent memory exhaustion
-        if (beaconFeatures.size() < 500) {
-            auto it = beaconFeatures.find(key);
-            if (it != beaconFeatures.end()) {
-                it->second.beaconCount++;
-            } else {
-                features.beaconCount = 1;
-                beaconFeatures[key] = features;
-            }
-            beaconCount++;
-        }
-        xSemaphoreGive(beaconMutex);
-    }
-    // If mutex unavailable, skip adding to map (safe fallback)
-}
-
-void WarhogMode::startEnhancedCapture() {
-    beaconFeatures.clear();
-    beaconCount = 0;
-    
-    wifi_promiscuous_filter_t filter = {
-        .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT
-    };
-    
-    esp_wifi_set_promiscuous_filter(&filter);
-    esp_wifi_set_promiscuous_rx_cb(promiscuousCallback);
-    esp_wifi_set_promiscuous(true);
-}
-
-void WarhogMode::stopEnhancedCapture() {
-    WiFiUtils::stopPromiscuous();
-}

@@ -3,6 +3,8 @@
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <FS.h>
+#include <SPI.h>
 
 #define CONFIG_FILE "/porkchop.conf"
 #define PERSONALITY_FILE "/personality.json"
@@ -13,6 +15,19 @@ enum class GPSSource : uint8_t {
     CAP_LORA = 1,   // Cap LoRa868 GPS (G15/G13) - Cardputer ADV only
     CUSTOM = 2      // Custom pins - user-configured
 };
+
+static constexpr uint8_t GPS_SOURCE_COUNT = 3;
+
+// CapLoRa868 module pins (M5Stack Cardputer ADV EXT header)
+// LoRa SPI shares MOSI/MISO/SCK with SD card - only CS differs
+namespace CapLoraPins {
+    static constexpr uint8_t LORA_CS    = 5;   // SX1262 NSS (chip select)
+    static constexpr uint8_t LORA_RESET = 3;   // SX1262 NRESET
+    static constexpr uint8_t LORA_DIO1  = 4;   // SX1262 DIO1 (interrupt)
+    static constexpr uint8_t LORA_BUSY  = 6;   // SX1262 BUSY
+    static constexpr uint8_t GPS_RX     = 15;  // GPS UART RX
+    static constexpr uint8_t GPS_TX     = 13;  // GPS UART TX (default FSPIQ IOMUX!)
+}
 
 // GPS power management settings
 struct GPSConfig {
@@ -59,20 +74,27 @@ static constexpr uint8_t BOOT_MODE_COUNT = 4;
 struct MLConfig {
     bool enabled = true;
     MLCollectionMode collectionMode = MLCollectionMode::ENHANCED;  // Data collection mode
-    String modelPath = "/m5porkchop/models/porkchop_model.bin";
+    char modelPath[64] = "/m5porkchop/models/porkchop_model.bin";
     float confidenceThreshold = 0.7f;
     float rogueApThreshold = 0.8f;
     float vulnScorerThreshold = 0.6f;
     bool autoUpdate = false;
-    String updateUrl = "";
+    char updateUrl[128] = "";
 };
 
 // WiFi settings for scanning and OTA
 struct WiFiConfig {
-    uint16_t channelHopInterval = 500;
+    uint16_t channelHopInterval = 150;
+    uint16_t spectrumHopInterval = 150;  // Spectrum-only sweep speed (ms)
     uint16_t lockTime = 12000;          // Time to discover clients before attacking (12s optimal, buffed 13s)
     bool enableDeauth = true;
     bool randomizeMAC = true;           // Randomize MAC on mode start for stealth
+    int8_t spectrumMinRssi = -95;       // Spectrum: minimum RSSI to render (dBm)
+    int8_t attackMinRssi = -70;          // OINK/DNH: ignore networks weaker than this (dBm)
+    uint8_t spectrumTopN = 0;           // Spectrum: cap visible APs (0 = no cap)
+    uint16_t spectrumStaleMs = 5000;    // Spectrum: stale timeout before drop (ms)
+    bool spectrumCollapseSsid = false;  // Spectrum: merge same-SSID APs
+    bool spectrumTiltEnabled = true;    // Spectrum: enable tilt-to-tune
     char otaSSID[33];
     char otaPassword[65];
     bool autoConnect = false;
@@ -90,6 +112,7 @@ struct BLEConfig {
 // Personality
 struct PersonalityConfig {
     char name[32] = "Porkchop";
+    char callsign[16] = "";             // User handle (unlocked at L10)
     int mood = 50;                      // -100 to 100
     uint32_t experience = 0;
     float curiosity = 0.7f;
@@ -99,7 +122,7 @@ struct PersonalityConfig {
     uint8_t brightness = 80;            // Display brightness 0-100%
     uint8_t dimLevel = 20;              // Dimmed brightness 0-100% (0 = off)
     uint16_t dimTimeout = 30;           // Seconds before dimming (0 = never)
-    uint8_t themeIndex = 0;             // Color theme (0-13, see THEMES array)
+    uint8_t themeIndex = 0;             // Color theme (0-14, see THEMES array)
     G0Action g0Action = G0Action::SCREEN_TOGGLE;
     BootMode bootMode = BootMode::IDLE;
 };
@@ -114,6 +137,10 @@ public:
     static bool reinitSD();  // Try to (re)initialize SD card at runtime
     static bool loadWpaSecKeyFromFile();  // Load key from /m5porkchop/wpa-sec/wpasec_key.txt (legacy /wpasec_key.txt)
     static bool loadWigleKeyFromFile();   // Load keys from /m5porkchop/wigle/wigle_key.txt (legacy /wigle_key.txt)
+    static void prepareSDBus();           // Prepare SPI bus for raw SD access
+    static void prepareCapLoraGpio();     // Quiesce SX1262 and clear G13 IOMUX before GPS UART
+    static SPIClass& sdSpi();             // Access SD SPI bus
+    static int sdCsPin();                 // Access SD chip-select pin
     
     // Getters
     static GPSConfig& gps() { return gpsConfig; }
@@ -140,4 +167,7 @@ private:
     static bool createDefaultConfig();
     static bool createDefaultPersonality();
     static void savePersonalityToSPIFFS();
+    static bool loadFrom(fs::FS& fs, const char* path);   // JSON migration only
+    static bool applyJson(const JsonDocument& doc);        // JSON migration only
+    static bool importCredsFromJsonConf();                 // Merge creds from porkchop.conf if present
 };

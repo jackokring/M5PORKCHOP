@@ -30,7 +30,8 @@ private:
     static bool keyWasPressed;
     static bool editing;  // Currently adjusting a value
     static bool textEditing;  // Currently editing text
-    static String textBuffer;  // Buffer for text input
+    static char textBuffer[80];   // Buffer for text input (max field is 64 chars)
+    static uint8_t textLen;
     static uint8_t rootIndex;
     static uint8_t rootScroll;
     static uint8_t groupIndex;
@@ -43,6 +44,7 @@ private:
     static uint8_t origGpsRxPin;
     static uint8_t origGpsTxPin;
     static uint32_t origGpsBaud;
+    static uint8_t origGpsSource;
 
     static const uint8_t VISIBLE_ROOT_ITEMS = 5;
     static const uint8_t VISIBLE_GROUP_ITEMS = 4;

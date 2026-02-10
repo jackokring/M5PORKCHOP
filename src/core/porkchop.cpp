@@ -18,24 +18,29 @@
 #include "../piglet/mood.h"
 #include "../piglet/avatar.h"
 #include "../modes/oink.h"
+#include "heap_policy.h"
 #include "../modes/donoham.h"
 #include "../modes/warhog.h"
 #include "../modes/piggyblues.h"
 #include "../modes/spectrum.h"
 #include "../modes/pigsync_client.h"
 #include "../modes/bacon.h"
+#include "../modes/charging.h"
 #include "../web/fileserver.h"
 #include "../audio/sfx.h"
 #include "config.h"
+#include "heap_health.h"
 #include "xp.h"
 #include "sdlog.h"
 #include "sd_format.h"
 #include "challenges.h"
 #include "stress_test.h"
 #include "network_recon.h"
+#include "wifi_utils.h"
 #include <esp_heap_caps.h>
 #include <esp_attr.h>
 #include <esp_system.h>
+#include <WiFi.h>
 
 static const char* modeToString(PorkchopMode mode) {
     switch (mode) {
@@ -60,6 +65,7 @@ static const char* modeToString(PorkchopMode mode) {
         case PorkchopMode::PIGSYNC_DEVICE_SELECT: return "PIGSYNC_DEVICE_SELECT";
         case PorkchopMode::BACON_MODE: return "BACON";
         case PorkchopMode::SD_FORMAT: return "SD_FORMAT";
+        case PorkchopMode::CHARGING: return "CHARGING";
         case PorkchopMode::ABOUT: return "ABOUT";
         default: return "UNKNOWN";
     }
@@ -93,6 +99,8 @@ static const char* bootModeLabel(BootMode mode) {
     }
 }
 
+static bool healthBootToastShown = false;
+
 Porkchop::Porkchop() 
     : currentMode(PorkchopMode::IDLE)
     , previousMode(PorkchopMode::IDLE)
@@ -100,6 +108,55 @@ Porkchop::Porkchop()
     , handshakeCount(0)
     , networkCount(0)
     , deauthCount(0) {
+}
+
+static bool isAutoConditionSafe(PorkchopMode mode) {
+    switch (mode) {
+        case PorkchopMode::IDLE:
+        case PorkchopMode::MENU:
+        case PorkchopMode::SETTINGS:
+        case PorkchopMode::ABOUT:
+        case PorkchopMode::ACHIEVEMENTS:
+        case PorkchopMode::CRASH_VIEWER:
+        case PorkchopMode::DIAGNOSTICS:
+        case PorkchopMode::SWINE_STATS:
+        case PorkchopMode::BOAR_BROS:
+        case PorkchopMode::UNLOCKABLES:
+        case PorkchopMode::BOUNTY_STATUS:
+        case PorkchopMode::SD_FORMAT:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static void maybeAutoConditionHeap(PorkchopMode mode) {
+    if (!isAutoConditionSafe(mode)) {
+        return;
+    }
+    if (FileServer::isRunning() || FileServer::isConnecting()) {
+        return;
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+        return;
+    }
+    // At Critical pressure (<30KB free), brew needs 35KB transient — would fail anyway
+    if (static_cast<uint8_t>(HeapHealth::getPressureLevel()) > HeapPolicy::kMaxPressureLevelForAutoBrew) {
+        return;
+    }
+    if (!HeapHealth::consumeConditionRequest()) {
+        return;
+    }
+
+    bool wasReconRunning = NetworkRecon::isRunning();
+    if (wasReconRunning) {
+        NetworkRecon::pause();
+    }
+    // Small, low-disruption brew to coalesce heap when health drops.
+    WiFiUtils::brewHeap(HeapPolicy::kBrewAutoDwellMs, false);
+    if (wasReconRunning) {
+        NetworkRecon::resume();
+    }
 }
 
 void Porkchop::init() {
@@ -168,6 +225,7 @@ void Porkchop::init() {
             case 18: setMode(PorkchopMode::BACON_MODE); break;
             case 19: setMode(PorkchopMode::DIAGNOSTICS); break;
             case 20: setMode(PorkchopMode::SD_FORMAT); break;
+            case 21: setMode(PorkchopMode::CHARGING); break;
         }
     });
 
@@ -193,6 +251,17 @@ void Porkchop::init() {
     
     // Initialize non-blocking audio system
     SFX::init();
+
+    if (!healthBootToastShown) {
+        healthBootToastShown = true;
+        Display::showToast(
+            "HEALTH BAR IS HEAP HEALTH.\n"
+            "LARGEST CONTIG DRIVES TLS.\n"
+            "FRAGMENTATION YOINKS IT.\n"
+            "BREW FIXES. JAH BLESS DI RF.",
+            5000
+        );
+    }
     
     Serial.println("[PORKCHOP] Initialized");
     SDLog::log("PORK", "Initialized - LV%d %s", XP::getLevel(), XP::getTitle());
@@ -219,6 +288,8 @@ void Porkchop::update() {
         }
     }
     updateMode();
+
+    maybeAutoConditionHeap(currentMode);
     
     // Tick non-blocking audio engine
     SFX::update();
@@ -342,6 +413,9 @@ void Porkchop::setMode(PorkchopMode mode) {
         case PorkchopMode::BACON_MODE:
             BaconMode::stop();
             break;
+        case PorkchopMode::CHARGING:
+            ChargingMode::stop();
+            break;
         default:
             break;
     }
@@ -406,9 +480,9 @@ void Porkchop::setMode(PorkchopMode mode) {
             AchievementsMenu::show();
             break;
         case PorkchopMode::FILE_TRANSFER:
-            // Stop NetworkRecon to prevent heap fragmentation during FILE_TRANSFER
-            // (promiscuous callbacks interleaved with WebServer allocs cause fragmentation)
+            // Stop NetworkRecon and free its ~19KB network vector — FILE_TRANSFER doesn't use it
             NetworkRecon::stop();
+            NetworkRecon::freeNetworks();
             Avatar::setState(AvatarState::HAPPY);
             FileServer::start(Config::wifi().otaSSID, Config::wifi().otaPassword);
             break;
@@ -451,6 +525,10 @@ void Porkchop::setMode(PorkchopMode mode) {
         case PorkchopMode::ABOUT:
             Display::resetAboutState();
             break;
+        case PorkchopMode::CHARGING:
+            SDLog::log("PORK", "Mode: CHARGING");
+            ChargingMode::start();
+            break;
         default:
             break;
     }
@@ -487,29 +565,33 @@ void Porkchop::registerCallback(PorkchopEvent event, EventCallback callback) {
 
 void Porkchop::processEvents() {
     // Process events with bounds checking and yield for WDT safety
+    // NOTE: All postEvent() callers pass nullptr for data — no ownership to track.
     size_t processed = 0;
     const size_t MAX_EVENTS_PER_UPDATE = 16; // Limit events processed per update to prevent WDT
-    
-    for (const auto& item : eventQueue) {
-        if (processed >= MAX_EVENTS_PER_UPDATE) {
-            // If we hit the limit, remove processed events and keep remaining for next update
-            eventQueue.erase(eventQueue.begin(), eventQueue.begin() + processed);
-            return; // Exit early to avoid WDT timeout
-        }
-        
+
+    // Index-based loop to avoid iterator invalidation from erase()
+    size_t i = 0;
+    while (i < eventQueue.size() && processed < MAX_EVENTS_PER_UPDATE) {
+        const auto& item = eventQueue[i];
+
         for (const auto& cb : callbacks) {
             if (cb.first == item.event) {
-                // Execute callback with potential for yielding to prevent WDT issues
                 cb.second(item.event, item.data);
-                
-                // Yield occasionally during heavy event processing
+
                 if (++processed % 4 == 0) {
-                    yield(); // Allow other tasks to run
+                    yield();
                 }
             }
         }
+        i++;
     }
-    eventQueue.clear();
+
+    // Erase all processed events in one operation after the loop
+    if (i >= eventQueue.size()) {
+        eventQueue.clear();
+    } else {
+        eventQueue.erase(eventQueue.begin(), eventQueue.begin() + i);
+    }
 }
 
 void Porkchop::handleInput() {
@@ -700,6 +782,10 @@ void Porkchop::handleInput() {
                 case '2': // PIGSYNC device select
                     setMode(PorkchopMode::PIGSYNC_DEVICE_SELECT);
                     break;
+                case 'c': // Charging mode
+                case 'C':
+                    setMode(PorkchopMode::CHARGING);
+                    break;
             }
         }
         yield(); // Allow other tasks to run after processing all keys
@@ -882,6 +968,12 @@ void Porkchop::updateMode() {
             if (!PigSyncMode::isRunning()) {
                 // User exited, go back to menu
                 setMode(PorkchopMode::MENU);
+            }
+            break;
+        case PorkchopMode::CHARGING:
+            ChargingMode::update();
+            if (ChargingMode::shouldExit()) {
+                setMode(PorkchopMode::IDLE);
             }
             break;
         default:

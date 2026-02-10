@@ -25,6 +25,7 @@
 #include "../modes/pigsync_client.h"
 #include "../modes/pigsync_protocol.h"
 #include "../modes/bacon.h"
+#include "../modes/charging.h"
 #include "../gps/gps.h"
 #include "../web/fileserver.h"
 #include "menu.h"
@@ -263,7 +264,16 @@ void Display::update() {
     // Check for screen dimming
     updateDimming();
     
-    drawTopBar();
+    // SD Format mode hides bars to save RAM for disk operations
+    bool barsHidden = SdFormatMenu::areBarsHidden() || ChargingMode::areBarsHidden();
+    
+    if (!barsHidden) {
+        drawTopBar();
+    } else {
+        // Clear bar sprites when hidden to prevent stale content on push
+        topBar.fillSprite(COLOR_BG);
+        bottomBar.fillSprite(COLOR_BG);
+    }
 
     PorkchopMode mode = porkchop.getMode();
     bool useAvatarWeather = (mode == PorkchopMode::IDLE ||
@@ -388,6 +398,9 @@ void Display::update() {
         case PorkchopMode::SD_FORMAT:
             SdFormatMenu::draw(mainCanvas);
             break;
+        case PorkchopMode::CHARGING:
+            ChargingMode::draw(mainCanvas);
+            break;
     }
     
     // Draw toast if active and not expired (show for 2 seconds)
@@ -435,7 +448,9 @@ void Display::update() {
         toastActive = false;
     }
 
-    drawBottomBar();
+    if (!barsHidden) {
+        drawBottomBar();
+    }
     pushAll();
 }
 
@@ -618,10 +633,14 @@ void Display::drawTopBar() {
             snprintf(modeBuf, sizeof(modeBuf), "SD FORMAT");
             modeColor = COLOR_WARNING;
             break;
+        case PorkchopMode::CHARGING:
+            snprintf(modeBuf, sizeof(modeBuf), "CHARGING");
+            modeColor = COLOR_SUCCESS;
+            break;
     }
     
     // Append mood indicator
-    int happiness = Mood::getCurrentHappiness();
+    int happiness = Mood::getLastEffectiveHappiness();
     const char* moodLabel;
     if (happiness > 70) moodLabel = "HYP3";
     else if (happiness > 30) moodLabel = "GUD";
@@ -651,7 +670,14 @@ void Display::drawTopBar() {
     } else {
         getSystemTimeString(timeBuf, sizeof(timeBuf));
     }
-    int battLevel = M5.Power.getBatteryLevel();
+    static uint32_t lastBattUpdateMs = 0;
+    static int lastBattLevel = 0;
+    uint32_t now = millis();
+    if (lastBattUpdateMs == 0 || (now - lastBattUpdateMs) >= 2000) {
+        lastBattLevel = M5.Power.getBatteryLevel();
+        lastBattUpdateMs = now;
+    }
+    int battLevel = lastBattLevel;
     char statusBuf[4];
     statusBuf[0] = gpsStatus ? 'G' : '-';
     statusBuf[1] = wifiStatus ? 'W' : '-';
@@ -810,7 +836,7 @@ void Display::drawBottomBar() {
         // DIAGNOSTICS: show controls
         statsStr = "[ENT]SAVE [R]WIFI [H]HEAP [G]GC";
     } else if (mode == PorkchopMode::SD_FORMAT) {
-        statsStr = "ENTER=ARM  BKSP=EXIT";
+        statsStr = "ENTER=SELECT  BKSP=EXIT";
     } else if (mode == PorkchopMode::OINK_MODE) {
         // OINK: show Networks, Handshakes, Deauths, Channel, and optionally BRO count
         // PWNED banner is shown in top bar
@@ -928,7 +954,7 @@ void Display::drawBottomBar() {
 
     // Center: Heap health bar (XP-style, inverted)
     if (showHealthBar) {
-        int pct = HeapHealth::getPercent();
+        int pct = HeapHealth::getDisplayPercent();
 
         const int barW = 80;
         const int barH = 6;
@@ -1239,6 +1265,18 @@ void Display::showBootSplash() {
 
     bootSplashDelay(1200);
 
+    // Screen 4 (optional): Welcome back when callsign is set
+    const char* cs = Config::personality().callsign;
+    if (cs[0] != '\0') {
+        M5.Display.fillScreen(COLOR_BG);
+        M5.Display.setTextDatum(middle_center);
+        M5.Display.setTextSize(2);
+        M5.Display.drawString("WELCOME BACK", DISPLAY_W / 2, DISPLAY_H / 2 - 15);
+        M5.Display.setTextSize(3);
+        M5.Display.drawString(cs, DISPLAY_W / 2, DISPLAY_H / 2 + 15);
+        bootSplashDelay(1000);
+    }
+
     // Reset display state for main UI compatibility
     M5.Display.setTextDatum(top_left);
     M5.Display.setTextSize(1);
@@ -1246,35 +1284,44 @@ void Display::showBootSplash() {
 
 
 void Display::showProgress(const String& title, uint8_t percent) {
+    showProgress(title.c_str(), percent);
+}
+
+void Display::showProgress(const char* title, uint8_t percent) {
     mainCanvas.fillSprite(COLOR_BG);
     mainCanvas.setTextColor(COLOR_FG);
-    
+
     mainCanvas.setTextDatum(top_center);
     mainCanvas.setTextSize(2);
-    mainCanvas.drawString(title, DISPLAY_W / 2, 20);
-    
+    mainCanvas.drawString(title ? title : "", DISPLAY_W / 2, 20);
+
     // Progress bar
     int barW = DISPLAY_W - 40;
     int barH = 15;
     int barX = 20;
     int barY = MAIN_H / 2;
-    
+
     mainCanvas.drawRect(barX, barY, barW, barH, COLOR_FG);
     int fillW = (barW - 2) * percent / 100;
     mainCanvas.fillRect(barX + 1, barY + 1, fillW, barH - 2, COLOR_ACCENT);
-    
+
     // Percentage text
     mainCanvas.setTextSize(1);
     char percentBuf[8];
     snprintf(percentBuf, sizeof(percentBuf), "%u%%", percent);
     mainCanvas.drawString(percentBuf, DISPLAY_W / 2, barY + barH + 10);
-    
+
     pushAll();
 }
 
 void Display::showToast(const String& message, uint32_t durationMs) {
     if (message.length() == 0) return;
-    strncpy(toastMessage, message.c_str(), sizeof(toastMessage) - 1);
+    showToast(message.c_str(), durationMs);
+}
+
+void Display::showToast(const char* message, uint32_t durationMs) {
+    if (!message || message[0] == '\0') return;
+    strncpy(toastMessage, message, sizeof(toastMessage) - 1);
     toastMessage[sizeof(toastMessage) - 1] = '\0';
     toastStartTime = millis();
     toastDurationMs = (durationMs > 0) ? durationMs : 2000;
@@ -1527,14 +1574,14 @@ static const char* const FATHER_INIT_PHRASES[] = {
     "FATHER//WAKE SEQUENCE COMPLETE",
     "FATHER//CORE ONLINE",
     "FATHER//COLD START OK",
-    "FATHER//READY TO LISTEN",
+    "FATHER//ESP-NOW ARMED",
     "FATHER//SYSTEM GREEN"
 };
 static const char* const FATHER_LISTEN_PHRASES[] = {
     "FATHER//LISTEN CH%02d",
     "FATHER//RECEIVE WINDOW CH%02d",
     "FATHER//QUIET ON CH%02d",
-    "FATHER//OPEN CHANNEL %02d",
+    "FATHER//BROADCAST CH%02d",
     "FATHER//LISTENING CH%02d"
 };
 static const char* const FATHER_PROBE_PHRASES[] = {
@@ -1542,59 +1589,59 @@ static const char* const FATHER_PROBE_PHRASES[] = {
     "FATHER//ECHO SEARCH",
     "FATHER//SON SIGNAL SWEEP",
     "FATHER//SEEKING SON",
-    "FATHER//SCANNING QUIET"
+    "FATHER//BEACON SWEEP"
 };
 static const char* const FATHER_FOUND_PHRASES[] = {
     "FATHER//CONTACTS: %d",
     "FATHER//SIGNALS FOUND: %d",
-    "FATHER//PRESENCE: %d",
+    "FATHER//CALLSIGN: %d",
     "FATHER//SONS FOUND: %d"
 };
 static const char* const FATHER_DIAL_PHRASES[] = {
     "FATHER//DIAL %s",
     "FATHER//CALLING %s",
-    "FATHER//OPEN LINK %s"
+    "FATHER//CMD_HELLO %s"
 };
 static const char* const FATHER_RING_PHRASES[] = {
     "FATHER//INCOMING",
     "FATHER//RINGING",
-    "FATHER//ANSWER WINDOW"
+    "FATHER//RSP_RING RECV"
 };
 static const char* const FATHER_HANDSHAKE_PHRASES[] = {
     "FATHER//HANDSHAKE OK",
     "FATHER//LINK STABLE",
-    "FATHER//LINK ESTABLISHED"
+    "FATHER//LMK VERIFIED"
 };
 static const char* const FATHER_NAME_PHRASES[] = {
     "FATHER//IDENT: %s",
-    "FATHER//SON ID: %s",
+    "FATHER//CALLSIGN: %s",
     "FATHER//NAME REVEALED: %s"
 };
 static const char* const FATHER_LIVE_PHRASES[] = {
     "FATHER//SESSION LIVE",
     "FATHER//SESSION ACTIVE",
-    "FATHER//DATA CHANNEL OPEN"
+    "FATHER//DATA CH LOCKED"
 };
 static const char* const FATHER_TRANSFER_BEGIN_PHRASES[] = {
-    "FATHER//TRANSFER START",
+    "FATHER//CHUNKS INCOMING",
     "FATHER//TRANSFER RUNNING",
     "FATHER//RECEIVE SEQ START"
 };
 static const char* const FATHER_TRANSFER_END_PHRASES[] = {
-    "FATHER//TRANSFER COMPLETE",
+    "FATHER//CRC32 VERIFIED",
     "FATHER//RECEIVE COMPLETE",
     "FATHER//CHANNEL CLOSED"
 };
 static const char* const FATHER_NO_PIGS_PHRASES[] = {
     "FATHER//NO CONTACTS",
-    "FATHER//NO SIGNAL"
+    "FATHER//ZERO BEACONS"
 };
 static const char* const FATHER_IDLE_PHRASES[] = {
     "FATHER//STANDBY",
-    "FATHER//WAITING"
+    "FATHER//IDLE LOOP"
 };
 static const char* const FATHER_ERROR_PHRASES[] = {
-    "FATHER//ERROR: %s",
+    "FATHER//ERR: %s",
     "FATHER//FAULT: %s"
 };
 static const char* const FATHER_EXIST_SINGLE[] = {
@@ -1617,7 +1664,7 @@ static const FatherLinePair FATHER_EXIST_PAIRS[] = {
     { "FATHER//TRANSMISSION NOT A LANGUAGE", "FATHER//TRY ANOTHER CODE" }
 };
 static const char* const FATHER_ARROWS_PHRASES[] = {
-    "FATHER//WHY BLE"
+    "FATHER//SELECT TARGET"
 };
 static const char* const FATHER_HINT_LINE = "FATHER//ARROWS SELECT  ENTER CONNECT";
 static const char* const FATHER_HEADER_DEFAULT = "PIGSYNC::FA/TH/ER";
@@ -2852,14 +2899,25 @@ static uint16_t getNextScreenshotNumber() {
     
     File entry;
     while ((entry = dir.openNextFile())) {
-        String name = entry.name();
+        const char* name = entry.name();
         entry.close();
-        
-        // Parse "screenshotNNN.bmp" format
-        if (name.startsWith("screenshot") && name.endsWith(".bmp")) {
-            String numStr = name.substring(10, name.length() - 4);
-            uint16_t num = numStr.toInt();
-            if (num > maxNum) maxNum = num;
+
+        // Parse "screenshotNNN.bmp" format — zero heap allocation
+        // Extract basename if path includes directory
+        const char* base = strrchr(name, '/');
+        base = base ? base + 1 : name;
+        size_t baseLen = strlen(base);
+        if (baseLen > 14 && strncmp(base, "screenshot", 10) == 0 &&
+            strcmp(base + baseLen - 4, ".bmp") == 0) {
+            // Extract number between "screenshot" and ".bmp"
+            char numBuf[8];
+            size_t numLen = baseLen - 14;  // 10 ("screenshot") + 4 (".bmp")
+            if (numLen < sizeof(numBuf)) {
+                memcpy(numBuf, base + 10, numLen);
+                numBuf[numLen] = '\0';
+                uint16_t num = (uint16_t)atoi(numBuf);
+                if (num > maxNum) maxNum = num;
+            }
         }
     }
     dir.close();
@@ -2873,7 +2931,7 @@ bool Display::takeScreenshot() {
     
     // Check SD availability
     if (!Config::isSDAvailable()) {
-        showToast("NO SD CARD");
+        requestTopBarMessage("NO SD CARD", 2000);
         return false;
     }
     
@@ -2902,7 +2960,7 @@ bool Display::takeScreenshot() {
     
     if (!file) {
         Serial.println("[DISPLAY] Failed to open screenshot file");
-        showToast("SD WRITE FAILED");
+        requestTopBarMessage("SD WRITE FAILED", 2500);
         snapping = false;
         return false;
     }
@@ -2970,10 +3028,10 @@ bool Display::takeScreenshot() {
     
     Serial.printf("[DISPLAY] Screenshot saved: %s (%lu bytes)\n", path, filesize);
     
-    // Show success toast
+    // Show success in top bar (not centered toast — that ruins the screenshot)
     char msg[32];
     snprintf(msg, sizeof(msg), "SNAP! #%d", num);
-    showToast(msg);
+    requestTopBarMessage(msg, 2000);
 
     snapping = false;
     return true;

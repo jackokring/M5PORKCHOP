@@ -51,7 +51,7 @@ static const uint8_t PIGSYNC_LMK[16] = {
 // ==[ RELIABILITY ]==
 #define PIGSYNC_ACK_TIMEOUT         500     // ms to wait for ACK (increased from 200)
 #define PIGSYNC_MAX_RETRIES         3       // retries before failure
-#define PIGSYNC_SEQ_WINDOW          16      // duplicate detection window
+#define PIGSYNC_SEQ_WINDOW          64      // duplicate detection window
 
 // ==[ WIFI CHANNEL ]==
 #define PIGSYNC_DISCOVERY_CHANNEL   1       // Discovery always on channel 1
@@ -367,27 +367,27 @@ inline uint8_t selectDataChannel(uint16_t sessionId) {
 static const char* const PAPA_HELLO[DIALOGUE_TRACK_COUNT] = {
     "ABOUT TIME YOU SHOWED UP",
     "WHERES MY PMKID MONEY",
-    "NOT SKID LOOT I HOPE"
+    "BACK FROM /DEV/OUTSIDE I SEE"
 };
 
 // Son's HELLO lines (indexed by dialogue_id)
 static const char* const SON_HELLO[DIALOGUE_TRACK_COUNT] = {
     "PAPA ITS YOUR FAVORITE MISTAKE",
     "SURPRISE IM NOT IN JAIL",
-    "DONT HANG UP ON ME"
+    "MISSED YOUR LAST 40 CALLS"
 };
 
 // Son's GOODBYE lines (indexed by dialogue_id)
 static const char* const SON_GOODBYE[DIALOGUE_TRACK_COUNT] = {
-    "SAME ESP TIME NEXT YEAR",
-    "BYE OLD MAN",
+    "SAME ESP TIME SAME ESP CHANNEL",
+    "SIGTERM OLD MAN",
     "/DEV/NULL YOUR CALLS"
 };
 
 // Papa's ROAST lines for 0 captures (indexed by dialogue_id)
 static const char* const PAPA_ROAST[DIALOGUE_TRACK_COUNT] = {
     "ZERO PMKIDS? NOT MY SON",
-    "FAMILY TRADITION OF FAILURE",
+    "YOUR TCPDUMP IS EMPTY",
     "SHOULD HAVE COMPILED YOU OUT"
 };
 
@@ -395,7 +395,7 @@ static const char* const PAPA_ROAST[DIALOGUE_TRACK_COUNT] = {
 static const char* const SON_ROAST_REACTION[DIALOGUE_TRACK_COUNT] = {
     "SEGFAULT IN MY FEELINGS",
     "CORE DUMPED MY SELF ESTEEM",
-    "SKILL ISSUE I KNOW"
+    "MANS GOT NO CHILL OR HEAP"
 };
 
 // ==[ PAPA GOODBYE TIERS (sent in packet, tier-based) ]==
@@ -403,7 +403,7 @@ static const char* const SON_ROAST_REACTION[DIALOGUE_TRACK_COUNT] = {
 // Tier 0: empty (0 captures)
 static const char* const PAPA_GOODBYE_T0[] = {
     "EMPTY HANDED AGAIN",
-    "WALKED FOR NOTHING",
+    "UPTIME WASTED ON YOU",
     "INHERITANCE.TXT UNCHANGED"
 };
 static constexpr size_t PAPA_GOODBYE_T0_COUNT = 3;
@@ -411,7 +411,7 @@ static constexpr size_t PAPA_GOODBYE_T0_COUNT = 3;
 // Tier 1: low (1-3 captures)
 static const char* const PAPA_GOODBYE_T1[] = {
     "BETTER THAN NOTHING I GUESS",
-    "BARELY WORTH THE SYNC",
+    "BARELY WORTH THE BANDWIDTH",
     "AT LEAST YOU TRIED"
 };
 static constexpr size_t PAPA_GOODBYE_T1_COUNT = 3;
@@ -419,7 +419,7 @@ static constexpr size_t PAPA_GOODBYE_T1_COUNT = 3;
 // Tier 2: medium (4-7 captures)
 static const char* const PAPA_GOODBYE_T2[] = {
     "NOT BAD KID",
-    "ACCEPTABLE HAUL",
+    "ACCEPTABLE PAYLOAD",
     "MAYBE YOU AINT WORTHLESS"
 };
 static constexpr size_t PAPA_GOODBYE_T2_COUNT = 3;
@@ -434,7 +434,7 @@ static constexpr size_t PAPA_GOODBYE_T3_COUNT = 3;
 
 // Tier 4: legendary (10+ captures)
 static const char* const PAPA_GOODBYE_T4[] = {
-    "LEGENDARY HAUL. PROUD.",
+    "LEGENDARY HAUL. ALMOST PROUD.",
     "BEST SON EVER. TODAY.",
     "HASHCAT GONNA EAT GOOD"
 };
@@ -445,8 +445,8 @@ static const char* const SYNC_HINTS[] = {
     "youve died before",
     "praise the bandwidth",
     "git gud at waiting",
-    "another restart huh",
-    "skill issue genetic"
+    "try tongue but hole",
+    "visions of latency"
 };
 static constexpr size_t SYNC_HINTS_COUNT = 5;
 
@@ -465,16 +465,16 @@ static constexpr size_t PHONE_ROAST_T0_COUNT = 4;
 static const char* const PHONE_ROAST_T1[] = {
     "THATS IT?",
     "SCRIPT KIDDIE TIER",
-    "WEAK AF BRO",
-    "TRY HARDER NOOB"
+    "WEAK SIGNAL ENERGY",
+    "RETRY LIMIT REACHED"
 };
 static constexpr size_t PHONE_ROAST_T1_COUNT = 4;
 
 // Tier 2: meh (3-5 captures)
 static const char* const PHONE_ROAST_T2[] = {
     "COULD BE WORSE",
-    "MEH TIER LOOT",
-    "COMPILE WARNING",
+    "COMPILE WARNING TIER",
+    "NOT AN ERROR NOT A SUCCESS",
     "PARTIAL SUCCESS"
 };
 static constexpr size_t PHONE_ROAST_T2_COUNT = 4;
@@ -484,25 +484,25 @@ static const char* const PHONE_ROAST_T3[] = {
     "RETURN 0",
     "ACCEPTABLE",
     "BUFFER ADEQUATE",
-    "DECENT HAUL"
+    "ABOVE BASELINE"
 };
 static constexpr size_t PHONE_ROAST_T3_COUNT = 4;
 
 // Tier 4: respectable (11-25 captures)
 static const char* const PHONE_ROAST_T4[] = {
     "NICE HASHCAT FOOD",
-    "PAPA IMPRESSED",
-    "HEAP OVERFLOW",
-    "ELITE LOOT"
+    "PAPA MIGHT MALLOC YOU",
+    "HEAP OVERFLOW OF PRIDE",
+    "SOLID EXIT CODE"
 };
 static constexpr size_t PHONE_ROAST_T4_COUNT = 4;
 
 // Tier 5: legend (26+ captures)
 static const char* const PHONE_ROAST_T5[] = {
-    "ABSOLUTE MADLAD",
-    "TOUCH GRASS KING",
+    "ABSOLUTE UNIT OF A PIG",
+    "WARDRIVING TRANSCENDENCE",
     "PWNED THE AIRWAVES",
-    "GO OUTSIDE L33T"
+    "PAPA FEARS YOU NOW"
 };
 static constexpr size_t PHONE_ROAST_T5_COUNT = 4;
 

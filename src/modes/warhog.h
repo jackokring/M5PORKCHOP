@@ -3,14 +3,11 @@
 #pragma once
 
 #include <Arduino.h>
-#include <map>
 #include <vector>
-#include <atomic>
 #include <esp_wifi.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include "../gps/gps.h"
-#include "../ml/features.h"
 
 // BSSID key for map lookup (6 bytes as uint64_t)
 inline uint64_t bssidToKey(const uint8_t* bssid) {
@@ -35,7 +32,6 @@ public:
     
     // Export (data already on disk, these are for format info)
     static bool exportCSV(const char* path);
-    static bool exportMLTraining(const char* path);
     
     // GPS
     static bool hasGPSFix();
@@ -47,16 +43,12 @@ public:
     static uint32_t getWEPNetworks() { return wepNetworks; }
     static uint32_t getWPANetworks() { return wpaNetworks; }
     static uint32_t getSavedCount() { return savedCount; }  // Geotagged networks (CSV)
-    static uint32_t getMLOnlyCount() { return mlOnlyCount; } // ML-only networks (no GPS)
 
     // === BOUNTY SYSTEM (Phase 5) ===
     static void markCaptured(const uint8_t* bssid);                   // Track captures to exclude from bounties
     static void buildBountyList(uint8_t* buffer, uint8_t* count);     // Populate bounty payload buffer (max 15)
     static std::vector<uint64_t> getUnclaimedBSSIDs();                // Random sample of seen, excluding captured
 
-    // Internal helpers
-    static void clearBeaconFeatures();
-    
 private:
     static bool running;
     static uint32_t lastScanTime;
@@ -70,16 +62,9 @@ private:
     static uint32_t wepNetworks;
     static uint32_t wpaNetworks;
     static uint32_t savedCount;      // Networks saved with GPS to CSV
-    static uint32_t mlOnlyCount;     // Networks saved to ML file without GPS
-    static String currentFilename;   // Current session CSV file
-    static String currentMLFilename; // Current session ML training file
-    static String currentWigleFilename; // Current session WiGLE CSV file
-    
-    // Enhanced ML mode - beacon capture
-    static bool enhancedMode;
-    static std::map<uint64_t, WiFiFeatures> beaconFeatures;
-    static std::atomic<uint32_t> beaconCount;  // Atomic for thread-safe access from callback + main
-    static volatile bool beaconMapBusy;
+    static char currentFilename[128];   // Current session CSV file
+    static char currentWigleFilename[128]; // Current session WiGLE CSV file
+
     // Background scan task
     static TaskHandle_t scanTaskHandle;
     static volatile int scanResult;
@@ -90,25 +75,16 @@ private:
     
     // File helpers - write directly per-network
     static bool ensureCSVFileReady();
-    static bool ensureMLFileReady();
     static bool ensureWigleFileReady();
     static void checkWigleFileRotation();
     static void appendCSVEntry(const uint8_t* bssid, const char* ssid,
                                int8_t rssi, uint8_t channel, wifi_auth_mode_t auth,
                                double lat, double lon, double alt);
-    static void appendMLEntry(const uint8_t* bssid, const char* ssid,
-                              const WiFiFeatures& features, uint8_t label,
-                              double lat, double lon);
     static void appendWigleEntry(const uint8_t* bssid, const char* ssid,
                                  int8_t rssi, uint8_t channel, wifi_auth_mode_t auth,
                                  double lat, double lon, double alt, double accuracy);
     
-    static String authModeToString(wifi_auth_mode_t mode);
-    static String authModeToWigleString(wifi_auth_mode_t mode);
-    static String generateFilename(const char* ext);
-    
-    // Enhanced mode promiscuous callback
-    static void promiscuousCallback(void* buf, wifi_promiscuous_pkt_type_t type);
-    static void startEnhancedCapture();
-    static void stopEnhancedCapture();
+    static const char* authModeToString(wifi_auth_mode_t mode);
+    static const char* authModeToWigleString(wifi_auth_mode_t mode);
+    static void generateFilename(char* buf, size_t bufSize, const char* ext);
 };

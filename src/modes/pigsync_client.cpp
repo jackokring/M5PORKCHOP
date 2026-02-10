@@ -16,6 +16,8 @@
 #include "../core/sdlog.h"
 #include "../core/sd_layout.h"
 #include "../core/wifi_utils.h"
+#include "../core/heap_gates.h"
+#include "../core/heap_policy.h"
 #include "../core/network_recon.h"
 #include "../piglet/mood.h"
 #include "../ui/display.h"
@@ -294,7 +296,7 @@ static bool parseSirloinHandshake(const uint8_t* data, uint16_t len, CapturedHan
     offset += 2;
 
     if (beaconLen > 0) {
-        if (offset + beaconLen > len) {
+        if (beaconLen > 512 || offset + beaconLen > len) {
             return false;
         }
         out.beaconData = (uint8_t*)malloc(beaconLen);
@@ -441,7 +443,7 @@ static volatile bool pendingNameReveal = false;
 static char pendingNameRevealName[16] = {0};
 
 static volatile bool pendingChunkReceived = false;
-static const uint8_t PENDING_CHUNK_QUEUE_SIZE = 4;
+static const uint8_t PENDING_CHUNK_QUEUE_SIZE = 8;
 struct PendingChunkSlot {
     bool used;
     uint16_t seq;
@@ -886,8 +888,8 @@ void PigSyncMode::start() {
     // Pause NetworkRecon - promiscuous mode conflicts with ESP-NOW
     NetworkRecon::pause();
     
-    // Disable WiFi first
-    WiFi.disconnect(true);
+    // Soft WiFi reset — keep driver alive to avoid RX buffer realloc failures
+    WiFi.disconnect(false, true);
     WiFi.mode(WIFI_STA);
     delay(100);
     
@@ -895,6 +897,7 @@ void PigSyncMode::start() {
     
     // Clear state
     devices.clear();
+    devices.reserve(10);
     state = State::IDLE;
     connected = false;
     memset(connectedMac, 0, 6);
@@ -1918,8 +1921,8 @@ bool PigSyncMode::startSync() {
     yield();
     
     // Guard: ensure enough contiguous heap for reliable transfer
-    if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < 26000) {
-        strcpy(lastError, "LOW HEAP");
+    HeapGates::GateStatus gate = HeapGates::checkGate(0, HeapPolicy::kPigSyncMinContig);
+    if (!HeapGates::canMeet(gate, lastError, sizeof(lastError))) {
         return false;
     }
     
@@ -2071,18 +2074,19 @@ void PigSyncMode::sendReady() {
 
 void PigSyncMode::sendStartSync(uint8_t captureType, uint16_t index) {
     CmdStartSync pkt;
-    initHeader(&pkt.hdr, CMD_START_SYNC, reliability.nextSeq(), reliability.lastRxSeq, sessionId);
+    uint8_t seq = reliability.nextSeq();
+    initHeader(&pkt.hdr, CMD_START_SYNC, seq, reliability.lastRxSeq, sessionId);
     pkt.capture_type = captureType;
     pkt.reserved = 0;
     pkt.index = index;
-    
+
     state = State::WAITING_CHUNKS;
     progress.captureType = captureType;
     progress.captureIndex = index;
     progress.currentChunk = 0;
     progress.inProgress = true;
-    
-    esp_now_send(connectedMac, (uint8_t*)&pkt, sizeof(pkt));
+
+    sendControlPacket(connectedMac, (uint8_t*)&pkt, sizeof(pkt), CMD_START_SYNC, seq);
 }
 
 void PigSyncMode::sendAckChunk(uint16_t seq) {
@@ -2205,29 +2209,11 @@ bool PigSyncMode::savePMKID(const uint8_t* data, uint16_t len) {
     }
 
     char filename[64];
-    snprintf(filename, sizeof(filename), "%s/%02X%02X%02X%02X%02X%02X.22000",
-             handshakesDir,
-             pmkid.bssid[0], pmkid.bssid[1], pmkid.bssid[2],
-             pmkid.bssid[3], pmkid.bssid[4], pmkid.bssid[5]);
+    SDLayout::buildCaptureFilename(filename, sizeof(filename),
+                                   handshakesDir, pmkid.ssid, pmkid.bssid, ".22000");
     removeIfExists(filename);
 
     bool ok = OinkMode::savePMKID22000(pmkid, filename);
-
-    if (ok) {
-        char txtFilename[64];
-        snprintf(txtFilename, sizeof(txtFilename), "%s/%02X%02X%02X%02X%02X%02X_pmkid.txt",
-                 handshakesDir,
-                 pmkid.bssid[0], pmkid.bssid[1], pmkid.bssid[2],
-                 pmkid.bssid[3], pmkid.bssid[4], pmkid.bssid[5]);
-        removeIfExists(txtFilename);
-
-        File txtFile = SD.open(txtFilename, FILE_WRITE);
-        if (txtFile) {
-            txtFile.println(pmkid.ssid);
-            txtFile.close();
-        }
-    }
-
     return ok;
 }
 
@@ -2251,36 +2237,17 @@ bool PigSyncMode::saveHandshake(const uint8_t* data, uint16_t len) {
     }
 
     char filenamePcap[64];
-    snprintf(filenamePcap, sizeof(filenamePcap), "%s/%02X%02X%02X%02X%02X%02X.pcap",
-             handshakesDir,
-             hs.bssid[0], hs.bssid[1], hs.bssid[2],
-             hs.bssid[3], hs.bssid[4], hs.bssid[5]);
+    SDLayout::buildCaptureFilename(filenamePcap, sizeof(filenamePcap),
+                                   handshakesDir, hs.ssid, hs.bssid, ".pcap");
     removeIfExists(filenamePcap);
 
     char filename22000[64];
-    snprintf(filename22000, sizeof(filename22000), "%s/%02X%02X%02X%02X%02X%02X_hs.22000",
-             handshakesDir,
-             hs.bssid[0], hs.bssid[1], hs.bssid[2],
-             hs.bssid[3], hs.bssid[4], hs.bssid[5]);
+    SDLayout::buildCaptureFilename(filename22000, sizeof(filename22000),
+                                   handshakesDir, hs.ssid, hs.bssid, "_hs.22000");
     removeIfExists(filename22000);
 
     bool pcapOk = OinkMode::saveHandshakePCAP(hs, filenamePcap);
     bool hs22kOk = OinkMode::saveHandshake22000(hs, filename22000);
-
-    if (pcapOk || hs22kOk) {
-        char txtFilename[64];
-        snprintf(txtFilename, sizeof(txtFilename), "%s/%02X%02X%02X%02X%02X%02X.txt",
-                 handshakesDir,
-                 hs.bssid[0], hs.bssid[1], hs.bssid[2],
-                 hs.bssid[3], hs.bssid[4], hs.bssid[5]);
-        removeIfExists(txtFilename);
-
-        File txtFile = SD.open(txtFilename, FILE_WRITE);
-        if (txtFile) {
-            txtFile.println(hs.ssid);
-            txtFile.close();
-        }
-    }
 
     if (hs.beaconData) {
         free(hs.beaconData);

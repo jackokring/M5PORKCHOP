@@ -100,8 +100,9 @@ static bool advCachePrimed = false;
 static inline void primeAdvCache() {
     if (advCachePrimed) return;
     advDataCache.clearData();
+    // Add max-size payload to force NimBLE's internal buffer allocation.
+    // Keep the data — first real sendX() call will clearData() before setting payload.
     advDataCache.addData(ADV_WARMUP_PAYLOAD, sizeof(ADV_WARMUP_PAYLOAD));
-    advDataCache.clearData();
     advCachePrimed = true;
 }
 
@@ -290,13 +291,12 @@ void PiggyBluesMode::selectActiveTargets() {
         return;
     }
     
-    // Sort by RSSI (strongest first = closest)
-    std::sort(targets.begin(), targets.end(), [](const BLETarget& a, const BLETarget& b) {
-        return a.rssi > b.rssi;
-    });
-    
-    // Active count is up to 4 strongest
+    // Partial sort — only need top 4 by RSSI (strongest first = closest)
     activeCount = min((size_t)4, targets.size());
+    std::partial_sort(targets.begin(), targets.begin() + activeCount, targets.end(),
+        [](const BLETarget& a, const BLETarget& b) {
+            return a.rssi > b.rssi;
+        });
 }
 
 // AppleJuice payloads - fake AirPods/AppleTV/etc popups

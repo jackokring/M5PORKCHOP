@@ -6,6 +6,7 @@
 #include "config.h"
 #include "wsl_bypasser.h"
 #include "wifi_utils.h"
+#include "heap_gates.h"
 #include "heap_policy.h"
 #include <WiFi.h>
 #include <esp_wifi.h>
@@ -22,7 +23,7 @@ namespace NetworkRecon {
 static bool initialized = false;
 static bool running = false;
 static bool paused = false;
-static bool channelLocked = false;
+static std::atomic<bool> channelLocked{false};
 static bool channelLockedBeforePause = false;  // [BUG4 FIX] Save state for pause/resume
 static uint8_t lockedChannel = 0;
 static uint8_t currentChannel = 1;
@@ -32,22 +33,35 @@ static uint32_t lastCleanupTime = 0;
 static uint32_t startTime = 0;
 static volatile uint32_t packetCount = 0;
 static std::atomic<bool> busy{false};  // [BUG3 FIX] Atomic for cross-core visibility
+static std::atomic<uint32_t> hopIntervalOverrideMs{0};
 static size_t heapLargestAtStart = 0;
 static bool heapStabilized = false;
+// shrinkDeferCount removed — shrink_to_fit no longer runs during operation
 
 // Channel hop order (most common channels first for faster discovery)
 static const uint8_t CHANNEL_HOP_ORDER[RECON_CHANNEL_COUNT] = {
     1, 6, 11, 2, 3, 4, 5, 7, 8, 9, 10, 12, 13
 };
 
-// Hop interval in milliseconds
-static const uint32_t HOP_INTERVAL_MS = 150;
-
 // Stale network timeout (remove if not seen for this long)
 static const uint32_t STALE_TIMEOUT_MS = 60000;
 
 // Cleanup interval
 static const uint32_t CLEANUP_INTERVAL_MS = 5000;
+
+// Client activity decay (clear bitset after inactivity)
+static const uint32_t CLIENT_BITMAP_RESET_MS = 30000;
+
+static uint32_t getHopIntervalMsInternal() {
+    uint32_t overrideMs = hopIntervalOverrideMs.load();
+    uint32_t interval = overrideMs > 0 ? overrideMs : Config::wifi().channelHopInterval;
+    if (interval < 50) interval = 50;
+    if (interval > 2000) interval = 2000;
+    return interval;
+}
+
+// Beacon interval sanity cap (ignore huge gaps for EMA)
+static const uint32_t BEACON_INTERVAL_MAX_MS = 5000;
 
 // ============================================================================
 // Thread Safety
@@ -65,8 +79,20 @@ static std::vector<DetectedNetwork> networks;
 // Deferred Event Processing (avoid allocations in callback)
 // ============================================================================
 
-static volatile bool pendingNetworkAdd = false;
-static DetectedNetwork pendingNetwork;
+static const uint8_t PENDING_NET_SLOTS = 16;
+static DetectedNetwork pendingNetworks[PENDING_NET_SLOTS];
+static std::atomic<uint8_t> pendingNetWrite{0};
+static std::atomic<uint8_t> pendingNetRead{0};
+
+// Pending SSID reveal cache (best-effort for hidden networks)
+static const uint8_t PENDING_SSID_SLOTS = 4;
+struct PendingSSID {
+    uint8_t bssid[6];
+    char ssid[33];
+    std::atomic<bool> ready{false};
+};
+static PendingSSID pendingSsids[PENDING_SSID_SLOTS];
+static std::atomic<uint8_t> pendingSsidWrite{0};
 
 // ============================================================================
 // Mode-Specific Callbacks
@@ -80,20 +106,10 @@ static NewNetworkCallback newNetworkCallback = nullptr;
 // ============================================================================
 
 static void hopChannel() {
-    if (channelLocked) return;
+    if (channelLocked.load(std::memory_order_acquire)) return;
     
     currentChannelIndex = (currentChannelIndex + 1) % RECON_CHANNEL_COUNT;
     currentChannel = CHANNEL_HOP_ORDER[currentChannelIndex];
-    // #region agent log - H1 channel hop
-    {
-        static uint32_t lastHopLog = 0;
-        uint32_t now = millis();
-        if (now - lastHopLog > 1000) {
-            lastHopLog = now;
-            Serial.printf("[DBG-H1] RECON hop ch=%d locked=%d\n", currentChannel, channelLocked ? 1 : 0);
-        }
-    }
-    // #endregion
     esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
 }
 
@@ -106,47 +122,181 @@ static int findNetworkInternal(const uint8_t* bssid) {
     return -1;
 }
 
-static bool detectPMF(const uint8_t* payload, uint16_t len) {
-    // Look for RSN IE (0x30) and check RSN Capabilities for MFPC/MFPR bits
+static inline int8_t updateRssiAvg(int8_t prev, int8_t sample) {
+    if (prev == 0) return sample;
+    int16_t blended = (int16_t)prev * 3 + (int16_t)sample;
+    return (int8_t)(blended / 4);
+}
+
+static bool enqueuePendingNetwork(const DetectedNetwork& net) {
+    uint8_t write = pendingNetWrite.load(std::memory_order_relaxed);
+    uint8_t next = (uint8_t)((write + 1) % PENDING_NET_SLOTS);
+    uint8_t read = pendingNetRead.load(std::memory_order_acquire);
+    if (next == read) {
+        return false;  // Queue full, drop
+    }
+    pendingNetworks[write] = net;
+    pendingNetWrite.store(next, std::memory_order_release);
+    return true;
+}
+
+static bool dequeuePendingNetwork(DetectedNetwork& out) {
+    uint8_t read = pendingNetRead.load(std::memory_order_relaxed);
+    uint8_t write = pendingNetWrite.load(std::memory_order_acquire);
+    if (read == write) {
+        return false;
+    }
+    out = pendingNetworks[read];
+    pendingNetRead.store((uint8_t)((read + 1) % PENDING_NET_SLOTS), std::memory_order_release);
+    return true;
+}
+
+static void storePendingSsid(const uint8_t* bssid, const char* ssid) {
+    if (!bssid || !ssid || ssid[0] == 0) return;
+    uint8_t slot = pendingSsidWrite.fetch_add(1, std::memory_order_relaxed) % PENDING_SSID_SLOTS;
+    pendingSsids[slot].ready.store(false, std::memory_order_relaxed);
+    memcpy(pendingSsids[slot].bssid, bssid, 6);
+    strncpy(pendingSsids[slot].ssid, ssid, 32);
+    pendingSsids[slot].ssid[32] = 0;
+    pendingSsids[slot].ready.store(true, std::memory_order_release);
+}
+
+static bool applyPendingSsid(DetectedNetwork& net) {
+    for (uint8_t i = 0; i < PENDING_SSID_SLOTS; i++) {
+        if (!pendingSsids[i].ready.load(std::memory_order_acquire)) continue;
+        if (memcmp(pendingSsids[i].bssid, net.bssid, 6) != 0) continue;
+        strncpy(net.ssid, pendingSsids[i].ssid, 32);
+        net.ssid[32] = 0;
+        net.isHidden = false;
+        pendingSsids[i].ready.store(false, std::memory_order_release);
+        return true;
+    }
+    return false;
+}
+
+static void revealSsidIfKnown(const uint8_t* bssid, const char* ssid) {
+    if (!bssid || !ssid || ssid[0] == 0) return;
+
+    // Try to apply to existing network first
+    taskENTER_CRITICAL(&vectorMux);
+    int idx = findNetworkInternal(bssid);
+    if (idx >= 0 && idx < (int)networks.size()) {
+        if (networks[idx].ssid[0] == 0 || networks[idx].isHidden) {
+            strncpy(networks[idx].ssid, ssid, 32);
+            networks[idx].ssid[32] = 0;
+            networks[idx].isHidden = false;
+            networks[idx].lastSeen = millis();
+        }
+        taskEXIT_CRITICAL(&vectorMux);
+        return;
+    }
+    taskEXIT_CRITICAL(&vectorMux);
+
+    // Otherwise, store for when the network is added
+    storePendingSsid(bssid, ssid);
+}
+
+static inline uint8_t clientHashIndex(const uint8_t* mac) {
+    uint32_t h = 2166136261u;  // FNV-1a
+    for (int i = 0; i < 6; i++) {
+        h ^= mac[i];
+        h *= 16777619u;
+    }
+    return (uint8_t)(h & 0x7F);
+}
+
+static int computeRetentionScore(const DetectedNetwork& net, uint32_t now) {
+    int8_t rssi = (net.rssiAvg != 0) ? net.rssiAvg : net.rssi;
+    int score = 0;
+
+    if (rssi <= -95) score += 0;
+    else if (rssi >= -30) score += 60;
+    else score += ((int)rssi + 95) * 60 / 65;
+
+    uint32_t age = now - net.lastSeen;
+    if (age <= 2000) score += 20;
+    else if (age <= 5000) score += 12;
+    else if (age <= 15000) score += 5;
+
+    if (net.lastDataSeen > 0) {
+        uint32_t dataAge = now - net.lastDataSeen;
+        if (dataAge <= 3000) score += 20;
+        else if (dataAge <= 10000) score += 10;
+        else if (dataAge <= 30000) score += 5;
+    }
+
+    if (net.beaconIntervalEmaMs > 0) {
+        if (net.beaconIntervalEmaMs <= 150) score += 10;
+        else if (net.beaconIntervalEmaMs <= 500) score += 6;
+        else if (net.beaconIntervalEmaMs <= 1000) score += 3;
+    }
+
+    if (net.hasHandshake) score -= 20;
+    if (net.hasPMF) score -= 15;
+    if (net.authmode == WIFI_AUTH_OPEN) score -= 10;
+    if (net.ssid[0] == 0 || net.isHidden) score -= 10;
+    if (net.cooldownUntil > now) score -= 10;
+
+    return score;
+}
+
+// PMF detection result - we need both bits to distinguish WPA3 from WPA2/WPA3 mixed
+// jader242 i know you reading dis. pig knows.
+struct PmfResult {
+    bool capable;   // MFPC (bit 6) - PMF capable (WPA2/WPA3 transitional sets this)
+    bool required;  // MFPR (bit 7) - PMF required (pure WPA3 sets both)
+};
+
+static PmfResult detectPMF(const uint8_t* payload, uint16_t len) {
+    PmfResult result = {false, false};
     uint16_t offset = 36;
     while (offset + 2 < len) {
         uint8_t id = payload[offset];
         uint8_t ieLen = payload[offset + 1];
-        
+
         if (offset + 2 + ieLen > len) break;
-        
+
         if (id == 0x30 && ieLen >= 8) {  // RSN IE
-            // RSN capabilities are at fixed offset from RSN IE start
-            // Version (2) + Group Cipher Suite (4) + Pairwise Count (2) + Pairwise Suites (n*4)
-            // + AKM Count (2) + AKM Suites (m*4) + RSN Capabilities (2)
-            // For simplicity, scan for capabilities at expected position
             uint16_t rsnOffset = offset + 2;
+            uint16_t rsnEnd = rsnOffset + ieLen;
             uint16_t version = payload[rsnOffset] | (payload[rsnOffset + 1] << 8);
             if (version != 1) {
                 offset += 2 + ieLen;
                 continue;
             }
-            
-            // Skip to RSN capabilities (simplified - assumes minimal suites)
-            // In practice, need to parse suite counts
-            uint16_t capOffset = rsnOffset + 8;  // Minimum offset
-            if (capOffset + 2 <= offset + 2 + ieLen) {
-                uint16_t caps = payload[capOffset] | (payload[capOffset + 1] << 8);
-                // MFPC = bit 7, MFPR = bit 6
-                if (caps & 0x0080) return true;  // MFPC set
-            }
+
+            // Walk the RSN IE properly - no shortcuts, no assumptions
+            rsnOffset += 6;  // Skip version(2) + group cipher(4)
+            if (rsnOffset + 2 > rsnEnd) break;
+
+            uint16_t pairwiseCount = payload[rsnOffset] | (payload[rsnOffset + 1] << 8);
+            rsnOffset += 2 + (pairwiseCount * 4);
+            if (rsnOffset + 2 > rsnEnd) break;
+
+            uint16_t akmCount = payload[rsnOffset] | (payload[rsnOffset + 1] << 8);
+            rsnOffset += 2 + (akmCount * 4);
+            if (rsnOffset + 2 > rsnEnd) break;
+
+            // RSN Capabilities - IEEE 802.11-2016 Table 9-133
+            // Bit 6: MFPC (Management Frame Protection Capable)
+            // Bit 7: MFPR (Management Frame Protection Required)
+            uint16_t caps = payload[rsnOffset] | (payload[rsnOffset + 1] << 8);
+            result.capable  = (caps >> 6) & 0x01;  // MFPC
+            result.required = (caps >> 7) & 0x01;  // MFPR
+            break;
         }
-        
+
         offset += 2 + ieLen;
     }
-    return false;
+    return result;
 }
 
 static void processBeacon(const uint8_t* payload, uint16_t len, int8_t rssi) {
     if (len < 36) return;
     
     const uint8_t* bssid = payload + 16;
-    bool hasPMF = detectPMF(payload, len);
+    PmfResult pmf = detectPMF(payload, len);
+    uint32_t now = millis();
     
     // [BUG1 FIX] Lookup under spinlock - vector can be modified by cleanupStaleNetworks()
     taskENTER_CRITICAL(&vectorMux);
@@ -155,110 +305,139 @@ static void processBeacon(const uint8_t* payload, uint16_t len, int8_t rssi) {
     
     if (idx < 0) {
         // New network - queue for deferred add
-        if (!pendingNetworkAdd) {
-            DetectedNetwork net = {0};
-            memcpy(net.bssid, bssid, 6);
-            net.rssi = rssi;
-            net.lastSeen = millis();
-            net.beaconCount = 1;
-            net.isTarget = false;
-            net.hasPMF = hasPMF;
-            net.hasHandshake = false;
-            net.attackAttempts = 0;
-            net.isHidden = false;
-            net.clientCount = 0;
-            net.lastClientSeen = 0;
-            net.cooldownUntil = 0;
+        DetectedNetwork net = {0};
+        memcpy(net.bssid, bssid, 6);
+        net.rssi = rssi;
+        net.rssiAvg = rssi;
+        net.channel = currentChannel;
+        net.authmode = WIFI_AUTH_OPEN;
+        net.firstSeen = now;
+        net.lastSeen = now;
+        net.lastBeaconSeen = now;
+        net.beaconCount = 1;
+        net.beaconIntervalEmaMs = 0;
+        net.isTarget = false;
+        net.hasPMF = pmf.required;
+        net.hasHandshake = false;
+        net.attackAttempts = 0;
+        net.isHidden = false;
+        net.lastDataSeen = 0;
+        net.cooldownUntil = 0;
+        net.clientBitset = 0;
+        net.clientBitsetHigh = 0;
+
+        // Parse SSID from IE
+        uint16_t offset = 36;
+        while (offset + 2 < len) {
+            uint8_t id = payload[offset];
+            uint8_t ieLen = payload[offset + 1];
             
-            // Parse SSID from IE
-            uint16_t offset = 36;
-            while (offset + 2 < len) {
-                uint8_t id = payload[offset];
-                uint8_t ieLen = payload[offset + 1];
-                
-                if (offset + 2 + ieLen > len) break;
-                
-                if (id == 0) {
-                    if (ieLen > 0 && ieLen <= 32) {
-                        memcpy(net.ssid, payload + offset + 2, ieLen);
-                        net.ssid[ieLen] = 0;
-                        
-                        // Check for all-null SSID (hidden)
-                        bool allNull = true;
-                        for (uint8_t i = 0; i < ieLen; i++) {
-                            if (net.ssid[i] != 0) { allNull = false; break; }
-                        }
-                        if (allNull) {
-                            net.isHidden = true;
-                        }
-                    } else if (ieLen == 0) {
+            if (offset + 2 + ieLen > len) break;
+            
+            if (id == 0) {
+                if (ieLen > 0 && ieLen <= 32) {
+                    memcpy(net.ssid, payload + offset + 2, ieLen);
+                    net.ssid[ieLen] = 0;
+                    
+                    // Check for all-null SSID (hidden)
+                    bool allNull = true;
+                    for (uint8_t i = 0; i < ieLen; i++) {
+                        if (net.ssid[i] != 0) { allNull = false; break; }
+                    }
+                    if (allNull) {
                         net.isHidden = true;
                     }
-                    break;
+                } else if (ieLen == 0) {
+                    net.isHidden = true;
                 }
-                
-                offset += 2 + ieLen;
+                break;
             }
             
-            // Get channel from DS Parameter Set IE
-            offset = 36;
-            while (offset + 2 < len) {
-                uint8_t id = payload[offset];
-                uint8_t ieLen = payload[offset + 1];
-                
-                if (id == 3 && ieLen == 1) {
-                    net.channel = payload[offset + 2];
-                    break;
-                }
-                
-                offset += 2 + ieLen;
-            }
-            
-            // Parse auth mode
-            net.authmode = WIFI_AUTH_OPEN;
-            offset = 36;
-            while (offset + 2 < len) {
-                uint8_t id = payload[offset];
-                uint8_t ieLen = payload[offset + 1];
-                
-                if (offset + 2 + ieLen > len) break;
-                
-                if (id == 0x30 && ieLen >= 2) {  // RSN IE = WPA2/WPA3
-                    if (net.hasPMF) {
-                        net.authmode = WIFI_AUTH_WPA3_PSK;
-                    } else {
-                        net.authmode = WIFI_AUTH_WPA2_PSK;
-                    }
-                } else if (id == 0xDD && ieLen >= 8) {  // Vendor specific
-                    if (payload[offset + 2] == 0x00 && payload[offset + 3] == 0x50 &&
-                        payload[offset + 4] == 0xF2 && payload[offset + 5] == 0x01) {
-                        if (net.authmode == WIFI_AUTH_OPEN) {
-                            net.authmode = WIFI_AUTH_WPA_PSK;
-                        } else if (net.authmode == WIFI_AUTH_WPA2_PSK) {
-                            net.authmode = WIFI_AUTH_WPA_WPA2_PSK;
-                        }
-                    }
-                }
-                
-                offset += 2 + ieLen;
-            }
-            
-            if (net.channel == 0) {
-                net.channel = currentChannel;
-            }
-            
-            // Queue for deferred add
-            memcpy(&pendingNetwork, &net, sizeof(DetectedNetwork));
-            pendingNetworkAdd = true;
+            offset += 2 + ieLen;
         }
+        
+        // Get channel from DS Parameter Set IE
+        offset = 36;
+        while (offset + 2 < len) {
+            uint8_t id = payload[offset];
+            uint8_t ieLen = payload[offset + 1];
+            
+            if (id == 3 && ieLen == 1) {
+                net.channel = payload[offset + 2];
+                break;
+            }
+            
+            offset += 2 + ieLen;
+        }
+        
+        // Parse auth mode from RSN (0x30) and WPA vendor (0xDD) IEs
+        // RSN + MFPR        = pure WPA3 (PMF required, no fallback)
+        // RSN + MFPC only   = WPA2/WPA3 transitional (PMF capable, clients choose)
+        // RSN alone          = WPA2
+        // WPA vendor alone   = WPA1
+        // RSN + WPA vendor   = WPA1/WPA2 mixed
+        bool hasRSN = false;
+        offset = 36;
+        while (offset + 2 < len) {
+            uint8_t id = payload[offset];
+            uint8_t ieLen = payload[offset + 1];
+
+            if (offset + 2 + ieLen > len) break;
+
+            if (id == 0x30 && ieLen >= 2) {  // RSN IE
+                hasRSN = true;
+                net.authmode = WIFI_AUTH_WPA2_PSK;
+            } else if (id == 0xDD && ieLen >= 8) {  // Vendor specific
+                if (payload[offset + 2] == 0x00 && payload[offset + 3] == 0x50 &&
+                    payload[offset + 4] == 0xF2 && payload[offset + 5] == 0x01) {
+                    if (!hasRSN) {
+                        net.authmode = WIFI_AUTH_WPA_PSK;
+                    } else {
+                        net.authmode = WIFI_AUTH_WPA_WPA2_PSK;
+                    }
+                }
+            }
+
+            offset += 2 + ieLen;
+        }
+
+        // Apply PMF classification on top of RSN detection
+        if (hasRSN && net.authmode == WIFI_AUTH_WPA2_PSK) {
+            if (pmf.required) {
+                net.authmode = WIFI_AUTH_WPA3_PSK;         // MFPR=1: pure WPA3-SAE
+            } else if (pmf.capable) {
+                net.authmode = WIFI_AUTH_WPA2_WPA3_PSK;    // MFPC=1 only: transitional
+            }
+        }
+        
+        if (net.channel == 0) {
+            net.channel = currentChannel;
+        }
+        
+        // Queue for deferred add
+        enqueuePendingNetwork(net);
     } else {
         // Update existing network
         taskENTER_CRITICAL(&vectorMux);
         if (idx >= 0 && idx < (int)networks.size()) {
-            networks[idx].rssi = rssi;
-            networks[idx].lastSeen = millis();
-            networks[idx].beaconCount++;
-            networks[idx].hasPMF |= hasPMF;
+            DetectedNetwork& net = networks[idx];
+            net.rssi = rssi;
+            net.rssiAvg = updateRssiAvg(net.rssiAvg, rssi);
+            net.lastSeen = now;
+            net.beaconCount++;
+            if (net.lastBeaconSeen > 0) {
+                uint32_t delta = now - net.lastBeaconSeen;
+                if (delta > 0 && delta < BEACON_INTERVAL_MAX_MS) {
+                    if (net.beaconIntervalEmaMs == 0) {
+                        net.beaconIntervalEmaMs = (uint16_t)delta;
+                    } else {
+                        uint32_t blended = (uint32_t)net.beaconIntervalEmaMs * 7 + delta;
+                        net.beaconIntervalEmaMs = (uint16_t)(blended / 8);
+                    }
+                }
+            }
+            net.lastBeaconSeen = now;
+            net.hasPMF |= pmf.required;
         }
         taskEXIT_CRITICAL(&vectorMux);
     }
@@ -268,6 +447,32 @@ static void processProbeResponse(const uint8_t* payload, uint16_t len, int8_t rs
     if (len < 36) return;
     
     const uint8_t* bssid = payload + 16;
+    uint32_t now = millis();
+
+    // Parse SSID from IE (probe responses can reveal hidden SSIDs)
+    char ssidBuf[33] = {0};
+    bool ssidFound = false;
+    bool ssidAllNull = true;
+    uint16_t offset = 36;
+    while (offset + 2 < len) {
+        uint8_t id = payload[offset];
+        uint8_t ieLen = payload[offset + 1];
+        
+        if (offset + 2 + ieLen > len) break;
+        
+        if (id == 0 && ieLen > 0 && ieLen <= 32) {
+            memcpy(ssidBuf, payload + offset + 2, ieLen);
+            ssidBuf[ieLen] = 0;
+            ssidFound = true;
+            
+            for (uint8_t i = 0; i < ieLen; i++) {
+                if (ssidBuf[i] != 0) { ssidAllNull = false; break; }
+            }
+            break;
+        }
+        
+        offset += 2 + ieLen;
+    }
     
     // [BUG5 FIX] Do lookup inside critical section to prevent TOCTOU race
     // cleanupStaleNetworks() can modify vector between lookup and use
@@ -276,97 +481,80 @@ static void processProbeResponse(const uint8_t* payload, uint16_t len, int8_t rs
     
     if (idx < 0) {
         taskEXIT_CRITICAL(&vectorMux);
-        // Check if pending network matches (pendingNetwork is single-slot, no lock needed)
-        if (pendingNetworkAdd && memcmp(pendingNetwork.bssid, bssid, 6) == 0) {
-            if (pendingNetwork.ssid[0] == 0 || pendingNetwork.isHidden) {
-                uint16_t offset = 36;
-                while (offset + 2 < len) {
-                    uint8_t id = payload[offset];
-                    uint8_t ieLen = payload[offset + 1];
-                    
-                    if (offset + 2 + ieLen > len) break;
-                    
-                    if (id == 0 && ieLen > 0 && ieLen <= 32) {
-                        memcpy(pendingNetwork.ssid, payload + offset + 2, ieLen);
-                        pendingNetwork.ssid[ieLen] = 0;
-                        
-                        bool allNull = true;
-                        for (uint8_t i = 0; i < ieLen; i++) {
-                            if (pendingNetwork.ssid[i] != 0) { allNull = false; break; }
-                        }
-                        if (!allNull) {
-                            pendingNetwork.isHidden = false;
-                            pendingNetwork.lastSeen = millis();
-                        }
-                        break;
-                    }
-                    
-                    offset += 2 + ieLen;
-                }
-            }
+        if (ssidFound && !ssidAllNull) {
+            revealSsidIfKnown(bssid, ssidBuf);
         }
         return;
     }
     
     // idx is valid and we hold the lock - safe to use
-    if (networks[idx].ssid[0] == 0 || networks[idx].isHidden) {
-        uint16_t offset = 36;
-        while (offset + 2 < len) {
-            uint8_t id = payload[offset];
-            uint8_t ieLen = payload[offset + 1];
-            
-            if (offset + 2 + ieLen > len) break;
-            
-            if (id == 0 && ieLen > 0 && ieLen <= 32) {
-                memcpy(networks[idx].ssid, payload + offset + 2, ieLen);
-                networks[idx].ssid[ieLen] = 0;
-                networks[idx].isHidden = false;
-                break;
-            }
-            
-            offset += 2 + ieLen;
-        }
+    if ((networks[idx].ssid[0] == 0 || networks[idx].isHidden) && ssidFound && !ssidAllNull) {
+        memcpy(networks[idx].ssid, ssidBuf, 33);
+        networks[idx].isHidden = false;
     }
     
-    networks[idx].lastSeen = millis();
+    networks[idx].rssi = rssi;
+    networks[idx].rssiAvg = updateRssiAvg(networks[idx].rssiAvg, rssi);
+    networks[idx].lastSeen = now;
     taskEXIT_CRITICAL(&vectorMux);
 }
 
-static void trackClient(const uint8_t* bssid, const uint8_t* clientMac, int8_t rssi) {
-    taskENTER_CRITICAL(&vectorMux);
+static void processAssocRequest(const uint8_t* payload, uint16_t len, bool isReassoc) {
+    if (len < 36) return;
     
-    int idx = findNetworkInternal(bssid);
-    if (idx < 0 || idx >= (int)networks.size()) {
-        taskEXIT_CRITICAL(&vectorMux);
-        return;
+    const uint8_t* bssid = payload + 16;
+    uint16_t fixedLen = isReassoc ? 10 : 4;
+    uint16_t offset = 24 + fixedLen;
+    if (offset + 2 > len) return;
+    
+    // Parse SSID IE from tagged parameters
+    char ssidBuf[33] = {0};
+    bool ssidFound = false;
+    bool ssidAllNull = true;
+    while (offset + 2 < len) {
+        uint8_t id = payload[offset];
+        uint8_t ieLen = payload[offset + 1];
+        if (offset + 2 + ieLen > len) break;
+        
+        if (id == 0 && ieLen > 0 && ieLen <= 32) {
+            memcpy(ssidBuf, payload + offset + 2, ieLen);
+            ssidBuf[ieLen] = 0;
+            ssidFound = true;
+            for (uint8_t i = 0; i < ieLen; i++) {
+                if (ssidBuf[i] != 0) { ssidAllNull = false; break; }
+            }
+            break;
+        }
+        offset += 2 + ieLen;
     }
     
-    DetectedNetwork& net = networks[idx];
-    
-    // Check if client already tracked
-    for (uint8_t i = 0; i < net.clientCount; i++) {
-        if (memcmp(net.clients[i].mac, clientMac, 6) == 0) {
-            net.clients[i].rssi = rssi;
-            net.clients[i].lastSeen = millis();
-            net.lastClientSeen = millis();
-            taskEXIT_CRITICAL(&vectorMux);
-            return;
+    if (ssidFound && !ssidAllNull) {
+        revealSsidIfKnown(bssid, ssidBuf);
+    }
+}
+
+static void markDataActivity(const uint8_t* bssid, const uint8_t* clientMac) {
+    taskENTER_CRITICAL(&vectorMux);
+
+    int idx = findNetworkInternal(bssid);
+    if (idx >= 0 && idx < (int)networks.size()) {
+        DetectedNetwork& net = networks[idx];
+        net.lastDataSeen = millis();
+        if (clientMac) {
+            uint8_t bit = clientHashIndex(clientMac);
+            if (bit < 64) {
+                net.clientBitset |= (1ULL << bit);
+            } else {
+                net.clientBitsetHigh |= (1ULL << (bit - 64));
+            }
         }
     }
-    
-    // Add new client if space available
-    if (net.clientCount < MAX_CLIENTS_PER_NETWORK) {
-        memcpy(net.clients[net.clientCount].mac, clientMac, 6);
-        net.clients[net.clientCount].rssi = rssi;
-        net.clients[net.clientCount].lastSeen = millis();
-        net.clientCount++;
-        net.lastClientSeen = millis();
-    }
-    
+
     taskEXIT_CRITICAL(&vectorMux);
 }
 
 static void processDataFrame(const uint8_t* payload, uint16_t len, int8_t rssi) {
+    (void)rssi;
     if (len < 28) return;
     
     uint8_t toDs = (payload[1] & 0x01);
@@ -385,7 +573,7 @@ static void processDataFrame(const uint8_t* payload, uint16_t len, int8_t rssi) 
     
     if (bssid && clientMac) {
         if ((clientMac[0] & 0x01) == 0) {
-            trackClient(bssid, clientMac, rssi);
+            markDataActivity(bssid, clientMac);
         }
     }
 }
@@ -393,7 +581,12 @@ static void processDataFrame(const uint8_t* payload, uint16_t len, int8_t rssi) 
 static void promiscuousCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
     if (!buf) return;
     if (!running || paused) return;
-    if (busy) return;
+    if (busy) {
+        if (modeCallback) {
+            modeCallback((wifi_promiscuous_pkt_t*)buf, type);
+        }
+        return;
+    }
     
     wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
     uint16_t len = pkt->rx_ctrl.sig_len;
@@ -415,6 +608,10 @@ static void promiscuousCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
                 processBeacon(payload, len, rssi);
             } else if (frameSubtype == 0x05) {  // Probe Response
                 processProbeResponse(payload, len, rssi);
+            } else if (frameSubtype == 0x00) {  // Assoc Request
+                processAssocRequest(payload, len, false);
+            } else if (frameSubtype == 0x02) {  // Reassoc Request
+                processAssocRequest(payload, len, true);
             }
             break;
             
@@ -433,52 +630,64 @@ static void promiscuousCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
 }
 
 static void processDeferredEvents() {
-    // [BUG2 FIX] Set busy BEFORE checking flag - prevents callback overwrite race
-    busy = true;
+    const uint8_t kMaxAddsPerUpdate = 8;
+    uint8_t processed = 0;
+    DetectedNetwork pending = {};
     
-    if (pendingNetworkAdd) {
+    while (processed < kMaxAddsPerUpdate && dequeuePendingNetwork(pending)) {
+        // Apply any deferred SSID reveal before adding
+        applyPendingSsid(pending);
         
-        // Check capacity OUTSIDE critical section
-        bool shouldAdd = false;
-        size_t capacityLimit = networks.capacity();
-        bool hasCapacity = networks.size() < capacityLimit;
-        bool canGrow = networks.size() < MAX_RECON_NETWORKS;
-        
-        // Only add if we have pre-reserved capacity (no allocation needed)
+        // With reserve(MAX_RECON_NETWORKS) at init and no shrink_to_fit,
+        // push_back never allocates. At capacity, evict weakest instead of growing.
+        bool hasCapacity = networks.size() < networks.capacity();
+
+        bool inserted = false;
+        bool replaced = false;
         if (hasCapacity) {
-            shouldAdd = true;
-        } else if (canGrow && ESP.getFreeHeap() > HeapPolicy::kMinHeapForReconGrowth) {
-            // Grow capacity OUTSIDE critical section to avoid heap ops while holding spinlock
-            try {
-                networks.reserve(networks.capacity() + 20);
-                shouldAdd = true;
-            } catch (...) {
-                // OOM - skip this network
+            taskENTER_CRITICAL(&vectorMux);
+            networks.push_back(pending);  // Safe: capacity pre-reserved at init
+            taskEXIT_CRITICAL(&vectorMux);
+            inserted = true;
+        } else {
+            // Vector is full - evict a low-value entry if the new one is better
+            uint32_t now = millis();
+            int pendingScore = computeRetentionScore(pending, now);
+            int worstScore = 100000;
+            int worstIdx = -1;
+            
+            taskENTER_CRITICAL(&vectorMux);
+            for (size_t i = 0; i < networks.size(); i++) {
+                if (networks[i].isTarget) continue;
+                int score = computeRetentionScore(networks[i], now);
+                if (score < worstScore) {
+                    worstScore = score;
+                    worstIdx = (int)i;
+                }
             }
+            if (worstIdx >= 0 && pendingScore > worstScore) {
+                networks[worstIdx] = pending;
+                replaced = true;
+            }
+            taskEXIT_CRITICAL(&vectorMux);
         }
         
-        if (shouldAdd) {
-            taskENTER_CRITICAL(&vectorMux);
-            networks.push_back(pendingNetwork);  // Safe: capacity pre-reserved
-            taskEXIT_CRITICAL(&vectorMux);
-            
+        if (inserted || replaced) {
             // Notify mode of new network discovery (for XP events)
             // Called OUTSIDE critical section - safe for Mood/XP calls
             if (newNetworkCallback) {
                 newNetworkCallback(
-                    pendingNetwork.authmode,
-                    pendingNetwork.isHidden,
-                    pendingNetwork.ssid,
-                    pendingNetwork.rssi,
-                    pendingNetwork.channel
+                    pending.authmode,
+                    pending.isHidden,
+                    pending.ssid,
+                    pending.rssi,
+                    pending.channel
                 );
             }
         }
         
-        pendingNetworkAdd = false;
+        processed++;
     }
-    
-    busy = false;
 }
 
 static void cleanupStaleNetworks() {
@@ -490,11 +699,20 @@ static void cleanupStaleNetworks() {
     taskENTER_CRITICAL(&vectorMux);
     
     // Collect stale indices (static to avoid stack/heap allocation)
-    static size_t staleIndices[20];
+    static size_t staleIndices[50];
     size_t staleCount = 0;
-    
-    for (size_t i = 0; i < networks.size() && staleCount < 20; i++) {
-        if (now - networks[i].lastSeen > STALE_TIMEOUT_MS) {
+
+    for (size_t i = 0; i < networks.size() && staleCount < 50; i++) {
+        if (networks[i].lastDataSeen > 0 &&
+            now - networks[i].lastDataSeen > CLIENT_BITMAP_RESET_MS) {
+            networks[i].clientBitset = 0;
+            networks[i].clientBitsetHigh = 0;
+        }
+        int8_t rssi = (networks[i].rssiAvg != 0) ? networks[i].rssiAvg : networks[i].rssi;
+        uint32_t timeout = STALE_TIMEOUT_MS;  // 60s default (strong signal)
+        if (rssi < -75) timeout = 120000;     // Weak: 2 min
+        else if (rssi < -50) timeout = 90000; // Medium: 1.5 min
+        if (now - networks[i].lastSeen > timeout) {
             staleIndices[staleCount++] = i;
         }
     }
@@ -518,7 +736,7 @@ void init() {
     Serial.println("[RECON] Initializing NetworkRecon service...");
     
     networks.clear();
-    networks.reserve(50);  // Initial reserve, will grow as needed
+    networks.reserve(MAX_RECON_NETWORKS);  // Full upfront reserve — eliminates growth reallocations
     
     packetCount = 0;
     currentChannel = 1;
@@ -527,9 +745,14 @@ void init() {
     lastCleanupTime = 0;
     running = false;
     paused = false;
-    channelLocked = false;
+    channelLocked.store(false, std::memory_order_relaxed);
     busy = false;
-    pendingNetworkAdd = false;
+    pendingNetWrite = 0;
+    pendingNetRead = 0;
+    pendingSsidWrite = 0;
+    for (uint8_t i = 0; i < PENDING_SSID_SLOTS; i++) {
+        pendingSsids[i].ready.store(false, std::memory_order_relaxed);
+    }
     modeCallback = nullptr;
     heapStabilized = false;
     
@@ -539,7 +762,12 @@ void init() {
 
 void start() {
     if (!initialized) init();
-    if (running) return;
+    if (running) {
+        if (paused) {
+            resume();
+        }
+        return;
+    }
     
     Serial.printf("[RECON] Starting background scan... free=%u largest=%u\n",
                   ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
@@ -547,6 +775,12 @@ void start() {
     heapLargestAtStart = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
     heapStabilized = false;
     startTime = millis();
+    pendingNetWrite = 0;
+    pendingNetRead = 0;
+    pendingSsidWrite = 0;
+    for (uint8_t i = 0; i < PENDING_SSID_SLOTS; i++) {
+        pendingSsids[i].ready.store(false, std::memory_order_relaxed);
+    }
     
     // Handle BLE coexistence
     if (NimBLEDevice::isInitialized()) {
@@ -566,11 +800,13 @@ void start() {
         
         NimBLEDevice::deinit(true);
         delay(100);
-        
+        yield();  // Let deferred FreeRTOS cleanup tasks coalesce freed BLE memory
+        delay(50);
+
         Serial.printf("[RECON] After BLE deinit: free=%u largest=%u\n",
                       ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     }
-    
+
     // Initialize WiFi
     WiFi.persistent(false);
     WiFi.setSleep(false);
@@ -614,6 +850,14 @@ void stop() {
     Serial.printf("[RECON] Stopped. Networks cached: %d\n", networks.size());
 }
 
+void freeNetworks() {
+    taskENTER_CRITICAL(&vectorMux);
+    networks.clear();
+    networks.shrink_to_fit();
+    taskEXIT_CRITICAL(&vectorMux);
+    Serial.println("[RECON] Networks vector freed");
+}
+
 void pause() {
     if (!running || paused) return;
     
@@ -622,9 +866,9 @@ void pause() {
     paused = true;
     
     // [BUG4 FIX] Save and clear channel lock - will restore on resume if mode still active
-    channelLockedBeforePause = channelLocked;
-    if (channelLocked) {
-        channelLocked = false;
+    channelLockedBeforePause = channelLocked.load(std::memory_order_acquire);
+    if (channelLockedBeforePause) {
+        channelLocked.store(false, std::memory_order_release);
         Serial.println("[RECON] Channel lock suspended for pause");
     }
     
@@ -657,7 +901,7 @@ void resume() {
     // [BUG4 FIX] Restore channel lock only if mode callback still registered
     // (If modeCallback is null, no mode owns the lock anymore)
     if (channelLockedBeforePause && modeCallback != nullptr) {
-        channelLocked = true;
+        channelLocked.store(true, std::memory_order_release);
         Serial.printf("[RECON] Channel lock restored to %d\n", lockedChannel);
     }
     channelLockedBeforePause = false;
@@ -674,7 +918,8 @@ void update() {
     processDeferredEvents();
     
     // Channel hopping
-    if (!channelLocked && now - lastHopTime > HOP_INTERVAL_MS) {
+    uint32_t hopInterval = getHopIntervalMsInternal();
+    if (!channelLocked.load(std::memory_order_acquire) && now - lastHopTime > hopInterval) {
         hopChannel();
         lastHopTime = now;
     }
@@ -683,6 +928,11 @@ void update() {
     if (now - lastCleanupTime > CLEANUP_INTERVAL_MS) {
         cleanupStaleNetworks();
         lastCleanupTime = now;
+
+        // NOTE: No shrink_to_fit here. The reserve(MAX_RECON_NETWORKS) at init
+        // is permanent during operation. Shrinking would force TLSF to find a
+        // new differently-sized block on next growth, creating fragmentation.
+        // Capacity is only released in freeNetworks() on mode exit.
     }
     
     // Check heap stabilization
@@ -712,8 +962,75 @@ uint8_t getCurrentChannel() {
     return currentChannel;
 }
 
+uint32_t getHopIntervalMs() {
+    return getHopIntervalMsInternal();
+}
+
+void setHopIntervalOverride(uint32_t intervalMs) {
+    if (intervalMs == 0) {
+        hopIntervalOverrideMs.store(0);
+        return;
+    }
+    if (intervalMs < 50) intervalMs = 50;
+    if (intervalMs > 2000) intervalMs = 2000;
+    hopIntervalOverrideMs.store(intervalMs);
+}
+
+void clearHopIntervalOverride() {
+    hopIntervalOverrideMs.store(0);
+}
+
 uint32_t getPacketCount() {
     return packetCount;
+}
+
+uint8_t estimateClientCount(const DetectedNetwork& net) {
+    return (uint8_t)(__builtin_popcountll(net.clientBitset) +
+                     __builtin_popcountll(net.clientBitsetHigh));
+}
+
+static inline uint8_t scoreRssi(int8_t rssi) {
+    if (rssi <= -95) return 0;
+    if (rssi >= -30) return 60;
+    return (uint8_t)(((int)rssi + 95) * 60 / 65);
+}
+
+static inline uint8_t scoreRecency(uint32_t ageMs) {
+    if (ageMs <= 2000) return 20;
+    if (ageMs <= 5000) return 12;
+    if (ageMs <= 15000) return 5;
+    return 0;
+}
+
+static inline uint8_t scoreActivity(uint32_t ageMs) {
+    if (ageMs <= 3000) return 20;
+    if (ageMs <= 10000) return 10;
+    if (ageMs <= 30000) return 5;
+    return 0;
+}
+
+static inline uint8_t scoreBeaconStability(uint16_t intervalEmaMs) {
+    if (intervalEmaMs == 0) return 0;
+    if (intervalEmaMs <= 150) return 10;
+    if (intervalEmaMs <= 500) return 6;
+    if (intervalEmaMs <= 1000) return 3;
+    return 0;
+}
+
+uint8_t getQualityScore(const DetectedNetwork& net) {
+    uint32_t now = millis();
+    int8_t rssi = (net.rssiAvg != 0) ? net.rssiAvg : net.rssi;
+    uint32_t age = now - net.lastSeen;
+    uint32_t dataAge = (net.lastDataSeen > 0) ? (now - net.lastDataSeen) : 0xFFFFFFFFu;
+    uint8_t score = 0;
+    score += scoreRssi(rssi);
+    score += scoreRecency(age);
+    if (dataAge != 0xFFFFFFFFu) {
+        score += scoreActivity(dataAge);
+    }
+    score += scoreBeaconStability(net.beaconIntervalEmaMs);
+    if (score > 100) score = 100;
+    return score;
 }
 
 std::vector<DetectedNetwork>& getNetworks() {
@@ -745,22 +1062,22 @@ int findNetworkIndex(const uint8_t* bssid) {
 
 void lockChannel(uint8_t channel) {
     if (channel < 1 || channel > 14) return;
-    
-    channelLocked = true;
+
     lockedChannel = channel;
     currentChannel = channel;
+    channelLocked.store(true, std::memory_order_release);
     esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
     
     Serial.printf("[RECON] Channel locked to %d\n", channel);
 }
 
 void unlockChannel() {
-    channelLocked = false;
+    channelLocked.store(false, std::memory_order_release);
     Serial.println("[RECON] Channel unlocked, resuming hopping");
 }
 
 bool isChannelLocked() {
-    return channelLocked;
+    return channelLocked.load(std::memory_order_acquire);
 }
 
 void setChannel(uint8_t channel) {

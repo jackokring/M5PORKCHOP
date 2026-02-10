@@ -4,6 +4,7 @@
 #include "wpasec.h"
 #include "../core/sd_layout.h"
 #include "../core/config.h"
+#include "../core/heap_gates.h"
 #include "../core/wifi_utils.h"
 #include "../core/network_recon.h"
 #include "../piglet/mood.h"
@@ -18,30 +19,18 @@ static const char* WPASEC_HOST = "wpa-sec.stanev.org";
 static const uint16_t WPASEC_PORT = 443;
 static const char* WPASEC_UPLOAD_PATH = "/";
 static const char* WPASEC_POTFILE_PATH = "/?api&dl=1";
+static const size_t WPASEC_MAX_CACHE_ENTRIES = 500;
 
 // Static member initialization
 bool WPASec::cacheLoaded = false;
 char WPASec::lastError[64] = "";
-std::map<String, WPASec::CacheEntry> WPASec::crackedCache;
-std::map<String, bool> WPASec::uploadedCache;
+std::vector<WPASec::CrackedEntry> WPASec::crackedCache;
+std::vector<WPASec::UploadedEntry> WPASec::uploadedCache;
 volatile bool WPASec::busy = false;
 bool WPASec::batchMode = false;
 
 bool WPASec::isBusy() {
     return busy;
-}
-
-String WPASec::normalizeBSSID(const char* bssid) {
-    if (!bssid) return "";
-    String out = "";
-    out.reserve(12);
-    for (int i = 0; bssid[i]; i++) {
-        char c = bssid[i];
-        if (c != ':' && c != '-') {
-            out += (char)toupper(c);
-        }
-    }
-    return out;
 }
 
 void WPASec::normalizeBSSID_Char(const char* bssid, char* output, size_t outLen) {
@@ -62,6 +51,7 @@ void WPASec::normalizeBSSID_Char(const char* bssid, char* output, size_t outLen)
 
 bool WPASec::loadUploadedList() {
     uploadedCache.clear();
+    uploadedCache.reserve(64);  // 64 * 13B = 832B — avoids 6 reallocations
     const char* uploadedPath = SDLayout::wpasecUploadedPath();
     if (!SD.exists(uploadedPath)) return true;
 
@@ -72,16 +62,20 @@ bool WPASec::loadUploadedList() {
         return false;
     }
 
-    String line;
-    line.reserve(64);  // Pre-allocate to reduce heap fragmentation
-    while (f.available() && uploadedCache.size() < 500) {
-        line = f.readStringUntil('\n');  // Reuses existing capacity
-        line.trim();
-        if (!line.isEmpty()) {
-            String key = normalizeBSSID(line.c_str());
-            if (!key.isEmpty()) {
-                uploadedCache[key] = true;
-            }
+    char lineBuf[64];
+    while (f.available() && uploadedCache.size() < WPASEC_MAX_CACHE_ENTRIES) {
+        size_t len = f.readBytesUntil('\n', lineBuf, sizeof(lineBuf) - 1);
+        lineBuf[len] = '\0';
+        // Trim trailing whitespace
+        while (len > 0 && (lineBuf[len - 1] == '\r' || lineBuf[len - 1] == ' ')) {
+            lineBuf[--len] = '\0';
+        }
+        if (len == 0) continue;
+
+        UploadedEntry entry;
+        normalizeBSSID_Char(lineBuf, entry.bssid, sizeof(entry.bssid));
+        if (entry.bssid[0] != '\0') {
+            uploadedCache.push_back(entry);
         }
     }
 
@@ -93,6 +87,7 @@ bool WPASec::loadCache() {
     if (cacheLoaded) return true;
 
     crackedCache.clear();
+    crackedCache.reserve(128);  // 128 * 110B = 14KB — avoids 6 reallocations vs no reserve
     uploadedCache.clear();
 
     const char* cachePath = SDLayout::wpasecResultsPath();
@@ -107,32 +102,60 @@ bool WPASec::loadCache() {
         // Format: AP_BSSID:CLIENT_BSSID:SSID:password (WPA-SEC potfile format)
         // AP_BSSID is always 12 hex chars, CLIENT_BSSID is always 12 hex chars
         // Cap at 500 entries to prevent memory exhaustion
-        String line;
-        line.reserve(128);  // Pre-allocate to reduce heap fragmentation
-        while (f.available() && crackedCache.size() < 500) {
-            line = f.readStringUntil('\n');  // Reuses existing capacity
-            line.trim();
-            if (line.isEmpty()) continue;
+        char lineBuf[160];
+        while (f.available() && crackedCache.size() < WPASEC_MAX_CACHE_ENTRIES) {
+            size_t len = f.readBytesUntil('\n', lineBuf, sizeof(lineBuf) - 1);
+            lineBuf[len] = '\0';
+            // Trim trailing whitespace
+            while (len > 0 && (lineBuf[len - 1] == '\r' || lineBuf[len - 1] == ' ')) {
+                lineBuf[--len] = '\0';
+            }
+            if (len == 0) continue;
 
             // WPA-SEC potfile: AP_BSSID:CLIENT_BSSID:SSID:password
             // Both BSSIDs are exactly 12 hex chars (no colons)
             // Password can contain colons, so we must find the THIRD colon
-            int firstColon = line.indexOf(':');
-            int secondColon = (firstColon > 0) ? line.indexOf(':', firstColon + 1) : -1;
-            int thirdColon = (secondColon > 0) ? line.indexOf(':', secondColon + 1) : -1;
+            // Find colons by scanning
+            const char* firstColon = nullptr;
+            const char* secondColon = nullptr;
+            const char* thirdColon = nullptr;
+            for (const char* p = lineBuf; *p; p++) {
+                if (*p == ':') {
+                    if (!firstColon) firstColon = p;
+                    else if (!secondColon) secondColon = p;
+                    else if (!thirdColon) { thirdColon = p; break; }
+                }
+            }
 
             // Validate: AP BSSID at pos 0-11 (colon at 12), client BSSID at pos 13-24 (colon at 25)
-            if (firstColon == 12 && secondColon == 25 && thirdColon > secondColon) {
-                String bssid = line.substring(0, firstColon);  // AP BSSID
-                String ssid = line.substring(secondColon + 1, thirdColon);  // SSID between 2nd and 3rd colon
-                String password = line.substring(thirdColon + 1);  // Everything after 3rd colon
+            if (firstColon && secondColon && thirdColon &&
+                (firstColon - lineBuf) == 12 &&
+                (secondColon - lineBuf) == 25 &&
+                thirdColon > secondColon) {
 
-                bssid = normalizeBSSID(bssid.c_str());
+                CrackedEntry entry;
+                memset(&entry, 0, sizeof(entry));
 
-                CacheEntry entry;
-                entry.ssid = ssid;
-                entry.password = password;
-                crackedCache[bssid] = entry;
+                // AP BSSID: first 12 chars, normalize
+                char rawBssid[13];
+                memcpy(rawBssid, lineBuf, 12);
+                rawBssid[12] = '\0';
+                normalizeBSSID_Char(rawBssid, entry.bssid, sizeof(entry.bssid));
+
+                // SSID: between 2nd and 3rd colon
+                size_t ssidLen = (size_t)(thirdColon - secondColon - 1);
+                if (ssidLen >= sizeof(entry.ssid)) ssidLen = sizeof(entry.ssid) - 1;
+                memcpy(entry.ssid, secondColon + 1, ssidLen);
+                entry.ssid[ssidLen] = '\0';
+
+                // Password: everything after 3rd colon
+                const char* pwStart = thirdColon + 1;
+                size_t pwLen = strlen(pwStart);
+                if (pwLen >= sizeof(entry.password)) pwLen = sizeof(entry.password) - 1;
+                memcpy(entry.password, pwStart, pwLen);
+                entry.password[pwLen] = '\0';
+
+                crackedCache.push_back(entry);
             }
         }
 
@@ -151,30 +174,36 @@ bool WPASec::loadCache() {
 // Local Cache Queries
 // ============================================================================
 
+const WPASec::CrackedEntry* WPASec::findCracked(const char* normalizedBssid) {
+    for (size_t i = 0; i < crackedCache.size(); i++) {
+        if (strcmp(crackedCache[i].bssid, normalizedBssid) == 0) {
+            return &crackedCache[i];
+        }
+    }
+    return nullptr;
+}
+
 bool WPASec::isCracked(const char* bssid) {
     loadCache();
-    String key = normalizeBSSID(bssid);
-    return crackedCache.find(key) != crackedCache.end();
+    char key[13];
+    normalizeBSSID_Char(bssid, key, sizeof(key));
+    return findCracked(key) != nullptr;
 }
 
-String WPASec::getPassword(const char* bssid) {
+const char* WPASec::getPassword(const char* bssid) {
     loadCache();
-    String key = normalizeBSSID(bssid);
-    auto it = crackedCache.find(key);
-    if (it != crackedCache.end()) {
-        return it->second.password;
-    }
-    return "";
+    char key[13];
+    normalizeBSSID_Char(bssid, key, sizeof(key));
+    const CrackedEntry* entry = findCracked(key);
+    return entry ? entry->password : "";
 }
 
-String WPASec::getSSID(const char* bssid) {
+const char* WPASec::getSSID(const char* bssid) {
     loadCache();
-    String key = normalizeBSSID(bssid);
-    auto it = crackedCache.find(key);
-    if (it != crackedCache.end()) {
-        return it->second.ssid;
-    }
-    return "";
+    char key[13];
+    normalizeBSSID_Char(bssid, key, sizeof(key));
+    const CrackedEntry* entry = findCracked(key);
+    return entry ? entry->ssid : "";
 }
 
 uint16_t WPASec::getCrackedCount() {
@@ -184,9 +213,13 @@ uint16_t WPASec::getCrackedCount() {
 
 bool WPASec::isUploaded(const char* bssid) {
     loadCache();
-    String key = normalizeBSSID(bssid);
-    if (crackedCache.find(key) != crackedCache.end()) return true;
-    return uploadedCache.find(key) != uploadedCache.end();
+    char key[13];
+    normalizeBSSID_Char(bssid, key, sizeof(key));
+    if (findCracked(key) != nullptr) return true;
+    for (size_t i = 0; i < uploadedCache.size(); i++) {
+        if (strcmp(uploadedCache[i].bssid, key) == 0) return true;
+    }
+    return false;
 }
 
 const char* WPASec::getLastError() {
@@ -197,7 +230,9 @@ void WPASec::freeCacheMemory() {
     size_t crackedCount = crackedCache.size();
     size_t uploadedCount = uploadedCache.size();
     crackedCache.clear();
+    crackedCache.shrink_to_fit();
     uploadedCache.clear();
+    uploadedCache.shrink_to_fit();
     cacheLoaded = false;
     Serial.printf("[WPASEC] Freed cache: %u cracked, %u uploaded\n",
                   (unsigned int)crackedCount, (unsigned int)uploadedCount);
@@ -212,8 +247,8 @@ bool WPASec::saveUploadedList() {
         return false;
     }
 
-    for (const auto& kv : uploadedCache) {
-        f.println(kv.first);
+    for (size_t i = 0; i < uploadedCache.size(); i++) {
+        f.println(uploadedCache[i].bssid);
     }
 
     f.close();
@@ -222,12 +257,22 @@ bool WPASec::saveUploadedList() {
 
 void WPASec::markAsUploaded(const char* bssid) {
     loadCache();
-    String key = normalizeBSSID(bssid);
-    if (!key.isEmpty()) {
-        uploadedCache[key] = true;
-        if (!batchMode) {
-            saveUploadedList();  // Only save immediately if not in batch mode
-        }
+    char key[13];
+    normalizeBSSID_Char(bssid, key, sizeof(key));
+    if (key[0] == '\0') return;
+
+    // Check if already present
+    for (size_t i = 0; i < uploadedCache.size(); i++) {
+        if (strcmp(uploadedCache[i].bssid, key) == 0) return;
+    }
+    // Cap in-memory cache to avoid unbounded heap growth
+    if (uploadedCache.size() >= WPASEC_MAX_CACHE_ENTRIES) return;
+
+    UploadedEntry entry;
+    memcpy(entry.bssid, key, sizeof(entry.bssid));
+    uploadedCache.push_back(entry);
+    if (!batchMode) {
+        saveUploadedList();
     }
 }
 
@@ -262,29 +307,15 @@ bool WPASec::hasApiKey() {
 bool WPASec::canSync() {
     // Free caches to maximize available heap
     freeCacheMemory();
-    
-    size_t freeHeap = ESP.getFreeHeap();
-    size_t largestBlock = ESP.getMaxAllocHeap();
-    
-    Serial.printf("[WPASEC] canSync: %u free, %u contiguous (need %u/%u)\n", 
-                  (unsigned int)freeHeap, (unsigned int)largestBlock,
-                  (unsigned int)MIN_HEAP_FOR_TLS, (unsigned int)MIN_CONTIGUOUS_FOR_TLS);
-    
-    // Check fragmentation first (more specific error)
-    if (largestBlock < MIN_CONTIGUOUS_FOR_TLS) {
-        snprintf(lastError, sizeof(lastError), "FRAGMENTED: %uKB", 
-                 (unsigned int)(largestBlock / 1024));
-        return false;
-    }
-    
-    // Then total heap
-    if (freeHeap < MIN_HEAP_FOR_TLS) {
-        snprintf(lastError, sizeof(lastError), "LOW HEAP: %uKB", 
-                 (unsigned int)(freeHeap / 1024));
-        return false;
-    }
-    
-    return true;
+
+    HeapGates::TlsGateStatus tls = HeapGates::checkTlsGates();
+
+    Serial.printf("[WPASEC] canSync: %u free, %u contiguous (need %u/%u)\n",
+                  (unsigned int)tls.freeHeap, (unsigned int)tls.largestBlock,
+                  (unsigned int)HeapPolicy::kMinHeapForTls,
+                  (unsigned int)HeapPolicy::kMinContigForTls);
+
+    return HeapGates::canTls(tls, lastError, sizeof(lastError));
 }
 
 bool WPASec::uploadSingleCapture(const char* filepath, const char* bssid) {
@@ -549,16 +580,21 @@ WPASecSyncResult WPASec::syncCaptures(WPASecProgressCallback cb) {
         busy = false;
         return result;
     }
+
+    if (cb) {
+        cb("prepping heap", 0, 0);
+    }
     
     // Proactive heap conditioning - condition early when heap is marginal
     // This prevents fragmentation from getting critical before TLS attempts
-    size_t largestBlock = ESP.getMaxAllocHeap();
-    if (largestBlock < PROACTIVE_CONDITIONING_THRESHOLD && largestBlock >= MIN_CONTIGUOUS_FOR_TLS) {
+    HeapGates::TlsGateStatus tls = HeapGates::checkTlsGates();
+    if (HeapGates::shouldProactivelyCondition(tls)) {
         if (cb) {
             cb("OPTIMIZING HEAP", 0, 0);
         }
         Serial.printf("[WPASEC] Proactive conditioning: %u < %u threshold\n",
-                      (unsigned int)largestBlock, (unsigned int)PROACTIVE_CONDITIONING_THRESHOLD);
+                      (unsigned int)tls.largestBlock,
+                      (unsigned int)HeapPolicy::kProactiveTlsConditioning);
         WiFiUtils::conditionHeapForTLS();
     }
     
@@ -589,6 +625,9 @@ WPASecSyncResult WPASec::syncCaptures(WPASecProgressCallback cb) {
     }
     
     // Collect files to upload from handshakes directory
+    if (cb) {
+        cb("scanning caps", 0, 0);
+    }
     const char* hsDir = SDLayout::handshakesDir();
     if (!SD.exists(hsDir)) {
         strncpy(result.error, "NO HANDSHAKES DIR", sizeof(result.error) - 1);
@@ -606,14 +645,14 @@ WPASecSyncResult WPASec::syncCaptures(WPASecProgressCallback cb) {
         char path[80];
         char bssid[13];
     };
-    static PendingUpload pendingUploads[50];  // Max 50 per sync
+    static PendingUpload pendingUploads[16];  // Max 16 per sync (reduced from 50, saves ~3KB BSS)
     uint8_t pendingCount = 0;
-    
+
     File dir = SD.open(hsDir);
     if (dir && dir.isDirectory()) {
         File file = dir.openNextFile();
         uint8_t filesScanned = 0;
-        while (file && pendingCount < 50) {
+        while (file && pendingCount < 16) {
             // Yield every 10 files to prevent WDT on large directories
             if (++filesScanned >= 10) {
                 filesScanned = 0;
@@ -628,20 +667,43 @@ WPASecSyncResult WPASec::syncCaptures(WPASecProgressCallback cb) {
             bool is22000 = (fnameLen > 6 && strcmp(fname + fnameLen - 6, ".22000") == 0);
             
             if (isPCAP || is22000) {
-                // Extract BSSID from filename (first 12 chars before extension)
-                // Find the dot position
+                // Extract BSSID from filename — supports both formats:
+                // Legacy: BSSID12HEX.ext (first 12 chars)
+                // New:    SSID_BSSID12HEX.ext (last 12 chars of base)
                 const char* dot = strrchr(fname, '.');
                 size_t baseLen = dot ? (size_t)(dot - fname) : fnameLen;
-                
-                // Check for _hs suffix
+
+                // Strip _hs suffix
                 if (baseLen > 3 && strncmp(fname + baseLen - 3, "_hs", 3) == 0) {
                     baseLen -= 3;
                 }
-                
+
                 if (baseLen >= 12) {
                     char bssid[13];
-                    memcpy(bssid, fname, 12);
+
+                    // Check if last 12 chars are hex and preceded by '_' (new format)
+                    bool isNewFmt = false;
+                    if (baseLen > 13 && fname[baseLen - 13] == '_') {
+                        isNewFmt = true;
+                        for (size_t i = baseLen - 12; i < baseLen; i++) {
+                            char c = fname[i];
+                            if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f'))) {
+                                isNewFmt = false;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (isNewFmt) {
+                        memcpy(bssid, fname + baseLen - 12, 12);
+                    } else {
+                        memcpy(bssid, fname, 12);
+                    }
                     bssid[12] = '\0';
+                    // Uppercase for consistency
+                    for (int i = 0; i < 12; i++) {
+                        if (bssid[i] >= 'a' && bssid[i] <= 'f') bssid[i] -= 32;
+                    }
                     
                     // Check if already uploaded or cracked
                     if (!isUploaded(bssid)) {
@@ -672,6 +734,9 @@ WPASecSyncResult WPASec::syncCaptures(WPASecProgressCallback cb) {
     uint8_t successMask[50] = {0};
     
     // Upload each pending file
+    if (cb) {
+        cb("yoinking caps", 0, 0);
+    }
     for (uint8_t i = 0; i < pendingCount; i++) {
         if (cb) {
             char status[32];
@@ -698,11 +763,24 @@ WPASecSyncResult WPASec::syncCaptures(WPASecProgressCallback cb) {
     // Mark successful uploads AFTER all TLS operations complete
     // This avoids cache reload during TLS when heap is tight
     if (result.uploaded > 0) {
+        if (cb) {
+            cb("marking loot", 0, 0);
+        }
         loadCache();
         for (uint8_t i = 0; i < pendingCount; i++) {
             if (successMask[i]) {
-                String key = normalizeBSSID(pendingUploads[i].bssid);
-                uploadedCache[key] = true;
+                char key[13];
+                normalizeBSSID_Char(pendingUploads[i].bssid, key, sizeof(key));
+                // Check not already present before push
+                bool found = false;
+                for (size_t j = 0; j < uploadedCache.size(); j++) {
+                    if (strcmp(uploadedCache[j].bssid, key) == 0) { found = true; break; }
+                }
+                if (!found && uploadedCache.size() < WPASEC_MAX_CACHE_ENTRIES) {
+                    UploadedEntry entry;
+                    memcpy(entry.bssid, key, sizeof(entry.bssid));
+                    uploadedCache.push_back(entry);
+                }
             }
         }
         saveUploadedList();
@@ -711,7 +789,7 @@ WPASecSyncResult WPASec::syncCaptures(WPASecProgressCallback cb) {
     
     // Download potfile
     if (cb) {
-        cb("DOWNLOADING POTFILE", 0, 0);
+        cb("slurping potfile", 0, 0);
     }
     
     // Free any residual memory before potfile TLS
@@ -722,13 +800,14 @@ WPASecSyncResult WPASec::syncCaptures(WPASecProgressCallback cb) {
     
     Serial.printf("[WPASEC] Heap before potfile: %u largest=%u\n", 
                   (unsigned int)ESP.getFreeHeap(),
-                  (unsigned int)ESP.getMaxAllocHeap());
+                  (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     
     uint16_t newCracks = 0;
     bool potfileOk = false;
     
     // Attempt potfile if heap is sufficient - no reconditioning, graceful skip if low
-    if (ESP.getMaxAllocHeap() >= MIN_CONTIGUOUS_FOR_TLS) {
+    HeapGates::GateStatus potGate = HeapGates::checkGate(0, HeapPolicy::kMinContigForTls);
+    if (potGate.failure == HeapGates::TlsGateFailure::None) {
         potfileOk = downloadPotfile(newCracks);
         if (potfileOk) {
             result.newCracked = newCracks;
@@ -738,8 +817,8 @@ WPASecSyncResult WPASec::syncCaptures(WPASecProgressCallback cb) {
         }
     } else {
         Serial.printf("[WPASEC] Skipping potfile: insufficient heap (%u < %u)\n",
-                      (unsigned int)ESP.getMaxAllocHeap(),
-                      (unsigned int)MIN_CONTIGUOUS_FOR_TLS);
+                      (unsigned int)potGate.largestBlock,
+                      (unsigned int)HeapPolicy::kMinContigForTls);
         snprintf(lastError, sizeof(lastError), "POTFILE SKIP: LOW HEAP");
     }
     

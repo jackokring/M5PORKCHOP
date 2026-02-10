@@ -32,10 +32,8 @@ public:
     
     static bool hasFix();
     static GPSData getData();
-    static String getLocationString();
-    static String getTimeString();
     static void getTimeString(char* out, size_t len);
-    static bool getLocationString(char* out, size_t len); // Non-allocating version
+    static bool getLocationString(char* out, size_t len);
     
     // Power management
     static void setPowerMode(bool active);
